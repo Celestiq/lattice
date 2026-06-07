@@ -80,6 +80,13 @@ func (r *Registry) Stale(now time.Time, threshold time.Duration) []*EntityRecord
 	return out
 }
 
+// Get returns the EntityRecord for pubkey, or nil if not found.
+func (r *Registry) Get(pubkey []byte) *EntityRecord {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.entities[hex.EncodeToString(pubkey)]
+}
+
 // All returns a snapshot of all registered entity records.
 func (r *Registry) All() []*EntityRecord {
 	r.mu.RLock()

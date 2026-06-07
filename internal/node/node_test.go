@@ -607,6 +607,263 @@ func TestNoDeliveryAfterOffline(t *testing.T) {
 	watcher.expectNoDeliver(t, 300*time.Millisecond)
 }
 
+// ─── Session 7: Call primitive ────────────────────────────────────────────────
+
+// allowCall adds an ACL rule permitting callerPub to call targetPub.
+func allowCall(t *testing.T, srv *node.Server, callerPub, targetPub ed25519.PublicKey) {
+	t.Helper()
+	srv.AddRule(acl.Rule{
+		IdentityPattern: acl.EncodeIdentity(callerPub),
+		Action:          acl.ActionCall,
+		SubjectPattern:  acl.EncodeIdentity(targetPub),
+		Effect:          acl.Allow,
+		Priority:        10,
+	})
+}
+
+// Basic round trip: A calls B, B responds, A receives the response.
+func TestCallBasicRoundTrip(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	a := connect(t, addr)
+	defer a.close()
+	b := connect(t, addr)
+	defer b.close()
+
+	allowCall(t, srv, a.pub, b.pub)
+
+	corrID := "round-trip-1"
+	a.send(pb.FrameType_FRAME_TYPE_REQUEST, &pb.Request{
+		CorrelationId: corrID,
+		TargetPubkey:  b.pub,
+		Payload:       []byte("ping"),
+		TimeoutMs:     5000,
+	})
+
+	// B receives the forwarded REQUEST with the original correlation ID.
+	frame := b.recv(t, 2*time.Second)
+	if frame.Type != pb.FrameType_FRAME_TYPE_REQUEST {
+		t.Fatalf("B: expected REQUEST, got %v", frame.Type)
+	}
+	var req pb.Request
+	proto.Unmarshal(frame.Payload, &req)
+	if req.CorrelationId != corrID {
+		t.Fatalf("B: correlation_id: got %q, want %q", req.CorrelationId, corrID)
+	}
+
+	// B sends RESPONSE with the same correlation ID.
+	b.send(pb.FrameType_FRAME_TYPE_RESPONSE, &pb.Response{
+		CorrelationId: corrID,
+		Payload:       []byte("pong"),
+	})
+
+	// A receives the forwarded RESPONSE.
+	frame = a.recv(t, 2*time.Second)
+	if frame.Type != pb.FrameType_FRAME_TYPE_RESPONSE {
+		t.Fatalf("A: expected RESPONSE, got %v", frame.Type)
+	}
+	var resp pb.Response
+	proto.Unmarshal(frame.Payload, &resp)
+	if resp.CorrelationId != corrID {
+		t.Fatalf("A: response correlation_id: got %q, want %q", resp.CorrelationId, corrID)
+	}
+	if string(resp.Payload) != "pong" {
+		t.Fatalf("A: response payload: got %q, want %q", resp.Payload, "pong")
+	}
+}
+
+// Calling an unknown pubkey → immediate NOT_FOUND error.
+func TestCallTargetNotFound(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	a := connect(t, addr)
+	defer a.close()
+
+	fakePub, _, _ := ed25519.GenerateKey(rand.Reader)
+
+	srv.AddRule(acl.Rule{
+		IdentityPattern: acl.EncodeIdentity(a.pub),
+		Action:          acl.ActionCall,
+		SubjectPattern:  "*",
+		Effect:          acl.Allow,
+		Priority:        10,
+	})
+
+	a.send(pb.FrameType_FRAME_TYPE_REQUEST, &pb.Request{
+		CorrelationId: "corr-not-found",
+		TargetPubkey:  fakePub,
+		Payload:       []byte("hello"),
+		TimeoutMs:     5000,
+	})
+
+	e := a.expectError(t)
+	if e.Code != "NOT_FOUND" {
+		t.Fatalf("expected NOT_FOUND, got %q", e.Code)
+	}
+}
+
+// Target exists but never responds → ERROR with code TIMEOUT after timeout_ms.
+func TestCallTimeout(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	a := connect(t, addr)
+	defer a.close()
+	b := connect(t, addr)
+	defer b.close()
+
+	allowCall(t, srv, a.pub, b.pub)
+
+	// Short deadline: 100ms. The timeout checker runs every 1s, so the error
+	// arrives within ~2s of the send.
+	a.send(pb.FrameType_FRAME_TYPE_REQUEST, &pb.Request{
+		CorrelationId: "corr-timeout",
+		TargetPubkey:  b.pub,
+		Payload:       []byte("hello"),
+		TimeoutMs:     100,
+	})
+
+	// B deliberately does not respond.
+	a.conn.(*tls.Conn).SetReadDeadline(time.Now().Add(3 * time.Second))
+	frame, err := wire.Read(a.conn)
+	if err != nil {
+		t.Fatalf("waiting for timeout ERROR: %v", err)
+	}
+	a.conn.(*tls.Conn).SetReadDeadline(time.Time{})
+
+	if frame.Type != pb.FrameType_FRAME_TYPE_ERROR {
+		t.Fatalf("expected ERROR, got %v", frame.Type)
+	}
+	var e pb.Error
+	proto.Unmarshal(frame.Payload, &e)
+	if e.Code != "TIMEOUT" {
+		t.Fatalf("expected TIMEOUT error code, got %q", e.Code)
+	}
+}
+
+// Two simultaneous calls from A to B with different correlation IDs complete
+// independently.
+func TestCallTwoSimultaneous(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	a := connect(t, addr)
+	defer a.close()
+	b := connect(t, addr)
+	defer b.close()
+
+	allowCall(t, srv, a.pub, b.pub)
+
+	corrID1, corrID2 := "sim-1", "sim-2"
+
+	a.send(pb.FrameType_FRAME_TYPE_REQUEST, &pb.Request{CorrelationId: corrID1, TargetPubkey: b.pub, Payload: []byte("req1"), TimeoutMs: 5000})
+	a.send(pb.FrameType_FRAME_TYPE_REQUEST, &pb.Request{CorrelationId: corrID2, TargetPubkey: b.pub, Payload: []byte("req2"), TimeoutMs: 5000})
+
+	// B receives both forwarded REQUESTs (collect by correlation ID).
+	reqs := make(map[string]bool)
+	for i := 0; i < 2; i++ {
+		frame := b.recv(t, 2*time.Second)
+		if frame.Type != pb.FrameType_FRAME_TYPE_REQUEST {
+			t.Fatalf("B: expected REQUEST, got %v", frame.Type)
+		}
+		var req pb.Request
+		proto.Unmarshal(frame.Payload, &req)
+		reqs[req.CorrelationId] = true
+	}
+	if !reqs[corrID1] || !reqs[corrID2] {
+		t.Fatalf("B: did not receive both requests; got %v", reqs)
+	}
+
+	// B responds to both.
+	b.send(pb.FrameType_FRAME_TYPE_RESPONSE, &pb.Response{CorrelationId: corrID1, Payload: []byte("resp1")})
+	b.send(pb.FrameType_FRAME_TYPE_RESPONSE, &pb.Response{CorrelationId: corrID2, Payload: []byte("resp2")})
+
+	// A receives both responses; check payloads by correlation ID.
+	resps := make(map[string]string)
+	for i := 0; i < 2; i++ {
+		frame := a.recv(t, 2*time.Second)
+		if frame.Type != pb.FrameType_FRAME_TYPE_RESPONSE {
+			t.Fatalf("A: expected RESPONSE, got %v", frame.Type)
+		}
+		var resp pb.Response
+		proto.Unmarshal(frame.Payload, &resp)
+		resps[resp.CorrelationId] = string(resp.Payload)
+	}
+	if resps[corrID1] != "resp1" {
+		t.Fatalf("corrID1: got %q, want %q", resps[corrID1], "resp1")
+	}
+	if resps[corrID2] != "resp2" {
+		t.Fatalf("corrID2: got %q, want %q", resps[corrID2], "resp2")
+	}
+}
+
+// Requester disconnects before response arrives — no panic; timeout goroutine
+// cleans up the pending entry silently.
+func TestCallRequesterDisconnects(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	a := connect(t, addr)
+	b := connect(t, addr)
+	defer b.close()
+
+	allowCall(t, srv, a.pub, b.pub)
+
+	a.send(pb.FrameType_FRAME_TYPE_REQUEST, &pb.Request{
+		CorrelationId: "corr-disco",
+		TargetPubkey:  b.pub,
+		Payload:       []byte("hello"),
+		TimeoutMs:     200,
+	})
+	a.close() // disconnect before B responds
+
+	// Let the timeout goroutine fire and attempt (and silently fail) to write to A.
+	time.Sleep(2 * time.Second)
+
+	// Server must still be functional: B can complete a heartbeat round trip.
+	b.mu.Lock()
+	wire.Write(b.conn, pb.FrameType_FRAME_TYPE_HEARTBEAT, nil)
+	b.mu.Unlock()
+	b.conn.(*tls.Conn).SetReadDeadline(time.Now().Add(2 * time.Second))
+	for {
+		frame, err := wire.Read(b.conn)
+		if err != nil {
+			t.Fatalf("server unresponsive after requester disconnect: %v", err)
+		}
+		if frame.Type == pb.FrameType_FRAME_TYPE_HEARTBEAT_ACK {
+			break
+		}
+		// Skip any forwarded REQUEST that B never consumed.
+	}
+	b.conn.(*tls.Conn).SetReadDeadline(time.Time{})
+}
+
+// ACL deny on call → immediate PERMISSION_DENIED error; REQUEST not forwarded.
+func TestCallACLDenied(t *testing.T) {
+	addr, _, stop := newServer(t, 30)
+	defer stop()
+
+	a := connect(t, addr)
+	defer a.close()
+	b := connect(t, addr)
+	defer b.close()
+
+	// No call rule added for A.
+	a.send(pb.FrameType_FRAME_TYPE_REQUEST, &pb.Request{
+		CorrelationId: "corr-acl",
+		TargetPubkey:  b.pub,
+		Payload:       []byte("hello"),
+		TimeoutMs:     5000,
+	})
+
+	e := a.expectError(t)
+	if e.Code != "PERMISSION_DENIED" {
+		t.Fatalf("expected PERMISSION_DENIED, got %q", e.Code)
+	}
+}
+
 // Two entities join simultaneously → two separate joined events.
 func TestTwoEntitiesJoinSimultaneously(t *testing.T) {
 	addr, srv, stop := newServer(t, 30)

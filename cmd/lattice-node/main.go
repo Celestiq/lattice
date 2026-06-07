@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"lattice/internal/identity"
 	"lattice/internal/node"
@@ -42,10 +44,21 @@ func main() {
 		log.Error("listen", "err", err)
 		os.Exit(1)
 	}
-	defer ln.Close()
 
 	srv := node.New(log, serverPriv, uint32(*heartbeatInterval))
 	log.Info("lattice-node listening", "addr", *addr, "tls", true)
+
+	// Graceful shutdown on SIGINT or SIGTERM.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		log.Info("signal received, shutting down")
+		ln.Close()       // stop accepting new connections
+		srv.Shutdown()   // drain existing connections + publish entity.left
+		log.Info("goodbye")
+		os.Exit(0)
+	}()
 
 	for {
 		conn, err := ln.Accept()

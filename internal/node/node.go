@@ -15,6 +15,7 @@ import (
 
 	"lattice/internal/acl"
 	"lattice/internal/bus"
+	"lattice/internal/call"
 	"lattice/internal/handshake"
 	"lattice/internal/registry"
 	"lattice/internal/schema"
@@ -30,10 +31,14 @@ type Server struct {
 	bus               *bus.Bus
 	acl               *acl.Engine
 	registry          *registry.Registry
+	calls             *call.Registry
 	serverPriv        ed25519.PrivateKey
 	serverPub         ed25519.PublicKey
 	heartbeatInterval uint32 // seconds
-	conns             sync.Map // sessionID → *lockedConn
+	conns             sync.Map   // sessionID → *lockedConn
+	wg                sync.WaitGroup
+	stopOnce          sync.Once
+	done              chan struct{}
 }
 
 // New creates a Server and starts the background heartbeat checker.
@@ -63,11 +68,15 @@ func New(log *slog.Logger, serverPriv ed25519.PrivateKey, heartbeatInterval uint
 		bus:               bus.New(),
 		acl:               engine,
 		registry:          registry.New(),
+		calls:             call.New(),
 		serverPriv:        serverPriv,
 		serverPub:         serverPub,
 		heartbeatInterval: heartbeatInterval,
+		done:              make(chan struct{}),
 	}
+	s.wg.Add(2)
 	go s.runHeartbeatChecker()
+	go s.runCallTimeoutChecker()
 	return s
 }
 
@@ -90,8 +99,41 @@ func (lc *lockedConn) writeFrame(ft pb.FrameType, payload []byte) error {
 	return wire.Write(lc.conn, ft, payload)
 }
 
+// Shutdown gracefully stops the server. It publishes entity.left for every
+// connected entity, closes all connections, and waits for all goroutines to
+// exit. Safe to call once; subsequent calls are no-ops.
+func (s *Server) Shutdown() {
+	s.stopOnce.Do(func() { close(s.done) })
+
+	// Publish entity.left for all connected entities while their connections are
+	// still open, so observers subscribed to lattice.system.> can receive it.
+	for _, ent := range s.registry.All() {
+		if s.registry.Remove(ent.Pubkey) == nil {
+			continue // concurrent disconnect already handled it
+		}
+		payload, _ := proto.Marshal(&pb.EntityLeft{
+			Pubkey:    ent.Pubkey,
+			SessionId: ent.SessionID,
+		})
+		s.publishSystemEvent("lattice.system.entity.left", payload)
+	}
+
+	// Close all connections so HandleConn goroutines see EOF and exit.
+	// HandleConn defers get nil from registry.Remove (already removed above)
+	// and skip the entity.left publish.
+	s.conns.Range(func(_, value any) bool {
+		value.(*lockedConn).conn.Close()
+		return true
+	})
+
+	s.wg.Wait()
+}
+
 // HandleConn runs the full lifecycle for one accepted connection.
 func (s *Server) HandleConn(conn net.Conn) {
+	s.wg.Add(1)
+	defer s.wg.Done()
+
 	tlsConn, ok := conn.(*tls.Conn)
 	if !ok {
 		conn.Close()
@@ -158,6 +200,12 @@ func (s *Server) HandleConn(conn net.Conn) {
 		case pb.FrameType_FRAME_TYPE_PUBLISH:
 			s.handlePublish(lc, rec, frame.Payload)
 
+		case pb.FrameType_FRAME_TYPE_REQUEST:
+			s.handleRequest(lc, rec, frame.Payload)
+
+		case pb.FrameType_FRAME_TYPE_RESPONSE:
+			s.handleResponse(lc, rec, frame.Payload)
+
 		default:
 			s.log.Warn("unhandled frame", "remote", remote, "type", frame.Type)
 		}
@@ -223,6 +271,97 @@ func (s *Server) handlePublish(lc *lockedConn, rec *session.Record, payload []by
 	s.fanout(msg.Subject, msg.Payload)
 }
 
+func (s *Server) handleRequest(lc *lockedConn, rec *session.Record, payload []byte) {
+	var req pb.Request
+	if err := proto.Unmarshal(payload, &req); err != nil {
+		s.sendError(lc, "INVALID_PAYLOAD", "cannot unmarshal REQUEST")
+		return
+	}
+	if len(req.TargetPubkey) != ed25519.PublicKeySize {
+		s.sendError(lc, "INVALID_PUBKEY", "target_pubkey must be 32 bytes")
+		return
+	}
+
+	// ACL check: (caller, "call", base32(target_pubkey)).
+	// SubjectPattern in call rules holds the target identity or "*" / ">".
+	targetIdentity := acl.EncodeIdentity(req.TargetPubkey)
+	if !s.acl.Allow(rec.Pubkey, acl.ActionCall, targetIdentity) {
+		s.sendError(lc, "PERMISSION_DENIED", "call denied by ACL")
+		return
+	}
+
+	// Target must be present in the entity registry.
+	targetEnt := s.registry.Get(req.TargetPubkey)
+	if targetEnt == nil {
+		s.sendError(lc, "NOT_FOUND", "target entity not connected")
+		return
+	}
+	v, ok := s.conns.Load(targetEnt.SessionID)
+	if !ok {
+		s.sendError(lc, "NOT_FOUND", "target entity not connected")
+		return
+	}
+	targetLc := v.(*lockedConn)
+
+	timeoutMs := req.TimeoutMs
+	if timeoutMs == 0 {
+		timeoutMs = 5000
+	}
+	deadline := time.Now().Add(time.Duration(timeoutMs) * time.Millisecond)
+
+	// Register before forwarding to prevent a race where the target responds
+	// before the pending entry exists.
+	s.calls.Add(req.CorrelationId, rec.ID, deadline)
+
+	if err := targetLc.writeFrame(pb.FrameType_FRAME_TYPE_REQUEST, payload); err != nil {
+		s.calls.Remove(req.CorrelationId)
+		s.sendError(lc, "DELIVERY_FAILED", "could not forward request to target")
+	}
+}
+
+func (s *Server) handleResponse(lc *lockedConn, rec *session.Record, payload []byte) {
+	var resp pb.Response
+	if err := proto.Unmarshal(payload, &resp); err != nil {
+		s.sendError(lc, "INVALID_PAYLOAD", "cannot unmarshal RESPONSE")
+		return
+	}
+
+	pending := s.calls.Remove(resp.CorrelationId)
+	if pending == nil {
+		s.sendError(lc, "NOT_FOUND", "unknown or expired correlation_id")
+		return
+	}
+
+	v, ok := s.conns.Load(pending.RequesterSessionID)
+	if !ok {
+		return // requester disconnected; silently drop
+	}
+	_ = v.(*lockedConn).writeFrame(pb.FrameType_FRAME_TYPE_RESPONSE, payload)
+}
+
+// ─── Call timeout checker ─────────────────────────────────────────────────────
+
+// runCallTimeoutChecker ticks every second and sends ERROR to requesters whose
+// calls have exceeded their deadline.
+func (s *Server) runCallTimeoutChecker() {
+	defer s.wg.Done()
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			for _, exp := range s.calls.Expired(time.Now()) {
+				if v, ok := s.conns.Load(exp.RequesterSessionID); ok {
+					payload, _ := proto.Marshal(&pb.Error{Code: "TIMEOUT", Message: "call timed out"})
+					_ = v.(*lockedConn).writeFrame(pb.FrameType_FRAME_TYPE_ERROR, payload)
+				}
+			}
+		case <-s.done:
+			return
+		}
+	}
+}
+
 // ─── System events ────────────────────────────────────────────────────────────
 
 // publishSystemEvent delivers payload to all subscribers of subject, bypassing
@@ -273,13 +412,19 @@ func (s *Server) publishEntityOffline(ent *registry.EntityRecord) {
 // runHeartbeatChecker ticks every heartbeatInterval seconds and marks entities
 // offline if their last heartbeat is older than 3 × heartbeatInterval.
 func (s *Server) runHeartbeatChecker() {
+	defer s.wg.Done()
 	interval := time.Duration(s.heartbeatInterval) * time.Second
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	for range ticker.C {
-		threshold := 3 * interval
-		for _, ent := range s.registry.Stale(time.Now(), threshold) {
-			s.markOffline(ent)
+	for {
+		select {
+		case <-ticker.C:
+			threshold := 3 * interval
+			for _, ent := range s.registry.Stale(time.Now(), threshold) {
+				s.markOffline(ent)
+			}
+		case <-s.done:
+			return
 		}
 	}
 }
