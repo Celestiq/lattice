@@ -1,0 +1,28 @@
+syntax = "proto3";
+
+package lattice;
+
+option go_package = "lattice/proto";
+
+// TemperatureReading is published to home.sensor.temperature.
+// value is required; range -50.0 .. 150.0 °C.
+// unit is optional; max 10 chars.
+message TemperatureReading {
+    optional float  value = 1;
+    optional string unit  = 2;
+}
+
+// LightAction is the valid command set for home.light.command.
+enum LightAction {
+    LIGHT_ACTION_UNSPECIFIED = 0;
+    LIGHT_ACTION_ON          = 1;
+    LIGHT_ACTION_OFF         = 2;
+    LIGHT_ACTION_TOGGLE      = 3;
+}
+
+// LightCommand is published to home.light.command.
+// action is required (ON/OFF/TOGGLE); brightness is optional (0.0..1.0).
+message LightCommand {
+    optional LightAction action     = 1;
+    optional float       brightness = 2;
+}
