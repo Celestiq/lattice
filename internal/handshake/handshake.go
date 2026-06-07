@@ -80,6 +80,7 @@ func DoServer(
 		sendError(conn, "INTERNAL", "could not create session")
 		return nil, fmt.Errorf("handshake: create session: %w", err)
 	}
+	rec.Capabilities = hello.Capabilities
 
 	serverPub := serverPriv.Public().(ed25519.PublicKey)
 	ack := &pb.HelloAck{

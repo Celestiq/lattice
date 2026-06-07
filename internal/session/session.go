@@ -11,10 +11,11 @@ import (
 
 // Record holds state for a single authenticated connection.
 type Record struct {
-	ID        string    // UUID v4
-	Pubkey    []byte    // Ed25519 public key (32 bytes)
-	Token     []byte    // 32-byte random session token
-	CreatedAt time.Time
+	ID           string    // UUID v4
+	Pubkey       []byte    // Ed25519 public key (32 bytes)
+	Token        []byte    // 32-byte random session token
+	CreatedAt    time.Time
+	Capabilities []string  // subjects declared at HELLO time; informational only
 }
 
 // Table is a thread-safe session store indexed by session ID and by pubkey.

@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package lattice;
+
+option go_package = "lattice/proto";
+
+// System events published by the server to lattice.system.entity.*.
+// These bypass schema validation — they are server-generated and trusted.
+
+message EntityJoined {
+    bytes           pubkey       = 1; // Ed25519 public key (32 bytes)
+    repeated string capabilities = 2; // subjects declared at HELLO time
+    string          session_id   = 3;
+}
+
+message EntityLeft {
+    bytes  pubkey     = 1;
+    string session_id = 2;
+}
+
+message EntityOffline {
+    bytes  pubkey     = 1;
+    string session_id = 2;
+}

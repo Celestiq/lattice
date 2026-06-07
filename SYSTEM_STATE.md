@@ -1,6 +1,6 @@
 # Lattice — System State
 
-**Scope:** Local orchestration only · **Language:** Go 1.23 · **Sessions complete:** 1–4 of 8
+**Scope:** Local orchestration only · **Language:** Go 1.23 · **Sessions complete:** 1–6 of 8
 
 This document captures the current state of the Lattice codebase: what exists, how the pieces fit together, and what comes next. It is the right place to start before reading any source file.
 
@@ -14,7 +14,7 @@ Lattice is a message bus for locally-connected entities (services, devices, agen
 - **Subscribe** to subjects with wildcards (`home.>`, `home.*.temperature`)
 - **Call** other entities point-to-point by public key (Session 7, not yet built)
 
-Everything is binary, framed, and typed. All payloads are Protobuf. All connections use TLS 1.3. All identities are Ed25519 key pairs.
+Everything is binary, framed, and typed. All payloads are Protobuf. All connections use TLS 1.3. All identities are Ed25519 key pairs. Every SUBSCRIBE and PUBLISH is checked against an ACL engine (deny-by-default) before any other processing.
 
 ---
 
@@ -32,10 +32,13 @@ lattice/
 │   ├── handshake/         # HELLO exchange (both sides)
 │   ├── bus/               # subject validation + subscription registry
 │   ├── schema/            # payload validators for registered subjects
+│   ├── acl/               # access-control engine (Sessions 5)
+│   ├── registry/          # entity liveness tracking (Session 6)
 │   └── node/              # server connection handler (owns all of the above)
 ├── proto/
 │   ├── frames.proto       # 14 frame types + message definitions
-│   └── schemas.proto      # TemperatureReading, LightCommand
+│   ├── schemas.proto      # TemperatureReading, LightCommand
+│   └── events.proto       # EntityJoined, EntityLeft, EntityOffline
 └── go.mod                 # single dependency: google.golang.org/protobuf
 ```
 
@@ -100,19 +103,37 @@ HELLO exchange  (internal/handshake)
   server sends:  HELLO_ACK { session_id, session_token, server_pubkey, heartbeat_interval }
     │
     ▼
+Post-handshake setup  (internal/node)
+  registry.Register(sessionID, pubkey, capabilities)
+  publish lattice.system.entity.joined
+    │
+    ▼
 Frame dispatch loop  (internal/node)
-  HEARTBEAT      → HEARTBEAT_ACK
-  SUBSCRIBE      → bus.Subscribe
+  HEARTBEAT      → registry.UpdateHeartbeat → HEARTBEAT_ACK
+  SUBSCRIBE      → acl.Allow(subscribe) → bus.Subscribe
   UNSUBSCRIBE    → bus.Unsubscribe
-  PUBLISH        → ValidateSubject → schema.Validate → bus.Fanout → DELIVER to each
+  PUBLISH        → ValidateSubject → acl.Allow(publish) → schema.Validate → bus.Fanout → DELIVER to each
   anything else  → logged, ignored
     │
     ▼
-Cleanup on disconnect (in order):
-  1. session.Table.Remove(sessionID)
-  2. bus.Bus.RemoveSession(sessionID)
-  3. conns.Delete(sessionID)       ← prevents new fanout writes to this conn
-  4. conn.Close()
+Cleanup on disconnect — two paths:
+
+  GRACEFUL (client closes / read error):
+    registry.Remove(pubkey) → returns record (non-nil)
+    bus.RemoveSession(sessionID)
+    conns.Delete(sessionID)
+    sessions.Remove(sessionID)
+    publish lattice.system.entity.left
+    conn.Close()
+
+  OFFLINE (heartbeat checker marks stale):
+    registry.Remove(pubkey) → returns record (non-nil)
+    bus.RemoveSession(sessionID)
+    conns.LoadAndDelete(sessionID)
+    sessions.Remove(sessionID)
+    publish lattice.system.entity.offline
+    conn.Close()
+    → HandleConn defer: registry.Remove returns nil → skips entity.left (already handled)
 ```
 
 The TLS nonce used in HELLO is derived from `tls.ConnectionState.ExportKeyingMaterial("lattice-hello-v1", nil, 32)`. Both sides call this on their respective ends of the same TLS session and get the identical 32 bytes — the server never sends it to the client.
@@ -135,13 +156,14 @@ The fundamental unit of communication. `wire.Read` and `wire.Write` are the only
 ### `session.Record` — `internal/session/session.go`
 ```go
 type Record struct {
-    ID        string    // UUID v4, generated at HELLO time
-    Pubkey    []byte    // Ed25519 public key (32 bytes)
-    Token     []byte    // 32 random bytes, sent to client in HELLO_ACK
-    CreatedAt time.Time
+    ID           string    // UUID v4, generated at HELLO time
+    Pubkey       []byte    // Ed25519 public key (32 bytes)
+    Token        []byte    // 32 random bytes, sent to client in HELLO_ACK
+    CreatedAt    time.Time
+    Capabilities []string  // declared in HELLO frame; informational only
 }
 ```
-One record per authenticated connection. Lifetime: created in `handshake.DoServer`, removed in `node.HandleConn`'s cleanup defer.
+One record per authenticated connection. Capabilities are set by `handshake.DoServer` from the HELLO frame and stored here for use in system events.
 
 ---
 
@@ -153,7 +175,7 @@ type Table struct {
     byPubkey map[string]*Record // hex(pubkey) → record
 }
 ```
-The server's source of truth for who is connected. Dual-indexed so it can be looked up by session ID (frame routing) or by pubkey (entity registry in Session 6).
+The server's source of truth for who is connected. Dual-indexed so it can be looked up by session ID (frame routing) or by pubkey (registry lookups).
 
 ---
 
@@ -186,18 +208,69 @@ The subscription registry. Patterns come from SUBSCRIBE frames; session IDs come
 
 ---
 
+### `acl.Engine` — `internal/acl/acl.go`
+```go
+type Engine struct {
+    mu    sync.RWMutex
+    rules []Rule // kept in descending Priority order
+}
+
+type Rule struct {
+    IdentityPattern string  // base32(pubkey) (no padding) or "*"
+    Action          Action  // "publish" | "subscribe" | "call"
+    SubjectPattern  string  // same wildcard syntax as subscription patterns
+    Effect          Effect  // Allow | Deny
+    Priority        int     // higher = evaluated first
+}
+```
+Deny-by-default. `Allow(pubkey, action, subject)` walks rules in priority order; the first match decides. No match → deny.
+
+`EncodeIdentity(pubkey []byte) string` converts a raw Ed25519 public key to the canonical base32 (no-padding) string used in identity patterns and log output.
+
+At server startup, two rules at priority 1000 allow the server's own identity to publish and subscribe to everything (`>`). These let the server emit system events without being blocked by its own ACL.
+
+---
+
+### `registry.EntityRecord` — `internal/registry/registry.go`
+```go
+type EntityRecord struct {
+    Pubkey          []byte
+    Capabilities    []string
+    SessionID       string
+    ConnectedAt     time.Time
+    LastHeartbeatAt time.Time
+}
+```
+Runtime liveness state per entity. `LastHeartbeatAt` is initialised to `ConnectedAt` and refreshed on every HEARTBEAT frame. The heartbeat checker compares `now − LastHeartbeatAt` against `3 × heartbeatInterval` to decide whether an entity is stale.
+
+---
+
+### `registry.Registry` — `internal/registry/registry.go`
+```go
+type Registry struct {
+    mu       sync.RWMutex
+    entities map[string]*EntityRecord // hex(pubkey) → record
+}
+```
+`Remove(pubkey)` returns the record if it existed, or `nil` if it was already removed. This nil-check is the mechanism that prevents both cleanup paths (graceful and offline) from running simultaneously for the same entity.
+
+---
+
 ### `node.Server` — `internal/node/node.go`
 ```go
 type Server struct {
     log               *slog.Logger
     sessions          *session.Table
     bus               *bus.Bus
+    acl               *acl.Engine
+    registry          *registry.Registry
     serverPriv        ed25519.PrivateKey
-    heartbeatInterval uint32
+    serverPub         ed25519.PublicKey
+    heartbeatInterval uint32 // seconds
     conns             sync.Map // sessionID → *lockedConn
 }
 ```
-The top-level server object. Created once; `HandleConn` is called in a goroutine per accepted connection. Owns all shared state.
+The top-level server object. Created once; `HandleConn` is called in a goroutine per accepted connection. Owns all shared state. On creation, starts the `runHeartbeatChecker` goroutine.
 
 ---
 
@@ -224,6 +297,10 @@ Client B sends PUBLISH { subject: "home.sensor.temperature", payload: <proto byt
     ├─ bus.ValidateSubject("home.sensor.temperature")
     │      checks: no wildcards, not lattice.system.*, ≤16 segs, ≤256 chars
     │
+    ├─ acl.Allow(rec.Pubkey, "publish", "home.sensor.temperature")
+    │      walks rules in priority order; first match wins; default deny
+    │      → ERROR to publisher if denied; delivery stops here
+    │
     ├─ schema.Validate("home.sensor.temperature", payload)
     │      unmarshals TemperatureReading, checks:
     │        value is present, value ∈ [-50, 150]
@@ -243,7 +320,33 @@ Client B sends PUBLISH { subject: "home.sensor.temperature", payload: <proto byt
                └─ mutex.Lock → wire.Write → mutex.Unlock
 ```
 
-The publisher's goroutine does all of this synchronously. If a subscriber's connection is slow to write, it blocks that goroutine. Fan-out concurrency is a Session 6+ concern.
+---
+
+## System Events
+
+The server publishes system events to three reserved subjects. These bypass ACL, subject validation, and schema validation — they are server-generated and trusted.
+
+| Subject | Proto message | Trigger |
+|---------|--------------|---------|
+| `lattice.system.entity.joined` | `EntityJoined { pubkey, capabilities, session_id }` | Entity completes HELLO handshake |
+| `lattice.system.entity.left` | `EntityLeft { pubkey, session_id }` | Entity disconnects gracefully |
+| `lattice.system.entity.offline` | `EntityOffline { pubkey, session_id }` | Entity misses 3 × heartbeat_interval |
+
+Any entity can subscribe to `lattice.system.>` to observe the presence layer. The offline entity's own subscriptions are removed *before* its offline event is published, so it cannot receive its own eviction notice.
+
+---
+
+## Heartbeat Checker
+
+`runHeartbeatChecker` is a goroutine started in `node.New`. It ticks every `heartbeatInterval` seconds and calls `registry.Stale(now, 3×interval)` to find entities that have gone silent. For each stale entity it calls `markOffline`, which:
+
+1. Calls `registry.Remove` — if nil, another goroutine already handled it; return immediately.
+2. Removes the entity's subscriptions from the bus.
+3. Removes and retrieves the `*lockedConn` from `conns`.
+4. Removes the session from the session table.
+5. Publishes `lattice.system.entity.offline` (while other subscribers are still in `conns`).
+6. Closes the connection, causing `HandleConn`'s `wire.Read` to return EOF.
+7. `HandleConn`'s defer runs: `registry.Remove` returns nil → skips `entity.left`.
 
 ---
 
@@ -270,6 +373,8 @@ Currently two subjects have registered schemas (hardcoded in `internal/schema/sc
 | `home.light.command` | `LightCommand` | `action` required (ON/OFF/TOGGLE), `brightness` optional (float32, 0.0..1.0) |
 
 Proto3 `optional` is used for all fields so the validator can distinguish "not set" from "set to zero value".
+
+> **Note:** In production, the schema registry would be dynamic — schemas registered at runtime using Protobuf `FileDescriptorProto` and `dynamicpb` for runtime-defined message types. The hardcoded `schemas.proto` is a development scaffold.
 
 ---
 
@@ -312,21 +417,18 @@ go test ./...
 | `internal/handshake` | 6 | Valid HELLO, corrupted signature, mismatched pubkey, two concurrent sessions, HEARTBEAT round-trip, session token storage |
 | `internal/bus` | 17 | Wildcard matching (exact, `*`, `>`), pattern/subject validation, subscribe/unsubscribe/fanout, deduplication, session cleanup |
 | `internal/schema` | 13 | Both schemas: valid payloads, out-of-range values, missing required fields, invalid enum, string length, unknown subject |
-| `internal/node` | 16 | Full server integration: pub/sub delivery, wildcard delivery, unsubscribe, disconnect cleanup, invalid patterns, schema rejection, rejection recovery |
-| **Total** | **59** | |
+| `internal/acl` | 7 | Deny by default, exact identity allow, wildcard identity, priority ordering, deny overrides lower-priority allow, ActionCall reserved |
+| `internal/node` | 28 | Full server integration: pub/sub delivery, wildcard delivery, unsubscribe, disconnect cleanup, invalid patterns, schema rejection, ACL deny, ACL wildcard allow, priority ordering, entity.joined/left/offline events, simultaneous joins, no-delivery-after-offline |
+| **Total** | **78** | |
 
 ---
 
-## What Is Not Yet Built (Sessions 5–8)
+## What Is Not Yet Built (Sessions 7–8)
 
 | Session | What it adds |
 |---------|-------------|
-| **5 — ACL engine** | Every SUBSCRIBE and PUBLISH checked against rules. Deny by default. Rules have identity pattern, action, subject pattern, effect, priority. |
-| **6 — Entity registry + system events** | Server tracks connected entities. `lattice.system.entity.joined/left/offline` published on connect/disconnect/missed heartbeat. |
-| **7 — Call primitive** | `REQUEST` addressed to a target pubkey; server forwards to target; `RESPONSE` forwarded back. Correlation ID ties pairs. Timeout on server side. |
-| **8 — Integration** | Full end-to-end test sequence. Graceful shutdown. README and demo script. |
-
-The PUBLISH handler has a comment marking where the ACL check will be inserted (before schema validation, per spec).
+| **7 — Call primitive** | `REQUEST` addressed to a target pubkey; server forwards to target; `RESPONSE` forwarded back. Correlation ID ties pairs. ACL check `(caller, "call", target_pubkey)`. Server-side timeout with pending call registry. |
+| **8 — Integration** | Full end-to-end test sequence. Graceful shutdown (publish `entity.left` for all connected entities on Ctrl+C). README and demo script. |
 
 ---
 
@@ -340,7 +442,9 @@ cmd/lattice-node
             │       ├── internal/wire
             │       └── proto/
             ├── internal/bus
-            ├── internal/schema ──► proto/
+            ├── internal/schema  ──► proto/
+            ├── internal/acl     ──► internal/bus (for Match)
+            ├── internal/registry
             └── internal/wire
 
 cmd/lattice-client
@@ -349,9 +453,11 @@ cmd/lattice-client
     ├── internal/wire
     └── proto/
 
-internal/wire ──► proto/
-internal/identity  (stdlib only)
-internal/session   (stdlib only)
+internal/wire     ──► proto/
+internal/identity    (stdlib only)
+internal/session     (stdlib only)
+internal/registry    (stdlib only)
+internal/acl      ──► internal/bus
 ```
 
 No import cycles. The `proto/` package is a leaf — nothing in it imports internal packages.
