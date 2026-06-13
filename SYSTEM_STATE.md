@@ -1,8 +1,8 @@
 # Lattice — System State
 
-**Scope:** Local orchestration only · **Language:** Go 1.23 · **Sessions complete:** 1–8 of 8 · **Status: v0.1 done**
+**Scope:** Local orchestration only · **Language:** Go 1.23 · **v0.1.1 hardening:** Sessions 0–3 complete · **Branch:** `dev/v0.1.1-hardening`
 
-This document captures the complete state of the Lattice v0.1 codebase: what exists, how the pieces fit together, and the design decisions behind them. Start here before reading any source file.
+This document captures the complete state of the Lattice codebase: what exists, how the pieces fit together, and the design decisions behind them. Start here before reading any source file.
 
 ---
 
@@ -99,10 +99,11 @@ TCP accept
 TLS 1.3 handshake  (crypto/tls, self-signed Ed25519 cert)
     │
     ▼
-HELLO exchange  (internal/handshake)
-  client sends:  HELLO { pubkey, signature over TLS-exporter nonce }
-  server checks: ed25519.Verify(pubkey, nonce, signature)
-  server sends:  HELLO_ACK { session_id, session_token, server_pubkey, heartbeat_interval }
+HELLO exchange  (internal/handshake)  — 10-second deadline enforced
+  client sends:  HELLO { pubkey, signature(clientNonce), protocol_version=1, capabilities }
+  server checks: ed25519.Verify(pubkey, clientNonce, signature); version check
+  server sends:  HELLO_ACK { session_id, session_token, server_pubkey, server_signature, heartbeat_interval }
+  client checks: ed25519.Verify(server_pubkey, serverNonce, server_signature); pinned-key check (TOFU)
     │
     ▼
 Post-handshake setup  (internal/node)
@@ -111,16 +112,16 @@ Post-handshake setup  (internal/node)
     │
     ▼
 Frame dispatch loop  (internal/node)
-  HEARTBEAT      → registry.UpdateHeartbeat → HEARTBEAT_ACK
+  HEARTBEAT      → registry.UpdateHeartbeat → HEARTBEAT_ACK (ctrl-priority lane)
   SUBSCRIBE      → acl.Allow(subscribe) → bus.Subscribe
   UNSUBSCRIBE    → bus.Unsubscribe
-  PUBLISH        → ValidateSubject → acl.Allow(publish) → schema.Validate → bus.Fanout → DELIVER to each
+  PUBLISH        → ValidateSubject → acl.Allow(publish) → schema.Validate → bus.Fanout → for each subscriber: acl.AllowConcrete(subscribe, subject) → DELIVER
   REQUEST        → acl.Allow(call) → registry.Get(target) → calls.Add → forward REQUEST to target
   RESPONSE       → calls.Remove(correlationID) → forward RESPONSE to requester
   anything else  → logged, ignored
     │
     ▼
-Cleanup on disconnect — two paths:
+Cleanup on disconnect — three paths:
 
   GRACEFUL (client closes / read error):
     registry.Remove(pubkey) → returns record (non-nil)
@@ -128,7 +129,8 @@ Cleanup on disconnect — two paths:
     conns.Delete(sessionID)
     sessions.Remove(sessionID)
     publish lattice.system.entity.left
-    conn.Close()
+    conn.Close()     → interrupts any pending write in sessionWriter
+    sw.close()       → waits for writer goroutine to exit
 
   OFFLINE (heartbeat checker marks stale):
     registry.Remove(pubkey) → returns record (non-nil)
@@ -136,11 +138,22 @@ Cleanup on disconnect — two paths:
     conns.LoadAndDelete(sessionID)
     sessions.Remove(sessionID)
     publish lattice.system.entity.offline
-    conn.Close()
-    → HandleConn defer: registry.Remove returns nil → skips entity.left (already handled)
+    sw.conn.Close()  → writer goroutine detects error, calls onWriteError (no-op: already removed), exits
+    → HandleConn defer: registry.Remove returns nil → skips entity.left; sw.close() fast-returns
+
+  WRITE TIMEOUT (5-second per-write deadline in sessionWriter):
+    sessionWriter.write() detects error → conn.Close() → onWriteError closure fires
+    registry.Remove(pubkey) → if nil, return (another path got here first)
+    bus.RemoveSession(sessionID)
+    conns.Delete(sessionID)
+    sessions.Remove(sessionID)
+    publish lattice.system.entity.offline
+    → HandleConn read loop exits (conn closed) → defer: registry.Remove returns nil → skips entity.left
 ```
 
-The TLS nonce used in HELLO is derived from `tls.ConnectionState.ExportKeyingMaterial("lattice-hello-v1", nil, 32)`. Both sides call this on their respective ends of the same TLS session and get identical 32 bytes — the server never transmits it.
+Both TLS exporter nonces are derived via `tls.ConnectionState.ExportKeyingMaterial`. Two distinct labels prevent the same bytes from being signed in both directions:
+- Client nonce: `"lattice-hello-v1"` — signed by the client, verified by the server
+- Server nonce: `"lattice-hello-server-v1"` — signed by the server, verified by the client
 
 ---
 
@@ -150,8 +163,8 @@ The TLS nonce used in HELLO is derived from `tls.ConnectionState.ExportKeyingMat
 
 1. `close(s.done)` — signals background goroutines (heartbeat checker, call timeout checker) to stop.
 2. Iterates `registry.All()` snapshot; calls `registry.Remove` for each (prevents HandleConn defers from double-publishing).
-3. Publishes `lattice.system.entity.left` for each removed entity while connections are still open.
-4. `conns.Range` — closes every active connection; HandleConn goroutines see EOF and exit.
+3. Publishes `lattice.system.entity.left` for each removed entity (frames are enqueued into subscriber writers' data channels while those writers are still running).
+4. `conns.Range` — for each `sessionWriter`: calls `sw.close()` (drains buffered frames including entity.left, with 5-second write deadline per frame), then `sw.conn.Close()` so HandleConn's read loop exits.
 5. `s.wg.Wait()` — blocks until all HandleConn goroutines and both background goroutines have exited.
 
 The CLI binary hooks SIGINT/SIGTERM: closes the listener first (stops new connections), then calls `srv.Shutdown()`.
@@ -174,11 +187,11 @@ The fundamental unit of communication. `wire.Read` and `wire.Write` are the only
 ### `session.Record` — `internal/session/session.go`
 ```go
 type Record struct {
-    ID           string    // UUID v4, generated at HELLO time
-    Pubkey       []byte    // Ed25519 public key (32 bytes)
-    Token        []byte    // 32 random bytes, sent to client in HELLO_ACK
+    ID           string           // UUID v4, generated at HELLO time
+    Pubkey       []byte           // Ed25519 public key (32 bytes)
+    Token        []byte           // 32 random bytes, sent to client in HELLO_ACK
     CreatedAt    time.Time
-    Capabilities []string  // declared in HELLO frame; informational only
+    Capabilities []*pb.Capability // declared in HELLO frame; propagated to EntityJoined event
 }
 ```
 
@@ -223,13 +236,21 @@ type Bus struct {
 - `>` matches one or more segments, terminal only: `home.>` matches `home.sensor.temperature` and `home.sensor`
 - `>` in non-terminal position is rejected at subscribe time
 
+`PatternsIntersect(a, b string) bool` — in `internal/bus/subject.go`. Reports whether any concrete subject exists that matches both patterns. Used by the ACL engine for delivery-time correctness reasoning. Algorithm: walk segment pairs; `>` matches any remaining suffix of length ≥ 1 (returns true immediately if the other side still has segments), `*` matches any one segment, literals must be equal, length mismatch returns false.
+
 ---
 
 ### `acl.Engine` — `internal/acl/acl.go`
 ```go
+type cacheKey struct {
+    identity string
+    action   Action
+}
+
 type Engine struct {
     mu    sync.RWMutex
-    rules []Rule // kept in descending Priority order
+    rules []Rule             // kept in descending Priority order
+    cache map[cacheKey][]Rule // identity-indexed rule cache; protected by mu; reset on AddRule
 }
 
 type Rule struct {
@@ -240,7 +261,11 @@ type Rule struct {
     Priority        int     // higher = evaluated first
 }
 ```
-Deny-by-default. `Allow(pubkey, action, subject)` walks rules in priority order; the first match decides. No match → deny.
+Deny-by-default. Two methods check ACL:
+
+- **`Allow(pubkey, action, subject)`** — subscribe/publish/call gate. Walks the full rule list under RLock; no caching. The `subject` argument may be a wildcard pattern (e.g., the subscription pattern `home.>`). Used in `handleSubscribe`, `handlePublish`, `handleRequest`.
+
+- **`AllowConcrete(pubkey, action, subject)`** — delivery-time gate. Same logic as `Allow` but uses an identity-indexed cache (`cacheKey{identity, action}` → `[]Rule`) to avoid scanning all rules on every DELIVER. Cache is built lazily on first call and invalidated (replaced with a fresh map) on every `AddRule`. Uses double-checked locking: read under RLock, write under WLock on miss. The `subject` argument must be a concrete (non-wildcard) string. Used in `fanout` and `publishSystemEvent`.
 
 `EncodeIdentity(pubkey []byte) string` converts a raw Ed25519 public key to the canonical base32 (no-padding) string used in identity patterns.
 
@@ -254,7 +279,7 @@ At server startup, two rules at priority 1000 allow the server's own identity to
 ```go
 type EntityRecord struct {
     Pubkey          []byte
-    Capabilities    []string
+    Capabilities    []*pb.Capability
     SessionID       string
     ConnectedAt     time.Time
     LastHeartbeatAt time.Time
@@ -271,7 +296,7 @@ type Registry struct {
     entities map[string]*EntityRecord // hex(pubkey) → record
 }
 ```
-`Remove(pubkey)` returns the record if it existed, or `nil` if already removed. This nil-check is the sentinel that prevents the graceful, offline, and shutdown disconnect paths from all firing for the same entity.
+`Remove(pubkey)` returns the record if it existed, or `nil` if already removed. This nil-check is the sentinel that prevents the graceful, offline, write-timeout, and shutdown disconnect paths from all firing for the same entity.
 
 `Get(pubkey)` returns the record without removing it — used by `handleRequest` for target lookup.
 
@@ -305,7 +330,7 @@ type Server struct {
     serverPriv        ed25519.PrivateKey
     serverPub         ed25519.PublicKey
     heartbeatInterval uint32
-    conns             sync.Map   // sessionID → *lockedConn
+    conns             sync.Map   // sessionID → *sessionWriter
     wg                sync.WaitGroup
     stopOnce          sync.Once
     done              chan struct{}
@@ -315,14 +340,21 @@ Created once; `HandleConn` is called in a goroutine per accepted connection. The
 
 ---
 
-### `node.lockedConn` — `internal/node/node.go`
+### `node.sessionWriter` — `internal/node/writer.go`
 ```go
-type lockedConn struct {
-    mu   sync.Mutex
-    conn net.Conn
+type sessionWriter struct {
+    conn         net.Conn
+    ctrl         chan writerMsg  // cap 64  — HEARTBEAT_ACK, ERROR; never dropped under data congestion
+    data         chan writerMsg  // cap 128 — DELIVER, REQUEST, RESPONSE; dropped on overflow, logged
+    stopOnce     sync.Once
+    done         chan struct{}
+    wg           sync.WaitGroup
+    log          *slog.Logger
+    sessionID    string
+    onWriteError func()         // called after conn.Close() when a write deadline fires
 }
 ```
-A connection with a write mutex. Stored in `Server.conns` keyed by session ID. Required because any connection's goroutine can write to *any other* connection during fanout or REQUEST/RESPONSE forwarding.
+One per connection, stored in `Server.conns`. A dedicated goroutine drains both channels with ctrl priority: a fast non-blocking check of `ctrl` precedes every fair select, so a pending heartbeat-ack is never starved by a flood of DELIVER frames. Every `wire.Write` call sets a 5-second deadline; a missed deadline closes the conn and fires `onWriteError`. `close()` signals stop, drains buffered frames, and blocks until the goroutine exits — safe to call multiple times.
 
 ---
 
@@ -349,9 +381,14 @@ Client B sends PUBLISH { subject: "home.sensor.temperature", payload: <proto byt
     │      returns deduplicated []sessionID
     │
     └─ for each sessionID:
-           conns.Load(sessionID) → *lockedConn
-           lockedConn.writeFrame(DELIVER, { subject, payload })
-               └─ mutex.Lock → wire.Write → mutex.Unlock
+           sessions.ByID(sessionID) → *session.Record (nil → skip: session cleaned up)
+           acl.AllowConcrete(rec.Pubkey, "subscribe", subject)
+               → skip subscriber silently if denied (no ERROR to subscriber)
+               → uses identity-indexed rule cache (O(1) on hit); cache invalidated by AddRule
+           conns.Load(sessionID) → *sessionWriter
+           sw.enqueue(DELIVER, { subject, payload })
+               └─ non-blocking send to data channel (cap 128); drops + logs on overflow
+                  writer goroutine drains channel → wire.Write with 5s deadline
 ```
 
 ---
@@ -372,7 +409,7 @@ Client A sends REQUEST { correlation_id, target_pubkey=B, payload, timeout_ms }
     ├─ calls.Add(correlation_id, A.sessionID, now+timeout_ms)
     │      registered BEFORE forwarding (avoids response-arrives-first race)
     │
-    └─ targetLc.writeFrame(REQUEST, payload)  ─────────────► Client B receives REQUEST
+    └─ targetSw.enqueue(REQUEST, payload) ───────────────────► Client B receives REQUEST
 
 Client B sends RESPONSE { correlation_id, payload }
     │
@@ -381,22 +418,22 @@ Client B sends RESPONSE { correlation_id, payload }
     ├─ calls.Remove(correlation_id) → *PendingCall
     │      → ERROR NOT_FOUND if correlation_id unknown or already expired
     │
-    └─ requesterLc.writeFrame(RESPONSE, payload) ──────────► Client A receives RESPONSE
+    └─ requesterSw.enqueue(RESPONSE, payload) ───────────────► Client A receives RESPONSE
 
-(If no RESPONSE within timeout_ms, runCallTimeoutChecker fires ERROR TIMEOUT to A)
+(If no RESPONSE within timeout_ms, runCallTimeoutChecker fires ERROR TIMEOUT to A via enqueueControl)
 ```
 
 ---
 
 ## System Events
 
-The server publishes to three reserved subjects. These bypass ACL, subject validation, and schema validation.
+The server publishes to three reserved subjects. These bypass publish-side ACL, subject format validation, and schema validation. **Delivery-time ACL is enforced**: a subscriber whose rules include `deny lattice.system.entity.joined` (or any covering pattern) will not receive that event.
 
 | Subject | Proto message | Trigger |
 |---------|--------------|---------|
 | `lattice.system.entity.joined` | `EntityJoined { pubkey, capabilities, session_id }` | Entity completes HELLO handshake |
 | `lattice.system.entity.left` | `EntityLeft { pubkey, session_id }` | Graceful disconnect or server shutdown |
-| `lattice.system.entity.offline` | `EntityOffline { pubkey, session_id }` | Entity misses 3 × heartbeat_interval |
+| `lattice.system.entity.offline` | `EntityOffline { pubkey, session_id }` | Entity misses 3 × heartbeat_interval, or write deadline exceeded |
 
 The offline entity's own subscriptions are removed *before* its offline event is published, so it cannot receive its own eviction notice.
 
@@ -408,17 +445,17 @@ The offline entity's own subscriptions are removed *before* its offline event is
 
 1. `registry.Remove` — if nil, another goroutine already handled it; return.
 2. Remove subscriptions from the bus.
-3. Remove `*lockedConn` from `conns`.
+3. Remove `*sessionWriter` from `conns` via `LoadAndDelete`.
 4. Remove session from the session table.
 5. Publish `entity.offline` (while other subscribers are still in `conns`).
-6. Close the connection → HandleConn's `wire.Read` returns EOF.
-7. HandleConn defer: `registry.Remove` returns nil → skips `entity.left`.
+6. `sw.conn.Close()` → HandleConn's `wire.Read` returns error; the sessionWriter goroutine detects the closed conn on its next write, calls `onWriteError` (which is a no-op since the entity is already removed), and exits.
+7. HandleConn defer: `registry.Remove` returns nil → skips `entity.left`; `sw.close()` fast-returns (goroutine already exited).
 
 ---
 
 ## Call Timeout Checker
 
-`runCallTimeoutChecker` ticks every 1 second. Calls `calls.Expired(now)` to retrieve and atomically remove all pending calls past their deadline. For each expired call, sends `ERROR { code: "TIMEOUT" }` to the requester's session (silently drops if requester already disconnected — `conns.Load` miss).
+`runCallTimeoutChecker` ticks every 1 second. Calls `calls.Expired(now)` to retrieve and atomically remove all pending calls past their deadline. For each expired call, sends `ERROR { code: "TIMEOUT" }` to the requester via `enqueueControl` (silently drops if requester already disconnected — `conns.Load` miss).
 
 ---
 
@@ -457,7 +494,7 @@ Proto3 `optional` is used for all fields so the validator can distinguish "not s
 | `lattice-node` | `node.key` | `--key` |
 | `lattice-client` | `client.key` | `--key` |
 
-The server generates a **fresh self-signed TLS certificate at each startup** (not persisted). Clients use `InsecureSkipVerify: true`; CA pinning is deferred.
+The server generates a **fresh self-signed TLS certificate at each startup** (not persisted). Clients use `InsecureSkipVerify: true` — the TLS certificate is not the trust anchor; the Ed25519 mutual-auth signature exchange is. On first connection (TOFU), the client writes the server's Ed25519 pubkey to `server.pin`; subsequent connections verify against it.
 
 ---
 
@@ -470,14 +507,14 @@ go test ./...
 | Package | Tests | What they cover |
 |---------|-------|-----------------|
 | `internal/wire` | 7 | Frame encode/decode, 256 KiB boundary, concurrent clients, mid-read disconnect |
-| `internal/handshake` | 6 | Valid HELLO, corrupted signature, mismatched pubkey, concurrent sessions, HEARTBEAT round-trip, session token |
-| `internal/bus` | 17 | Wildcard matching (`*`, `>`), pattern/subject validation, subscribe/unsubscribe/fanout, deduplication, session cleanup |
+| `internal/handshake` | 11 | Valid HELLO, corrupted signature, mismatched pubkey, concurrent sessions, HEARTBEAT round-trip, session token, server signature verify/forge, pin mismatch, unsupported protocol version, typed capabilities, handshake deadline (10s, skipped in short mode) |
+| `internal/bus` | 26 | Wildcard matching (`*`, `>`), pattern/subject validation, subscribe/unsubscribe/fanout, deduplication, session cleanup; 9 `PatternsIntersect` cases (identical, gt-vs-exact, gt-vs-gt, broader-gt, star-vs-exact, different-prefix, private-vs-broader, disjoint-lengths, star-length-mismatch) |
 | `internal/schema` | 13 | Both schemas: valid payloads, out-of-range values, missing fields, invalid enum, string length, unknown subject |
-| `internal/acl` | 7 | Deny by default, exact allow, wildcard identity, priority ordering, deny overrides lower-priority allow |
-| `internal/node` | 35 | Full integration: pub/sub, wildcards, schema rejection, ACL deny/allow/priority, entity events, offline detection, call round-trip, call timeout, call ACL, requester disconnect, graceful shutdown |
-| **Total** | **85** | |
+| `internal/acl` | 11 | Deny by default, exact allow, wildcard identity, priority ordering, deny overrides lower-priority allow; `AllowConcrete` empty-deny, allow, delivery-time deny (wildcard bypass fix), cache invalidation after `AddRule` |
+| `internal/node` | 33 | 26 black-box integration tests (pub/sub, wildcards, schema rejection, ACL, entity events, offline detection, call round-trip/timeout/ACL, graceful shutdown, typed capabilities, delivery-time wildcard deny, system-event delivery deny); 7 white-box writer unit tests (delivery, write-error callback, idempotent close, close-waits-for-goroutine, channel overflow) |
+| **Total** | **101** | |
 
-The `TestIntegrationSequence` test covers all 10 steps of the Session 8 integration scenario in a single sequential test with per-step log output.
+The `TestIntegrationSequence` test covers all 10 steps of the full integration scenario in a single sequential test with per-step log output.
 
 ---
 

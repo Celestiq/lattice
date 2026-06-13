@@ -763,7 +763,7 @@ func TestCallTwoSimultaneous(t *testing.T) {
 
 	// B receives both forwarded REQUESTs (collect by correlation ID).
 	reqs := make(map[string]bool)
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		frame := b.recv(t, 2*time.Second)
 		if frame.Type != pb.FrameType_FRAME_TYPE_REQUEST {
 			t.Fatalf("B: expected REQUEST, got %v", frame.Type)
@@ -782,7 +782,7 @@ func TestCallTwoSimultaneous(t *testing.T) {
 
 	// A receives both responses; check payloads by correlation ID.
 	resps := make(map[string]string)
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		frame := a.recv(t, 2*time.Second)
 		if frame.Type != pb.FrameType_FRAME_TYPE_RESPONSE {
 			t.Fatalf("A: expected RESPONSE, got %v", frame.Type)
@@ -961,7 +961,7 @@ func TestTwoEntitiesJoinSimultaneously(t *testing.T) {
 	watcher.subscribe(t, "lattice.system.>")
 
 	var wg sync.WaitGroup
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -989,4 +989,60 @@ func TestTwoEntitiesJoinSimultaneously(t *testing.T) {
 	if joined < 2 {
 		t.Fatalf("expected 2 joined events, got %d", joined)
 	}
+}
+
+// ─── Session 3: delivery-time ACL (Decision #11) ─────────────────────────────
+
+// TestDeliveryTimeACLBlocksWildcardSubscriber is the core Session 3 regression:
+// subscribe-time Allow passes for a broad wildcard pattern, but a higher-priority
+// deny on the concrete published subject must silently drop the DELIVER frame.
+func TestDeliveryTimeACLBlocksWildcardSubscriber(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	publisher := connect(t, addr)
+	defer publisher.close()
+	subscriber := connect(t, addr)
+	defer subscriber.close()
+
+	pubID := acl.EncodeIdentity(publisher.pub)
+	subID := acl.EncodeIdentity(subscriber.pub)
+
+	srv.AddRule(acl.Rule{IdentityPattern: pubID, Action: acl.ActionPublish, SubjectPattern: "home.sensor.temperature", Effect: acl.Allow, Priority: 10})
+	// Broad subscribe allow at p10 — subscribe-time check for "home.>" passes.
+	srv.AddRule(acl.Rule{IdentityPattern: subID, Action: acl.ActionSubscribe, SubjectPattern: "home.>", Effect: acl.Allow, Priority: 10})
+	// High-priority deny for the specific concrete subject — fires at delivery time.
+	srv.AddRule(acl.Rule{IdentityPattern: subID, Action: acl.ActionSubscribe, SubjectPattern: "home.sensor.temperature", Effect: acl.Deny, Priority: 100})
+
+	subscriber.subscribe(t, "home.>") // subscribe-time check passes — deny does not match "home.>"
+
+	publisher.publish(t, "home.sensor.temperature", tempReading(22.5))
+
+	// Delivery-time deny must silently drop the frame; no DELIVER arrives.
+	subscriber.expectNoDeliver(t, 200*time.Millisecond)
+}
+
+// TestSystemEventDeliveryDeny verifies that a high-priority deny on a specific
+// system-event subject prevents delivery even when the broader subscription to
+// "lattice.system.>" was granted at subscribe time.
+func TestSystemEventDeliveryDeny(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	watcher := connect(t, addr)
+	defer watcher.close()
+
+	watcherID := acl.EncodeIdentity(watcher.pub)
+	// Broad allow at p10 — subscribe-time check for "lattice.system.>" passes.
+	srv.AddRule(acl.Rule{IdentityPattern: watcherID, Action: acl.ActionSubscribe, SubjectPattern: "lattice.system.>", Effect: acl.Allow, Priority: 10})
+	// High-priority deny for entity.joined only — fires at delivery time.
+	srv.AddRule(acl.Rule{IdentityPattern: watcherID, Action: acl.ActionSubscribe, SubjectPattern: "lattice.system.entity.joined", Effect: acl.Deny, Priority: 100})
+
+	watcher.subscribe(t, "lattice.system.>") // subscribe-time check passes
+
+	// New connection triggers entity.joined — watcher must not receive it.
+	joiner := connect(t, addr)
+	defer joiner.close()
+
+	watcher.expectNoDeliver(t, 300*time.Millisecond)
 }

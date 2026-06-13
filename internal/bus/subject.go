@@ -65,6 +65,33 @@ func ValidateSubject(subject string) error {
 	return nil
 }
 
+// PatternsIntersect reports whether there is any concrete subject that matches
+// both pattern a and pattern b. Both must be valid Lattice patterns.
+// Used by the ACL engine to check subscribe-time subsumption and delivery-time rules.
+func PatternsIntersect(a, b string) bool {
+	return intersectSegs(strings.Split(a, "."), strings.Split(b, "."), 0, 0)
+}
+
+func intersectSegs(a, b []string, i, j int) bool {
+	ia, ib := i >= len(a), j >= len(b)
+	if ia && ib {
+		return true // both fully consumed — an empty suffix matches
+	}
+	if ia || ib {
+		return false // one pattern still requires segments the other cannot provide
+	}
+	sa, sb := a[i], b[j]
+	if sa == ">" || sb == ">" {
+		// ">" matches any suffix of length ≥ 1; the other side still has a segment
+		// at this position (checked above), so a common subject always exists.
+		return true
+	}
+	if sa == "*" || sb == "*" || sa == sb {
+		return intersectSegs(a, b, i+1, j+1)
+	}
+	return false // literal mismatch — no common subject possible
+}
+
 // Match reports whether concrete subject matches pattern.
 // * matches exactly one segment. > matches one or more segments and must be terminal.
 func Match(pattern, subject string) bool {

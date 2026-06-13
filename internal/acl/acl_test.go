@@ -150,6 +150,96 @@ func TestActionIsolation(t *testing.T) {
 	}
 }
 
+// ─── AllowConcrete (delivery-time ACL) ───────────────────────────────────────
+
+func TestAllowConcreteEmptyDenies(t *testing.T) {
+	e := acl.New()
+	pub, _ := genKey(t)
+	if e.AllowConcrete(pub, acl.ActionSubscribe, "home.sensor.temperature") {
+		t.Fatal("empty engine must deny")
+	}
+}
+
+func TestAllowConcreteAllow(t *testing.T) {
+	e := acl.New()
+	pub, _ := genKey(t)
+	e.AddRule(acl.Rule{
+		IdentityPattern: "*",
+		Action:          acl.ActionSubscribe,
+		SubjectPattern:  "home.>",
+		Effect:          acl.Allow,
+		Priority:        10,
+	})
+	if !e.AllowConcrete(pub, acl.ActionSubscribe, "home.sensor.temperature") {
+		t.Fatal("should be allowed via home.>")
+	}
+}
+
+// DeliveryTimeDenyFixesWildcardBypass is the core bug that Session 3 fixes:
+// a subscriber on "home.>" gets allow at subscribe-time (Allow passes),
+// but a higher-priority deny for the concrete subject fires at delivery time.
+func TestAllowConcreteDeliveryTimeDeny(t *testing.T) {
+	e := acl.New()
+	pub, _ := genKey(t)
+	e.AddRule(acl.Rule{
+		IdentityPattern: "*",
+		Action:          acl.ActionSubscribe,
+		SubjectPattern:  "home.>",
+		Effect:          acl.Allow,
+		Priority:        10,
+	})
+	e.AddRule(acl.Rule{
+		IdentityPattern: acl.EncodeIdentity(pub),
+		Action:          acl.ActionSubscribe,
+		SubjectPattern:  "home.private.temperature",
+		Effect:          acl.Deny,
+		Priority:        100,
+	})
+
+	// Subscribe-time check for the broad pattern must still succeed.
+	if !e.Allow(pub, acl.ActionSubscribe, "home.>") {
+		t.Fatal("subscribe-time Allow must accept home.> (deny does not match that pattern)")
+	}
+	// Delivery-time check for the denied concrete subject must fail.
+	if e.AllowConcrete(pub, acl.ActionSubscribe, "home.private.temperature") {
+		t.Fatal("AllowConcrete must deny home.private.temperature")
+	}
+	// Other concrete subjects not covered by the deny remain allowed.
+	if !e.AllowConcrete(pub, acl.ActionSubscribe, "home.sensor.temperature") {
+		t.Fatal("AllowConcrete must allow home.sensor.temperature")
+	}
+}
+
+// TestACLCacheInvalidation verifies that AddRule clears the identity-indexed
+// cache so subsequent calls see the updated rule set.
+func TestACLCacheInvalidation(t *testing.T) {
+	e := acl.New()
+	pub, _ := genKey(t)
+	e.AddRule(acl.Rule{
+		IdentityPattern: "*",
+		Action:          acl.ActionSubscribe,
+		SubjectPattern:  "home.>",
+		Effect:          acl.Allow,
+		Priority:        10,
+	})
+	// Prime the cache — should allow.
+	if !e.AllowConcrete(pub, acl.ActionSubscribe, "home.sensor.temperature") {
+		t.Fatal("should be allowed before deny is added")
+	}
+	// Add a high-priority deny — must invalidate the cache.
+	e.AddRule(acl.Rule{
+		IdentityPattern: acl.EncodeIdentity(pub),
+		Action:          acl.ActionSubscribe,
+		SubjectPattern:  "home.sensor.temperature",
+		Effect:          acl.Deny,
+		Priority:        100,
+	})
+	// New deny must be visible on the very next call.
+	if e.AllowConcrete(pub, acl.ActionSubscribe, "home.sensor.temperature") {
+		t.Fatal("should be denied after high-priority deny rule is added")
+	}
+}
+
 // EncodeIdentity is deterministic and round-trips through base32.
 func TestEncodeIdentityDeterministic(t *testing.T) {
 	pub, _ := genKey(t)

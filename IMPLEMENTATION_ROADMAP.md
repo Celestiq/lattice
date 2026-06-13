@@ -16,8 +16,8 @@ All 18 decisions accounted for. Decision #13 (QUIC port) is explicitly deferred.
 |---------|-----------|-------|------|--------|
 | 0 | — | Pre-flight: key hygiene + proto toolchain | Low | `[x]` |
 | 1 | #1, #3, #7, #9, #17 | Handshake & identity hardening | **High** | `[x]` |
-| 2 | #10 | Bus flow control — per-session writer queues | **Highest** | `[ ]` |
-| 3 | #11 | ACL correctness — delivery-time check + rule cache | **High** | `[ ]` |
+| 2 | #10 | Bus flow control — per-session writer queues | **Highest** | `[x]` |
+| 3 | #11 | ACL correctness — delivery-time check + rule cache | **High** | `[x]` |
 | 4 | #12, #6, #8 | Session lifecycle correctness | Med | `[ ]` |
 | 5 | #4, #18, #5 | Message provenance & correlation envelopes | Med | `[ ]` |
 | 6 | #2 | Token-based session resume | Med | `[ ]` |
@@ -132,7 +132,7 @@ Plus the session-specific new tests listed below.
 
 ### Decision
 
-- [ ] **#10 — Per-session writer queues with slow-consumer policy**
+- [x] **#10 — Per-session writer queues with slow-consumer policy**
   Replace the synchronous `lockedConn.writeFrame` (which blocks on the publisher's goroutine holding a mutex) with a per-session bounded outbound channel drained by a dedicated writer goroutine. Fan-out enqueues a pre-serialised frame and returns immediately. Details:
   - **Write deadline:** 5 seconds on every `wire.Write` call. Exceeded → disconnect + publish `entity.offline`.
   - **Slow-consumer policy by subject class:**
@@ -169,7 +169,7 @@ Plus the session-specific new tests listed below.
 
 ### Decision
 
-- [ ] **#11 — Delivery-time ACL check + subscribe-time subsumption**
+- [x] **#11 — Delivery-time ACL check + subscribe-time subsumption**
   The current bug: subscribe-time ACL calls `bus.Match(rule.SubjectPattern, subscriptionPattern)` where `subscriptionPattern` is itself a wildcard pattern. A subscription to `home.>` does not string-match a deny rule on `home.private.>`, so the deny is silently skipped. There is no delivery-time re-check, so the subscriber receives every `home.private.*` message.
 
   **Two-layered fix:**

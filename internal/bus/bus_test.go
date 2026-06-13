@@ -147,3 +147,64 @@ func TestWildcardFanoutMultipleSubscribers(t *testing.T) {
 		t.Fatalf("expected 2 subscribers, got %v", sids)
 	}
 }
+
+// ─── PatternsIntersect ────────────────────────────────────────────────────────
+
+func TestPatternsIntersectIdentical(t *testing.T) {
+	if !bus.PatternsIntersect("home.sensor.temperature", "home.sensor.temperature") {
+		t.Fatal("identical patterns must intersect")
+	}
+}
+
+func TestPatternsIntersectGtVsExact(t *testing.T) {
+	// "home.>" and "home.sensor.temperature" share common subjects.
+	if !bus.PatternsIntersect("home.>", "home.sensor.temperature") {
+		t.Fatal("home.> and home.sensor.temperature must intersect")
+	}
+}
+
+func TestPatternsIntersectGtVsGt(t *testing.T) {
+	if !bus.PatternsIntersect("home.>", "home.>") {
+		t.Fatal("home.> and home.> must intersect")
+	}
+}
+
+func TestPatternsIntersectGtVsBroader(t *testing.T) {
+	if !bus.PatternsIntersect(">", "home.sensor.temperature") {
+		t.Fatal("> intersects any subject")
+	}
+}
+
+func TestPatternsIntersectStarVsExact(t *testing.T) {
+	if !bus.PatternsIntersect("home.*", "home.sensor") {
+		t.Fatal("home.* intersects home.sensor")
+	}
+}
+
+func TestPatternsIntersectDifferentPrefix(t *testing.T) {
+	if bus.PatternsIntersect("home.>", "work.>") {
+		t.Fatal("home.> and work.> must not intersect — different first segment")
+	}
+}
+
+func TestPatternsIntersectPrivateVsBroader(t *testing.T) {
+	// "home.private.>" has subjects like "home.private.x"; "home.>" also matches those.
+	if !bus.PatternsIntersect("home.private.>", "home.>") {
+		t.Fatal("home.private.> is a subset of home.> — they must intersect")
+	}
+}
+
+func TestPatternsIntersectDisjointLengths(t *testing.T) {
+	// "home.sensor" (2 segments) vs "home.sensor.temperature" (3 segments) cannot
+	// share a common subject because lengths differ and neither ends with ">".
+	if bus.PatternsIntersect("home.sensor", "home.sensor.temperature") {
+		t.Fatal("different fixed-length patterns with no wildcard must not intersect")
+	}
+}
+
+func TestPatternsIntersectStarLengthMismatch(t *testing.T) {
+	// "home.*" matches exactly 2-segment subjects; "home.sensor.>" needs 3+.
+	if bus.PatternsIntersect("home.*", "home.sensor.>") {
+		t.Fatal("home.* (2 segments) and home.sensor.> (3+ segments) must not intersect")
+	}
+}

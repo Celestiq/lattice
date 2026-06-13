@@ -267,7 +267,7 @@ func TestTwoClientsIndependentSessions(t *testing.T) {
 		mu         sync.Mutex
 		sessionIDs []string
 	)
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
