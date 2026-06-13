@@ -19,7 +19,7 @@ All 18 decisions accounted for. Decision #13 (QUIC port) is explicitly deferred.
 | 2 | #10 | Bus flow control — per-session writer queues | **Highest** | `[x]` |
 | 3 | #11 | ACL correctness — delivery-time check + rule cache | **High** | `[x]` |
 | 4 | #12, #6, #8 | Session lifecycle correctness | Med | `[x]` |
-| 5 | #4, #18, #5 | Message provenance & correlation envelopes | Med | `[ ]` |
+| 5 | #4, #18, #5 | Message provenance & correlation envelopes | Med | `[x]` |
 | 6 | #2 | Token-based session resume | Med | `[ ]` |
 | 7 | #14, #15, #16 | Dynamic schema registry + admin API | Med/Large | `[ ]` |
 
@@ -247,7 +247,7 @@ Plus the session-specific new tests listed below.
 
 ### Decisions
 
-- [ ] **#4 — DELIVER envelope**
+- [x] **#4 — DELIVER envelope**
   Extend `Deliver` from `{subject, payload}` to `{id, subject, publisher_identity, published_at, schema_version, payload}`. Fields:
   - `id`: `uint64`, server-assigned per-concrete-subject **monotonic counter** (not global). A new sequence allocator maps subject → atomic counter.
   - `publisher_identity`: base32 pubkey of the publishing entity, server-stamped (not client-asserted).
@@ -256,10 +256,10 @@ Plus the session-specific new tests listed below.
 
   **Amendment:** the per-subject `id` creates a conflict with `subscriber_offsets` keyed by pattern. A wildcard subscriber on `home.>` receives interleaved per-subject sequences — a single offset per pattern is meaningless. Durable offset tracking must key per concrete subject. Update the durable-messages storage design note in `DEV.md` before implementing.
 
-- [ ] **#18 — REQUEST caller identity**
+- [x] **#18 — REQUEST caller identity**
   Server stamps `caller_identity` (base32 pubkey of the requesting entity) and `received_at` (server timestamp) onto the `Request` proto before forwarding to the target. These fields are server-assigned — the target can trust them. The requesting client cannot assert them.
 
-- [ ] **#5 — ERROR frame correlation**
+- [x] **#5 — ERROR frame correlation**
   Add optional `ref_id string` to `Error`. Add optional `message_id string` to `Publish` — client-assigned. Server echoes `message_id` in any resulting ERROR (`ref_id = message_id`). For call timeouts, `runCallTimeoutChecker` echoes the expired `correlation_id` in the ERROR's `ref_id`.
 
 ### Files to Modify

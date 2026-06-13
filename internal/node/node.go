@@ -32,6 +32,7 @@ type Server struct {
 	acl               *acl.Engine
 	registry          *registry.Registry
 	calls             *call.Registry
+	seq               subjectSequencer   // per-subject monotonic DELIVER IDs (Decision #4)
 	serverPriv        ed25519.PrivateKey
 	serverPub         ed25519.PublicKey
 	heartbeatInterval uint32 // seconds
@@ -271,25 +272,25 @@ func (s *Server) handlePublish(sw *sessionWriter, rec *session.Record, payload [
 
 	// Reject wildcards and the reserved namespace before touching ACL.
 	if err := bus.ValidateSubject(msg.Subject); err != nil {
-		s.sendError(sw, "INVALID_SUBJECT", err.Error())
+		s.sendError(sw, "INVALID_SUBJECT", err.Error(), msg.MessageId)
 		return
 	}
 
 	// ACL check: session exists → ACL → schema → fan-out.
 	if !s.acl.Allow(rec.Pubkey, acl.ActionPublish, msg.Subject) {
 		s.log.Debug("publish denied by ACL", "session_id", rec.ID, "subject", msg.Subject)
-		s.sendError(sw, "PERMISSION_DENIED", "publish denied by ACL")
+		s.sendError(sw, "PERMISSION_DENIED", "publish denied by ACL", msg.MessageId)
 		return
 	}
 
 	// Schema validation.
 	if err := schema.Validate(msg.Subject, msg.Payload); err != nil {
-		s.sendError(sw, "SCHEMA_ERROR", err.Error())
+		s.sendError(sw, "SCHEMA_ERROR", err.Error(), msg.MessageId)
 		return
 	}
 
-	// Fan-out.
-	s.fanout(msg.Subject, msg.Payload)
+	// Fan-out — pass publisher pubkey for server-stamped provenance (Decision #4).
+	s.fanout(msg.Subject, msg.Payload, rec.Pubkey)
 }
 
 func (s *Server) handleRequest(sw *sessionWriter, rec *session.Record, payload []byte) {
@@ -334,7 +335,13 @@ func (s *Server) handleRequest(sw *sessionWriter, rec *session.Record, payload [
 	// before the pending entry exists.
 	s.calls.Add(req.CorrelationId, rec.ID, targetEnt.SessionID, deadline)
 
-	if !targetSw.enqueue(pb.FrameType_FRAME_TYPE_REQUEST, payload) {
+	// Stamp caller_identity and received_at server-side before forwarding so the
+	// target can trust these fields (Decision #18). Client-supplied values are overwritten.
+	req.CallerIdentity = acl.EncodeIdentity(rec.Pubkey)
+	req.ReceivedAt = time.Now().UnixMilli()
+	stampedPayload, _ := proto.Marshal(&req)
+
+	if !targetSw.enqueue(pb.FrameType_FRAME_TYPE_REQUEST, stampedPayload) {
 		s.calls.Remove(req.CorrelationId)
 		s.sendError(sw, "DELIVERY_FAILED", "target data channel full")
 	}
@@ -386,7 +393,13 @@ func (s *Server) runCallTimeoutChecker() {
 		case <-ticker.C:
 			for _, exp := range s.calls.Expired(time.Now()) {
 				if v, ok := s.conns.Load(exp.RequesterSessionID); ok {
-					payload, _ := proto.Marshal(&pb.Error{Code: "TIMEOUT", Message: "call timed out"})
+					// Echo correlation_id as ref_id so the requester can match the error
+					// to the originating call (Decision #5).
+					payload, _ := proto.Marshal(&pb.Error{
+						Code:    "TIMEOUT",
+						Message: "call timed out",
+						RefId:   exp.CorrelationID,
+					})
 					_ = v.(*sessionWriter).enqueueControl(pb.FrameType_FRAME_TYPE_ERROR, payload)
 				}
 			}
@@ -405,7 +418,14 @@ func (s *Server) publishSystemEvent(subject string, payload []byte) {
 	if len(sids) == 0 {
 		return
 	}
-	deliverPayload, err := proto.Marshal(&pb.Deliver{Subject: subject, Payload: payload})
+	deliverPayload, err := proto.Marshal(&pb.Deliver{
+		Id:                s.seq.Next(subject),
+		Subject:           subject,
+		Payload:           payload,
+		PublisherIdentity: acl.EncodeIdentity(s.serverPub),
+		PublishedAt:       time.Now().UnixMilli(),
+		SchemaVersion:     schema.Version(subject), // 0 for system subjects
+	})
 	if err != nil {
 		return
 	}
@@ -501,13 +521,20 @@ func (s *Server) markOffline(ent *registry.EntityRecord) {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-// fanout delivers payload to all subscribers of subject.
-func (s *Server) fanout(subject string, innerPayload []byte) {
+// fanout delivers payload to all subscribers of subject with a full provenance envelope.
+func (s *Server) fanout(subject string, innerPayload []byte, publisherPubkey []byte) {
 	sids := s.bus.Fanout(subject)
 	if len(sids) == 0 {
 		return
 	}
-	deliverPayload, err := proto.Marshal(&pb.Deliver{Subject: subject, Payload: innerPayload})
+	deliverPayload, err := proto.Marshal(&pb.Deliver{
+		Id:                s.seq.Next(subject),
+		Subject:           subject,
+		Payload:           innerPayload,
+		PublisherIdentity: acl.EncodeIdentity(publisherPubkey),
+		PublishedAt:       time.Now().UnixMilli(),
+		SchemaVersion:     schema.Version(subject),
+	})
 	if err != nil {
 		return
 	}
@@ -525,8 +552,14 @@ func (s *Server) fanout(subject string, innerPayload []byte) {
 	}
 }
 
-func (s *Server) sendError(sw *sessionWriter, code, message string) {
-	payload, _ := proto.Marshal(&pb.Error{Code: code, Message: message})
+// sendError sends an ERROR frame. An optional refID (e.g. Publish.message_id) is
+// echoed in Error.ref_id for client-side correlation (Decision #5).
+func (s *Server) sendError(sw *sessionWriter, code, message string, refID ...string) {
+	e := &pb.Error{Code: code, Message: message}
+	if len(refID) > 0 && refID[0] != "" {
+		e.RefId = refID[0]
+	}
+	payload, _ := proto.Marshal(e)
 	_ = sw.enqueueControl(pb.FrameType_FRAME_TYPE_ERROR, payload)
 }
 

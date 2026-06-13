@@ -460,6 +460,7 @@ type Publish struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Subject       string                 `protobuf:"bytes,1,opt,name=subject,proto3" json:"subject,omitempty"`
 	Payload       []byte                 `protobuf:"bytes,2,opt,name=payload,proto3" json:"payload,omitempty"`
+	MessageId     string                 `protobuf:"bytes,3,opt,name=message_id,json=messageId,proto3" json:"message_id,omitempty"` // client-assigned; echoed in Error.ref_id on failure (Decision #5)
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -508,12 +509,23 @@ func (x *Publish) GetPayload() []byte {
 	return nil
 }
 
+func (x *Publish) GetMessageId() string {
+	if x != nil {
+		return x.MessageId
+	}
+	return ""
+}
+
 type Deliver struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Subject       string                 `protobuf:"bytes,1,opt,name=subject,proto3" json:"subject,omitempty"`
-	Payload       []byte                 `protobuf:"bytes,2,opt,name=payload,proto3" json:"payload,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	Subject           string                 `protobuf:"bytes,1,opt,name=subject,proto3" json:"subject,omitempty"`
+	Payload           []byte                 `protobuf:"bytes,2,opt,name=payload,proto3" json:"payload,omitempty"`
+	Id                uint64                 `protobuf:"varint,3,opt,name=id,proto3" json:"id,omitempty"`                                                       // per-subject monotonic counter, server-assigned (Decision #4)
+	PublisherIdentity string                 `protobuf:"bytes,4,opt,name=publisher_identity,json=publisherIdentity,proto3" json:"publisher_identity,omitempty"` // base32 pubkey of publisher, server-stamped (Decision #4)
+	PublishedAt       int64                  `protobuf:"varint,5,opt,name=published_at,json=publishedAt,proto3" json:"published_at,omitempty"`                  // Unix milliseconds, server timestamp (Decision #4)
+	SchemaVersion     uint32                 `protobuf:"varint,6,opt,name=schema_version,json=schemaVersion,proto3" json:"schema_version,omitempty"`            // from schema registry; 0 if no registered schema (Decision #4)
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *Deliver) Reset() {
@@ -560,14 +572,44 @@ func (x *Deliver) GetPayload() []byte {
 	return nil
 }
 
+func (x *Deliver) GetId() uint64 {
+	if x != nil {
+		return x.Id
+	}
+	return 0
+}
+
+func (x *Deliver) GetPublisherIdentity() string {
+	if x != nil {
+		return x.PublisherIdentity
+	}
+	return ""
+}
+
+func (x *Deliver) GetPublishedAt() int64 {
+	if x != nil {
+		return x.PublishedAt
+	}
+	return 0
+}
+
+func (x *Deliver) GetSchemaVersion() uint32 {
+	if x != nil {
+		return x.SchemaVersion
+	}
+	return 0
+}
+
 type Request struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	CorrelationId string                 `protobuf:"bytes,1,opt,name=correlation_id,json=correlationId,proto3" json:"correlation_id,omitempty"`
-	TargetPubkey  []byte                 `protobuf:"bytes,2,opt,name=target_pubkey,json=targetPubkey,proto3" json:"target_pubkey,omitempty"` // Ed25519 public key of target entity (32 bytes)
-	Payload       []byte                 `protobuf:"bytes,3,opt,name=payload,proto3" json:"payload,omitempty"`
-	TimeoutMs     uint32                 `protobuf:"varint,4,opt,name=timeout_ms,json=timeoutMs,proto3" json:"timeout_ms,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	CorrelationId  string                 `protobuf:"bytes,1,opt,name=correlation_id,json=correlationId,proto3" json:"correlation_id,omitempty"`
+	TargetPubkey   []byte                 `protobuf:"bytes,2,opt,name=target_pubkey,json=targetPubkey,proto3" json:"target_pubkey,omitempty"` // Ed25519 public key of target entity (32 bytes)
+	Payload        []byte                 `protobuf:"bytes,3,opt,name=payload,proto3" json:"payload,omitempty"`
+	TimeoutMs      uint32                 `protobuf:"varint,4,opt,name=timeout_ms,json=timeoutMs,proto3" json:"timeout_ms,omitempty"`
+	CallerIdentity string                 `protobuf:"bytes,5,opt,name=caller_identity,json=callerIdentity,proto3" json:"caller_identity,omitempty"` // base32 pubkey of requester, server-stamped; client-supplied value is overwritten (Decision #18)
+	ReceivedAt     int64                  `protobuf:"varint,6,opt,name=received_at,json=receivedAt,proto3" json:"received_at,omitempty"`            // Unix milliseconds, server timestamp (Decision #18)
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *Request) Reset() {
@@ -628,6 +670,20 @@ func (x *Request) GetTimeoutMs() uint32 {
 	return 0
 }
 
+func (x *Request) GetCallerIdentity() string {
+	if x != nil {
+		return x.CallerIdentity
+	}
+	return ""
+}
+
+func (x *Request) GetReceivedAt() int64 {
+	if x != nil {
+		return x.ReceivedAt
+	}
+	return 0
+}
+
 type Response struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	CorrelationId string                 `protobuf:"bytes,1,opt,name=correlation_id,json=correlationId,proto3" json:"correlation_id,omitempty"`
@@ -684,6 +740,7 @@ type Error struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Code          string                 `protobuf:"bytes,1,opt,name=code,proto3" json:"code,omitempty"`
 	Message       string                 `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"`
+	RefId         string                 `protobuf:"bytes,3,opt,name=ref_id,json=refId,proto3" json:"ref_id,omitempty"` // echoes Publish.message_id on publish errors, or correlation_id on call timeout (Decision #5)
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -728,6 +785,13 @@ func (x *Error) GetCode() string {
 func (x *Error) GetMessage() string {
 	if x != nil {
 		return x.Message
+	}
+	return ""
+}
+
+func (x *Error) GetRefId() string {
+	if x != nil {
+		return x.RefId
 	}
 	return ""
 }
@@ -889,25 +953,35 @@ const file_proto_frames_proto_rawDesc = "" +
 	"\tSubscribe\x12\x18\n" +
 	"\asubject\x18\x01 \x01(\tR\asubject\"'\n" +
 	"\vUnsubscribe\x12\x18\n" +
-	"\asubject\x18\x01 \x01(\tR\asubject\"=\n" +
+	"\asubject\x18\x01 \x01(\tR\asubject\"\\\n" +
 	"\aPublish\x12\x18\n" +
 	"\asubject\x18\x01 \x01(\tR\asubject\x12\x18\n" +
-	"\apayload\x18\x02 \x01(\fR\apayload\"=\n" +
+	"\apayload\x18\x02 \x01(\fR\apayload\x12\x1d\n" +
+	"\n" +
+	"message_id\x18\x03 \x01(\tR\tmessageId\"\xc6\x01\n" +
 	"\aDeliver\x12\x18\n" +
 	"\asubject\x18\x01 \x01(\tR\asubject\x12\x18\n" +
-	"\apayload\x18\x02 \x01(\fR\apayload\"\x8e\x01\n" +
+	"\apayload\x18\x02 \x01(\fR\apayload\x12\x0e\n" +
+	"\x02id\x18\x03 \x01(\x04R\x02id\x12-\n" +
+	"\x12publisher_identity\x18\x04 \x01(\tR\x11publisherIdentity\x12!\n" +
+	"\fpublished_at\x18\x05 \x01(\x03R\vpublishedAt\x12%\n" +
+	"\x0eschema_version\x18\x06 \x01(\rR\rschemaVersion\"\xd8\x01\n" +
 	"\aRequest\x12%\n" +
 	"\x0ecorrelation_id\x18\x01 \x01(\tR\rcorrelationId\x12#\n" +
 	"\rtarget_pubkey\x18\x02 \x01(\fR\ftargetPubkey\x12\x18\n" +
 	"\apayload\x18\x03 \x01(\fR\apayload\x12\x1d\n" +
 	"\n" +
-	"timeout_ms\x18\x04 \x01(\rR\ttimeoutMs\"K\n" +
+	"timeout_ms\x18\x04 \x01(\rR\ttimeoutMs\x12'\n" +
+	"\x0fcaller_identity\x18\x05 \x01(\tR\x0ecallerIdentity\x12\x1f\n" +
+	"\vreceived_at\x18\x06 \x01(\x03R\n" +
+	"receivedAt\"K\n" +
 	"\bResponse\x12%\n" +
 	"\x0ecorrelation_id\x18\x01 \x01(\tR\rcorrelationId\x12\x18\n" +
-	"\apayload\x18\x02 \x01(\fR\apayload\"5\n" +
+	"\apayload\x18\x02 \x01(\fR\apayload\"L\n" +
 	"\x05Error\x12\x12\n" +
 	"\x04code\x18\x01 \x01(\tR\x04code\x12\x18\n" +
-	"\amessage\x18\x02 \x01(\tR\amessage\"$\n" +
+	"\amessage\x18\x02 \x01(\tR\amessage\x12\x15\n" +
+	"\x06ref_id\x18\x03 \x01(\tR\x05refId\"$\n" +
 	"\n" +
 	"Disconnect\x12\x16\n" +
 	"\x06reason\x18\x01 \x01(\tR\x06reason\"\x1c\n" +

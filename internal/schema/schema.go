@@ -16,6 +16,12 @@ var registry = map[string]func([]byte) error{
 	"home.light.command":      validateLightCommand,
 }
 
+// versions maps subject → schema version (1-based; 0 means no registered schema).
+var versions = map[string]uint32{
+	"home.sensor.temperature": 1,
+	"home.light.command":      1,
+}
+
 // Validate checks payload against the schema registered for subject.
 // Returns a descriptive error if validation fails or the subject is unknown.
 func Validate(subject string, payload []byte) error {
@@ -24,6 +30,11 @@ func Validate(subject string, payload []byte) error {
 		return fmt.Errorf("unknown subject: no schema registered for %q", subject)
 	}
 	return v(payload)
+}
+
+// Version returns the current schema version for subject, or 0 if none is registered.
+func Version(subject string) uint32 {
+	return versions[subject]
 }
 
 // ─── home.sensor.temperature ─────────────────────────────────────────────────

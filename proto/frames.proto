@@ -62,22 +62,29 @@ message Unsubscribe {
 }
 
 message Publish {
-  string subject = 1;
-  bytes  payload = 2;
+  string subject    = 1;
+  bytes  payload    = 2;
+  string message_id = 3; // client-assigned; echoed in Error.ref_id on failure (Decision #5)
 }
 
 message Deliver {
-  string subject = 1;
-  bytes  payload = 2;
+  string subject             = 1;
+  bytes  payload             = 2;
+  uint64 id                  = 3; // per-subject monotonic counter, server-assigned (Decision #4)
+  string publisher_identity  = 4; // base32 pubkey of publisher, server-stamped (Decision #4)
+  int64  published_at        = 5; // Unix milliseconds, server timestamp (Decision #4)
+  uint32 schema_version      = 6; // from schema registry; 0 if no registered schema (Decision #4)
 }
 
 // ─── Session 7: call primitive ───────────────────────────────────────────────
 
 message Request {
-  string correlation_id = 1;
-  bytes  target_pubkey  = 2; // Ed25519 public key of target entity (32 bytes)
-  bytes  payload        = 3;
-  uint32 timeout_ms     = 4;
+  string correlation_id  = 1;
+  bytes  target_pubkey   = 2; // Ed25519 public key of target entity (32 bytes)
+  bytes  payload         = 3;
+  uint32 timeout_ms      = 4;
+  string caller_identity = 5; // base32 pubkey of requester, server-stamped; client-supplied value is overwritten (Decision #18)
+  int64  received_at     = 6; // Unix milliseconds, server timestamp (Decision #18)
 }
 
 message Response {
@@ -90,6 +97,7 @@ message Response {
 message Error {
   string code    = 1;
   string message = 2;
+  string ref_id  = 3; // echoes Publish.message_id on publish errors, or correlation_id on call timeout (Decision #5)
 }
 
 message Disconnect {

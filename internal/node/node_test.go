@@ -1277,3 +1277,260 @@ func TestDisconnectTeardown(t *testing.T) {
 		t.Fatalf("expected entity.left after DISCONNECT, got %q", d.Subject)
 	}
 }
+
+// ─── Session 5: message provenance & correlation (Decisions #4, #18, #5) ──────
+
+// expectFullDeliver receives a DELIVER frame and returns the full decoded Deliver
+// message including provenance fields (id, publisher_identity, published_at, schema_version).
+func (c *testClient) expectFullDeliver(t *testing.T, wantSubject string) *pb.Deliver {
+	t.Helper()
+	frame := c.recv(t, 2*time.Second)
+	if frame.Type != pb.FrameType_FRAME_TYPE_DELIVER {
+		t.Fatalf("expected DELIVER, got %v", frame.Type)
+	}
+	var d pb.Deliver
+	if err := proto.Unmarshal(frame.Payload, &d); err != nil {
+		t.Fatalf("unmarshal DELIVER: %v", err)
+	}
+	if d.Subject != wantSubject {
+		t.Fatalf("DELIVER subject: got %q, want %q", d.Subject, wantSubject)
+	}
+	return &d
+}
+
+// TestMonotonicDeliverID verifies that sequential publishes on the same subject
+// produce monotonically increasing IDs starting at 1.
+func TestMonotonicDeliverID(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	sub := connect(t, addr)
+	defer sub.close()
+	pub := connect(t, addr)
+	defer pub.close()
+	allowAll(t, srv, sub.pub)
+	allowAll(t, srv, pub.pub)
+
+	sub.subscribe(t, "home.sensor.temperature")
+
+	for i := range 3 {
+		pub.publish(t, "home.sensor.temperature", tempReading(float32(20+i)))
+		d := sub.expectFullDeliver(t, "home.sensor.temperature")
+		want := uint64(i + 1)
+		if d.Id != want {
+			t.Fatalf("publish %d: DELIVER.id = %d, want %d", i+1, d.Id, want)
+		}
+	}
+}
+
+// TestPerSubjectIsolation verifies that per-subject counters are independent:
+// home.sensor.temperature and home.light.command each start at 1.
+func TestPerSubjectIsolation(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	sub := connect(t, addr)
+	defer sub.close()
+	pub := connect(t, addr)
+	defer pub.close()
+	id := acl.EncodeIdentity(pub.pub)
+	subID := acl.EncodeIdentity(sub.pub)
+	srv.AddRule(acl.Rule{IdentityPattern: id, Action: acl.ActionPublish, SubjectPattern: "home.>", Effect: acl.Allow, Priority: 10})
+	srv.AddRule(acl.Rule{IdentityPattern: subID, Action: acl.ActionSubscribe, SubjectPattern: "home.>", Effect: acl.Allow, Priority: 10})
+
+	sub.subscribe(t, "home.>")
+
+	pub.publish(t, "home.sensor.temperature", tempReading(20))
+	d1 := sub.expectFullDeliver(t, "home.sensor.temperature")
+
+	pub.publish(t, "home.light.command", lightCmd(pb.LightAction_LIGHT_ACTION_ON))
+	d2 := sub.expectFullDeliver(t, "home.light.command")
+
+	if d1.Id != 1 {
+		t.Fatalf("temperature: DELIVER.id = %d, want 1", d1.Id)
+	}
+	if d2.Id != 1 {
+		t.Fatalf("light.command: DELIVER.id = %d, want 1", d2.Id)
+	}
+}
+
+// TestPublisherIdentityStamped verifies that Deliver.publisher_identity is
+// server-stamped with the actual publisher's base32 pubkey.
+func TestPublisherIdentityStamped(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	sub := connect(t, addr)
+	defer sub.close()
+	pub := connect(t, addr)
+	defer pub.close()
+	allowAll(t, srv, sub.pub)
+	allowAll(t, srv, pub.pub)
+
+	sub.subscribe(t, "home.sensor.temperature")
+	pub.publish(t, "home.sensor.temperature", tempReading(22))
+
+	d := sub.expectFullDeliver(t, "home.sensor.temperature")
+	want := acl.EncodeIdentity(pub.pub)
+	if d.PublisherIdentity != want {
+		t.Fatalf("publisher_identity: got %q, want %q", d.PublisherIdentity, want)
+	}
+}
+
+// TestTimestampPopulated verifies that Deliver.published_at is a non-zero Unix
+// millisecond timestamp within the observed send window.
+func TestTimestampPopulated(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	sub := connect(t, addr)
+	defer sub.close()
+	pub := connect(t, addr)
+	defer pub.close()
+	allowAll(t, srv, sub.pub)
+	allowAll(t, srv, pub.pub)
+
+	before := time.Now().UnixMilli()
+	sub.subscribe(t, "home.sensor.temperature")
+	pub.publish(t, "home.sensor.temperature", tempReading(22))
+	d := sub.expectFullDeliver(t, "home.sensor.temperature")
+	after := time.Now().UnixMilli()
+
+	if d.PublishedAt < before || d.PublishedAt > after {
+		t.Fatalf("published_at %d not in range [%d, %d]", d.PublishedAt, before, after)
+	}
+}
+
+// TestRequestCallerIdentity verifies that the target receives caller_identity
+// and received_at server-stamped onto the forwarded REQUEST (Decision #18).
+func TestRequestCallerIdentity(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	a := connect(t, addr)
+	defer a.close()
+	b := connect(t, addr)
+	defer b.close()
+
+	allowCall(t, srv, a.pub, b.pub)
+
+	a.send(pb.FrameType_FRAME_TYPE_REQUEST, &pb.Request{
+		CorrelationId: "caller-identity-test",
+		TargetPubkey:  b.pub,
+		Payload:       []byte("ping"),
+		TimeoutMs:     5000,
+	})
+
+	frame := b.expectFrame(t, pb.FrameType_FRAME_TYPE_REQUEST)
+	var req pb.Request
+	proto.Unmarshal(frame.Payload, &req)
+
+	want := acl.EncodeIdentity(a.pub)
+	if req.CallerIdentity != want {
+		t.Fatalf("caller_identity: got %q, want %q", req.CallerIdentity, want)
+	}
+	if req.ReceivedAt == 0 {
+		t.Fatal("received_at is zero")
+	}
+}
+
+// TestCallerIdentityNotSpoofable verifies that a client-supplied caller_identity
+// is overwritten by the server before forwarding (Decision #18).
+func TestCallerIdentityNotSpoofable(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	a := connect(t, addr)
+	defer a.close()
+	b := connect(t, addr)
+	defer b.close()
+
+	allowCall(t, srv, a.pub, b.pub)
+
+	// A supplies a fake caller_identity — server must overwrite it.
+	a.send(pb.FrameType_FRAME_TYPE_REQUEST, &pb.Request{
+		CorrelationId:  "spoof-caller",
+		TargetPubkey:   b.pub,
+		Payload:        []byte("ping"),
+		TimeoutMs:      5000,
+		CallerIdentity: "FAKEFAKEFAKEFAKE",
+	})
+
+	frame := b.expectFrame(t, pb.FrameType_FRAME_TYPE_REQUEST)
+	var req pb.Request
+	proto.Unmarshal(frame.Payload, &req)
+
+	want := acl.EncodeIdentity(a.pub)
+	if req.CallerIdentity != want {
+		t.Fatalf("caller_identity not overwritten: got %q, want %q", req.CallerIdentity, want)
+	}
+}
+
+// TestErrorRefID verifies that Error.ref_id echoes the Publish.message_id when
+// a publish fails (Decision #5).
+func TestErrorRefID(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	pub := connect(t, addr)
+	defer pub.close()
+	allowAll(t, srv, pub.pub)
+
+	msgID := "my-message-123"
+	bad, _ := proto.Marshal(&pb.TemperatureReading{Value: func() *float32 { v := float32(999); return &v }()})
+	pub.send(pb.FrameType_FRAME_TYPE_PUBLISH, &pb.Publish{
+		Subject:   "home.sensor.temperature",
+		Payload:   bad,
+		MessageId: msgID,
+	})
+
+	e := pub.expectError(t)
+	if e.Code != "SCHEMA_ERROR" {
+		t.Fatalf("expected SCHEMA_ERROR, got %q", e.Code)
+	}
+	if e.RefId != msgID {
+		t.Fatalf("Error.ref_id: got %q, want %q", e.RefId, msgID)
+	}
+}
+
+// TestTimeoutErrorRefID verifies that Error.ref_id echoes the correlation_id
+// when a call times out (Decision #5).
+func TestTimeoutErrorRefID(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	a := connect(t, addr)
+	defer a.close()
+	b := connect(t, addr)
+	defer b.close()
+
+	allowCall(t, srv, a.pub, b.pub)
+
+	corrID := "timeout-ref-test"
+	a.send(pb.FrameType_FRAME_TYPE_REQUEST, &pb.Request{
+		CorrelationId: corrID,
+		TargetPubkey:  b.pub,
+		Payload:       []byte("hello"),
+		TimeoutMs:     100,
+	})
+
+	// B does not respond — wait for timeout ERROR.
+	a.conn.(*tls.Conn).SetReadDeadline(time.Now().Add(3 * time.Second))
+	frame, err := wire.Read(a.conn)
+	if err != nil {
+		t.Fatalf("waiting for timeout ERROR: %v", err)
+	}
+	a.conn.(*tls.Conn).SetReadDeadline(time.Time{})
+
+	if frame.Type != pb.FrameType_FRAME_TYPE_ERROR {
+		t.Fatalf("expected ERROR, got %v", frame.Type)
+	}
+	var e pb.Error
+	proto.Unmarshal(frame.Payload, &e)
+	if e.Code != "TIMEOUT" {
+		t.Fatalf("expected TIMEOUT, got %q", e.Code)
+	}
+	if e.RefId != corrID {
+		t.Fatalf("Error.ref_id: got %q, want %q", e.RefId, corrID)
+	}
+}

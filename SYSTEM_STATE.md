@@ -1,6 +1,6 @@
 # Lattice — System State
 
-**Scope:** Local orchestration only · **Language:** Go 1.23 · **v0.1.1 hardening:** Sessions 0–4 complete · **Branch:** `dev/v0.1.1-hardening`
+**Scope:** Local orchestration only · **Language:** Go 1.23 · **v0.1.1 hardening:** Sessions 0–5 complete · **Branch:** `dev/v0.1.1-hardening`
 
 This document captures the complete state of the Lattice codebase: what exists, how the pieces fit together, and the design decisions behind them. Start here before reading any source file.
 
@@ -77,10 +77,10 @@ Every message on the wire is a **frame**. A frame has a 5-byte header followed b
 | 4 | `HEARTBEAT_ACK` | server → client | Heartbeat acknowledgment | 2 |
 | 5 | `SUBSCRIBE` | client → server | Register interest in a subject pattern | 3 |
 | 6 | `UNSUBSCRIBE` | client → server | Remove a subscription | 3 |
-| 7 | `PUBLISH` | client → server | Send a message to a subject | 3 |
-| 8 | `DELIVER` | server → client | Forward a published message to a subscriber | 3 |
-| 9 | `ERROR` | server → client | Reject a frame; carries `code` + `message` | all |
-| 10 | `REQUEST` | client → server → client | Point-to-point call by target pubkey | 7 |
+| 7 | `PUBLISH` | client → server | Send a message to a subject; optional `message_id` for error correlation | 3 |
+| 8 | `DELIVER` | server → client | Forward with provenance envelope: `id`, `publisher_identity`, `published_at`, `schema_version` | 3 |
+| 9 | `ERROR` | server → client | Reject a frame; carries `code` + `message` + optional `ref_id` | all |
+| 10 | `REQUEST` | client → server → client | Point-to-point call; server stamps `caller_identity` + `received_at` | 7 |
 | 11 | `RESPONSE` | client → server → client | Reply to a REQUEST | 7 |
 | 12 | `DISCONNECT` | client → server | Graceful disconnect notification | 8 |
 | 13 | `PING` | either | Explicit latency probe | reserved |
@@ -349,6 +349,7 @@ type Server struct {
     acl               *acl.Engine
     registry          *registry.Registry
     calls             *call.Registry
+    seq               subjectSequencer   // per-subject monotonic DELIVER IDs (Decision #4)
     serverPriv        ed25519.PrivateKey
     serverPub         ed25519.PublicKey
     heartbeatInterval uint32
@@ -359,6 +360,16 @@ type Server struct {
 }
 ```
 Created once; `HandleConn` is called in a goroutine per accepted connection. The `wg` tracks all HandleConn goroutines and the two background goroutines (heartbeat checker, call timeout checker). `done` is closed by `Shutdown()` to signal them. `stopOnce` prevents double-close panics.
+
+---
+
+### `node.subjectSequencer` — `internal/node/seq.go`
+```go
+type subjectSequencer struct {
+    m sync.Map // subject (string) → *atomic.Uint64
+}
+```
+`Next(subject string) uint64` returns the next monotonically increasing ID for `subject`, starting at 1. IDs are independent per concrete subject (`home.sensor.temperature` and `home.light.command` have separate counters). Uses `sync.Map.LoadOrStore` + `atomic.Uint64.Add` — no global lock contention during fanout.
 
 ---
 
@@ -383,20 +394,21 @@ One per connection, stored in `Server.conns`. A dedicated goroutine drains both 
 ## How a PUBLISH Reaches a Subscriber
 
 ```
-Client B sends PUBLISH { subject: "home.sensor.temperature", payload: <proto bytes> }
+Client B sends PUBLISH { subject: "home.sensor.temperature", payload: <proto bytes>, message_id?: "x" }
     │
     ▼  node.HandleConn (Client B's goroutine)
     │
     ├─ bus.ValidateSubject("home.sensor.temperature")
     │      checks: no wildcards, not lattice.system.*, ≤16 segs, ≤256 chars
+    │      → ERROR { ref_id: message_id } if invalid
     │
     ├─ acl.Allow(rec.Pubkey, "publish", "home.sensor.temperature")
     │      walks rules in priority order; first match wins; default deny
-    │      → ERROR to publisher if denied; delivery stops here
+    │      → ERROR { ref_id: message_id } if denied; delivery stops here
     │
     ├─ schema.Validate("home.sensor.temperature", payload)
     │      unmarshals TemperatureReading, checks value ∈ [-50, 150], unit ≤ 10 chars
-    │      → ERROR to publisher if invalid; delivery stops here
+    │      → ERROR { ref_id: message_id } if invalid; delivery stops here
     │
     ├─ bus.Fanout("home.sensor.temperature")
     │      walks all subscribed patterns, wildcard-matches each
@@ -408,7 +420,13 @@ Client B sends PUBLISH { subject: "home.sensor.temperature", payload: <proto byt
                → skip subscriber silently if denied (no ERROR to subscriber)
                → uses identity-indexed rule cache (O(1) on hit); cache invalidated by AddRule
            conns.Load(sessionID) → *sessionWriter
-           sw.enqueue(DELIVER, { subject, payload })
+           sw.enqueue(DELIVER, {
+               id: seq.Next(subject),          ← per-subject monotonic counter
+               subject, payload,
+               publisher_identity: base32(B.pubkey),  ← server-stamped
+               published_at: now_ms,
+               schema_version: schema.Version(subject),
+           })
                └─ non-blocking send to data channel (cap 128); drops + logs on overflow
                   writer goroutine drains channel → wire.Write with 5s deadline
 ```
@@ -432,7 +450,11 @@ Client A sends REQUEST { correlation_id, target_pubkey=B, payload, timeout_ms }
     │      registered BEFORE forwarding (avoids response-arrives-first race)
     │      B.sessionID stored so the responder can be verified
     │
-    └─ targetSw.enqueue(REQUEST, payload) ───────────────────► Client B receives REQUEST
+    ├─ req.CallerIdentity = base32(A.pubkey)  ← server-stamps; overwrites any client value
+    │  req.ReceivedAt    = now_ms
+    │
+    └─ targetSw.enqueue(REQUEST, re-marshaled req) ──────────► Client B receives REQUEST
+           B can trust CallerIdentity and ReceivedAt — server-assigned, not client-asserted
 
 Client B sends RESPONSE { correlation_id, payload }
     │
@@ -448,7 +470,7 @@ Client B sends RESPONSE { correlation_id, payload }
     │
     └─ requesterSw.enqueue(RESPONSE, payload) ───────────────► Client A receives RESPONSE
 
-(If no RESPONSE within timeout_ms, runCallTimeoutChecker fires ERROR TIMEOUT to A via enqueueControl)
+(If no RESPONSE within timeout_ms, runCallTimeoutChecker fires ERROR { code: TIMEOUT, ref_id: correlation_id } to A)
 (If B evicted before responding, evictOldSession fires ERROR TARGET_DISCONNECTED to A immediately)
 ```
 
@@ -540,8 +562,8 @@ go test ./...
 | `internal/bus` | 26 | Wildcard matching (`*`, `>`), pattern/subject validation, subscribe/unsubscribe/fanout, deduplication, session cleanup; 9 `PatternsIntersect` cases (identical, gt-vs-exact, gt-vs-gt, broader-gt, star-vs-exact, different-prefix, private-vs-broader, disjoint-lengths, star-length-mismatch) |
 | `internal/schema` | 13 | Both schemas: valid payloads, out-of-range values, missing fields, invalid enum, string length, unknown subject |
 | `internal/acl` | 11 | Deny by default, exact allow, wildcard identity, priority ordering, deny overrides lower-priority allow; `AllowConcrete` empty-deny, allow, delivery-time deny (wildcard bypass fix), cache invalidation after `AddRule` |
-| `internal/node` | 38 | 31 black-box integration tests (pub/sub, wildcards, schema rejection, ACL, entity events, offline detection, call round-trip/timeout/ACL, graceful shutdown, typed capabilities, delivery-time wildcard deny, system-event delivery deny, reconnect eviction, join-on-reconnect, responder verification, eviction invalidates calls, DISCONNECT teardown); 7 white-box writer unit tests (delivery, write-error callback, idempotent close, close-waits-for-goroutine, channel overflow) |
-| **Total** | **106** | |
+| `internal/node` | 46 | 39 black-box integration tests (pub/sub, wildcards, schema rejection, ACL, entity events, offline detection, call round-trip/timeout/ACL, graceful shutdown, typed capabilities, delivery-time wildcard deny, system-event delivery deny, reconnect eviction, join-on-reconnect, responder verification, eviction invalidates calls, DISCONNECT teardown, monotonic DELIVER id, per-subject isolation, publisher identity stamped, timestamp populated, request caller identity, caller identity not spoofable, error ref_id, timeout error ref_id); 7 white-box writer unit tests (delivery, write-error callback, idempotent close, close-waits-for-goroutine, channel overflow) |
+| **Total** | **114** | |
 
 The `TestIntegrationSequence` test covers all 10 steps of the full integration scenario in a single sequential test with per-step log output.
 
