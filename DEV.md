@@ -47,6 +47,24 @@ go test ./...
 
 ---
 
+## Proto regeneration
+
+The compiled `*.pb.go` files are committed. To regenerate after editing a `.proto` file:
+
+```sh
+make proto
+```
+
+**Prerequisites (one-time setup):**
+```sh
+go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
+# protoc must be ≥ v3 (brew install protobuf on macOS)
+```
+
+The script (`scripts/gen-proto.sh`) pins `protoc-gen-go` at `v1.36.11`. Regenerating with any other version will produce spurious diffs. After running `make proto`, `git diff proto/` should be empty unless you actually changed a `.proto` file.
+
+---
+
 ## Repository layout
 
 ```
@@ -111,6 +129,8 @@ Maximum payload: 256 KiB. Reads use `io.ReadFull` — never partial.
 ---
 
 ## HELLO handshake
+
+> **Security note — Trust on First Use (TOFU):** The first time a client connects to a node, it receives the server's Ed25519 public key in `HELLO_ACK` as an unsigned assertion. There is no independent verification of that key — the client trusts whatever the TLS-terminating process claims. An attacker who can intercept the first connection (e.g. a MITM on an untrusted network) can substitute their own key and impersonate the server. After the first pairing the client should pin the received server pubkey and reject any future `HELLO_ACK` that presents a different key. Decision #1 (Session 1) addresses this by having the server sign a TLS-exporter nonce with its Ed25519 private key so the client can verify the assertion.
 
 After TLS 1.3 completes, the client sends a HELLO frame containing its Ed25519 public key and a signature. The nonce that is signed is derived identically on both sides from the TLS session:
 

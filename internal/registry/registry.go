@@ -5,12 +5,14 @@ import (
 	"encoding/hex"
 	"sync"
 	"time"
+
+	pb "lattice/proto"
 )
 
 // EntityRecord holds runtime state for a connected entity.
 type EntityRecord struct {
 	Pubkey          []byte
-	Capabilities    []string
+	Capabilities    []*pb.Capability
 	SessionID       string
 	ConnectedAt     time.Time
 	LastHeartbeatAt time.Time
@@ -28,7 +30,7 @@ func New() *Registry {
 
 // Register adds a new entity. If an entity with the same pubkey already exists
 // it is overwritten.
-func (r *Registry) Register(sessionID string, pubkey []byte, capabilities []string) *EntityRecord {
+func (r *Registry) Register(sessionID string, pubkey []byte, capabilities []*pb.Capability) *EntityRecord {
 	now := time.Now()
 	rec := &EntityRecord{
 		Pubkey:          append([]byte(nil), pubkey...),

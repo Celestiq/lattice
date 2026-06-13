@@ -2,7 +2,7 @@
 
 **Scope:** Decisions 1–18 from the CTO Architecture Review (June 2026) · **Status: In progress** · **Target: v0.1.1**
 
-This document is the single source of truth for the v0.1.1 hardening work. Each session maps to one isolated git branch. Check off decisions as they land. Merge to `main` only when the session's Definition of Done is fully met.
+This document is the single source of truth for the v0.1.1 hardening work. All sessions are implemented on a single branch: **`dev/0.1.1-hardening`**. Check off decisions as they land. Merge to `main` only when **all sessions** are complete and all tests pass.
 
 ---
 
@@ -10,16 +10,18 @@ This document is the single source of truth for the v0.1.1 hardening work. Each 
 
 All 18 decisions accounted for. Decision #13 (QUIC port) is explicitly deferred.
 
-| Session | Decisions | Theme | Risk | Branch | Status |
-|---------|-----------|-------|------|--------|--------|
-| 0 | — | Pre-flight: key hygiene + proto toolchain | Low | `chore/preflight` | `[ ]` |
-| 1 | #1, #3, #7, #9, #17 | Handshake & identity hardening | **High** | `feat/handshake-hardening` | `[ ]` |
-| 2 | #10 | Bus flow control — per-session writer queues | **Highest** | `feat/writer-queues` | `[ ]` |
-| 3 | #11 | ACL correctness — delivery-time check + rule cache | **High** | `fix/acl-delivery-time` | `[ ]` |
-| 4 | #12, #6, #8 | Session lifecycle correctness | Med | `fix/session-lifecycle` | `[ ]` |
-| 5 | #4, #18, #5 | Message provenance & correlation envelopes | Med | `feat/provenance-envelopes` | `[ ]` |
-| 6 | #2 | Token-based session resume | Med | `feat/session-resume` | `[ ]` |
-| 7 | #14, #15, #16 | Dynamic schema registry + admin API | Med/Large | `feat/dynamic-schema` | `[ ]` |
+**Working branch:** `dev/0.1.1-hardening` (all sessions)
+
+| Session | Decisions | Theme | Risk | Status |
+|---------|-----------|-------|------|--------|
+| 0 | — | Pre-flight: key hygiene + proto toolchain | Low | `[x]` |
+| 1 | #1, #3, #7, #9, #17 | Handshake & identity hardening | **High** | `[x]` |
+| 2 | #10 | Bus flow control — per-session writer queues | **Highest** | `[ ]` |
+| 3 | #11 | ACL correctness — delivery-time check + rule cache | **High** | `[ ]` |
+| 4 | #12, #6, #8 | Session lifecycle correctness | Med | `[ ]` |
+| 5 | #4, #18, #5 | Message provenance & correlation envelopes | Med | `[ ]` |
+| 6 | #2 | Token-based session resume | Med | `[ ]` |
+| 7 | #14, #15, #16 | Dynamic schema registry + admin API | Med/Large | `[ ]` |
 
 **Deferred (post-v0.1.1):** #13 QUIC port, federation, durable messages, libp2p DHT.
 **Sequencing constraint to carry forward:** Session 2 (writer queues) must be complete before QUIC is started. The per-session outbound queue maps directly onto per-stream writes in quic-go — porting blocking fanout onto QUIC forfeits the head-of-line-blocking benefit.
@@ -54,13 +56,13 @@ Plus the session-specific new tests listed below.
 
 ## Session 0 — Pre-flight
 
-**Branch:** `chore/preflight`
+**Branch:** `dev/0.1.1-hardening`
 
 ### Decisions
-- [ ] Verify `*.key` absent from git history: `git rev-list --all --objects | grep -i '\.key'` must produce zero output. `.gitignore` already contains `*.key` (confirmed in v0.1).
-- [ ] Document TOFU exposure: the first connection to a node is trust-on-first-use — the server pubkey is not independently verified on first pairing. This must be called out in `DEV.md` so operators understand what first-pairing means.
-- [ ] Install `protoc-gen-go` at the version matching the existing generated files: `go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11`. Confirm `protoc --version` ≥ 3 (already installed at `/opt/homebrew/bin/protoc`).
-- [ ] Add a codegen script or `Makefile` target so every subsequent session can regenerate `*.pb.go` with one command. Pin to `protoc-gen-go v1.36.11` to keep generated output reproducible.
+- [x] Verify `*.key` absent from git history: `git rev-list --all --objects | grep -i '\.key'` must produce zero output. `.gitignore` already contains `*.key` (confirmed in v0.1).
+- [x] Document TOFU exposure: the first connection to a node is trust-on-first-use — the server pubkey is not independently verified on first pairing. This must be called out in `DEV.md` so operators understand what first-pairing means.
+- [x] Install `protoc-gen-go` at the version matching the existing generated files: `go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11`. Confirm `protoc --version` ≥ 3 (already installed at `/opt/homebrew/bin/protoc`).
+- [x] Add a codegen script or `Makefile` target so every subsequent session can regenerate `*.pb.go` with one command. Pin to `protoc-gen-go v1.36.11` to keep generated output reproducible.
 
 ### Files to Create/Modify
 | File | Change |
@@ -78,24 +80,24 @@ Plus the session-specific new tests listed below.
 
 ## Session 1 — Handshake & Identity Hardening
 
-**Branch:** `feat/handshake-hardening`
-**Prerequisite:** Session 0 merged (codegen tooling in place).
+**Branch:** `dev/0.1.1-hardening`
+**Prerequisite:** Session 0 complete (codegen tooling in place).
 
 ### Decisions
 
-- [ ] **#1 — Server authentication in HELLO handshake**
+- [x] **#1 — Server authentication in HELLO handshake**
   The server currently sends `HELLO_ACK { server_pubkey }` as an unsigned assertion — any process that terminates TLS can assert any identity. Fix: server derives a *separate* 32-byte nonce via `ExportKeyingMaterial("lattice-hello-server-v1", nil, 32)` and signs it with its Ed25519 private key. This signature is added to `HelloAck`. The client verifies it against the pinned server pubkey. `InsecureSkipVerify` stays — the TLS certificate is not the trust anchor, the Ed25519 signature is. The two exporter labels (`"lattice-hello-v1"` for the client nonce, `"lattice-hello-server-v1"` for the server nonce) are intentionally distinct so the same bytes are never signed in both directions.
 
-- [ ] **#3 — Protocol version field**
+- [x] **#3 — Protocol version field**
   Add `uint32 protocol_version = N` to the `Hello` proto message. Server rejects connections with an unrecognised major version (send `ERROR { code: "UNSUPPORTED_VERSION" }` and close). Version lives in `Hello` only — the 5-byte frame header is stable and does not need a version field.
 
-- [ ] **#7 — Typed capabilities**
+- [x] **#7 — Typed capabilities**
   Change `repeated string capabilities` in `Hello` to `repeated Capability capabilities` where `Capability` is a new proto message. Start with the minimum fields required now. Future Entity Description extensions go into `Capability` without breaking the wire. All code that touches `rec.Capabilities` / `ent.Capabilities` must be updated to use the new type.
 
-- [ ] **#9 — Mark PING/PONG reserved**
+- [x] **#9 — Mark PING/PONG reserved**
   Add proto comments marking `FRAME_TYPE_PING` and `FRAME_TYPE_PONG` as reserved in `frames.proto`. No implementation, no handler. External developers must not build against them.
 
-- [ ] **#17 — Handshake deadline**
+- [x] **#17 — Handshake deadline**
   In `HandleConn`, call `conn.SetDeadline(time.Now().Add(10 * time.Second))` immediately before the `handshake.DoServer` call. Clear the deadline with `conn.SetDeadline(time.Time{})` after a successful `HELLO_ACK` is sent. A client that completes TLS and never sends `HELLO` currently holds a goroutine forever — the heartbeat checker cannot reap it because nothing pre-HELLO is in the registry.
 
 ### Files to Modify
@@ -125,8 +127,8 @@ Plus the session-specific new tests listed below.
 
 ## Session 2 — Bus Flow Control
 
-**Branch:** `feat/writer-queues`
-**Prerequisite:** Session 1 merged.
+**Branch:** `dev/0.1.1-hardening`
+**Prerequisite:** Session 1 complete.
 
 ### Decision
 
@@ -162,8 +164,8 @@ Plus the session-specific new tests listed below.
 
 ## Session 3 — ACL Correctness
 
-**Branch:** `fix/acl-delivery-time`
-**Prerequisite:** Session 2 merged.
+**Branch:** `dev/0.1.1-hardening`
+**Prerequisite:** Session 2 complete.
 
 ### Decision
 
@@ -197,8 +199,8 @@ Plus the session-specific new tests listed below.
 
 ## Session 4 — Session Lifecycle Correctness
 
-**Branch:** `fix/session-lifecycle`
-**Prerequisite:** Session 3 merged.
+**Branch:** `dev/0.1.1-hardening`
+**Prerequisite:** Session 3 complete.
 
 ### Decisions
 
@@ -240,8 +242,8 @@ Plus the session-specific new tests listed below.
 
 ## Session 5 — Message Provenance & Correlation
 
-**Branch:** `feat/provenance-envelopes`
-**Prerequisite:** Session 4 merged.
+**Branch:** `dev/0.1.1-hardening`
+**Prerequisite:** Session 4 complete.
 
 ### Decisions
 
@@ -286,8 +288,8 @@ Plus the session-specific new tests listed below.
 
 ## Session 6 — Token-Based Session Resume
 
-**Branch:** `feat/session-resume`
-**Prerequisite:** Session 4 merged (stable CAS registry + session table).
+**Branch:** `dev/0.1.1-hardening`
+**Prerequisite:** Session 4 complete (stable CAS registry + session table).
 
 ### Decision
 
@@ -327,8 +329,8 @@ Plus the session-specific new tests listed below.
 
 ## Session 7 — Dynamic Schema Registry + Admin API
 
-**Branch:** `feat/dynamic-schema`
-**Prerequisite:** Session 5 merged (schema_version in DELIVER envelope).
+**Branch:** `dev/0.1.1-hardening`
+**Prerequisite:** Session 5 complete (schema_version in DELIVER envelope).
 
 ### Decisions
 

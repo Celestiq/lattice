@@ -24,7 +24,7 @@ const (
 type EntityJoined struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Pubkey        []byte                 `protobuf:"bytes,1,opt,name=pubkey,proto3" json:"pubkey,omitempty"`             // Ed25519 public key (32 bytes)
-	Capabilities  []string               `protobuf:"bytes,2,rep,name=capabilities,proto3" json:"capabilities,omitempty"` // subjects declared at HELLO time
+	Capabilities  []*Capability          `protobuf:"bytes,2,rep,name=capabilities,proto3" json:"capabilities,omitempty"` // typed capabilities declared at HELLO time
 	SessionId     string                 `protobuf:"bytes,3,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -67,7 +67,7 @@ func (x *EntityJoined) GetPubkey() []byte {
 	return nil
 }
 
-func (x *EntityJoined) GetCapabilities() []string {
+func (x *EntityJoined) GetCapabilities() []*Capability {
 	if x != nil {
 		return x.Capabilities
 	}
@@ -189,10 +189,10 @@ var File_proto_events_proto protoreflect.FileDescriptor
 
 const file_proto_events_proto_rawDesc = "" +
 	"\n" +
-	"\x12proto/events.proto\x12\alattice\"i\n" +
+	"\x12proto/events.proto\x12\alattice\x1a\x12proto/frames.proto\"~\n" +
 	"\fEntityJoined\x12\x16\n" +
-	"\x06pubkey\x18\x01 \x01(\fR\x06pubkey\x12\"\n" +
-	"\fcapabilities\x18\x02 \x03(\tR\fcapabilities\x12\x1d\n" +
+	"\x06pubkey\x18\x01 \x01(\fR\x06pubkey\x127\n" +
+	"\fcapabilities\x18\x02 \x03(\v2\x13.lattice.CapabilityR\fcapabilities\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x03 \x01(\tR\tsessionId\"C\n" +
 	"\n" +
@@ -222,13 +222,15 @@ var file_proto_events_proto_goTypes = []any{
 	(*EntityJoined)(nil),  // 0: lattice.EntityJoined
 	(*EntityLeft)(nil),    // 1: lattice.EntityLeft
 	(*EntityOffline)(nil), // 2: lattice.EntityOffline
+	(*Capability)(nil),    // 3: lattice.Capability
 }
 var file_proto_events_proto_depIdxs = []int32{
-	0, // [0:0] is the sub-list for method output_type
-	0, // [0:0] is the sub-list for method input_type
-	0, // [0:0] is the sub-list for extension type_name
-	0, // [0:0] is the sub-list for extension extendee
-	0, // [0:0] is the sub-list for field type_name
+	3, // 0: lattice.EntityJoined.capabilities:type_name -> lattice.Capability
+	1, // [1:1] is the sub-list for method output_type
+	1, // [1:1] is the sub-list for method input_type
+	1, // [1:1] is the sub-list for extension type_name
+	1, // [1:1] is the sub-list for extension extendee
+	0, // [0:1] is the sub-list for field type_name
 }
 
 func init() { file_proto_events_proto_init() }
@@ -236,6 +238,7 @@ func file_proto_events_proto_init() {
 	if File_proto_events_proto != nil {
 		return
 	}
+	file_proto_frames_proto_init()
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{

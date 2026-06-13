@@ -72,7 +72,7 @@ func connect(t *testing.T, addr string) *testClient {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := handshake.DoClient(conn, priv); err != nil {
+	if _, err := handshake.DoClient(conn, priv, nil, nil); err != nil {
 		conn.Close()
 		t.Fatalf("handshake: %v", err)
 	}
@@ -861,6 +861,86 @@ func TestCallACLDenied(t *testing.T) {
 	e := a.expectError(t)
 	if e.Code != "PERMISSION_DENIED" {
 		t.Fatalf("expected PERMISSION_DENIED, got %q", e.Code)
+	}
+}
+
+// ─── Session 1 new tests ──────────────────────────────────────────────────────
+
+// TestHandshakeDeadlineReapsStuckClient: a client that completes TLS but never
+// sends HELLO is reaped within ~10 seconds (Decision #17).
+func TestHandshakeDeadlineReapsStuckClient(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping deadline test in -short mode (~10s)")
+	}
+	addr, _, stop := newServer(t, 30)
+	defer stop()
+
+	conn, err := tls.Dial("tcp", addr, &tls.Config{
+		InsecureSkipVerify: true,
+		MinVersion:         tls.VersionTLS13,
+	})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	// Complete TLS handshake but never send HELLO.
+	if err := conn.Handshake(); err != nil {
+		t.Fatalf("tls handshake: %v", err)
+	}
+
+	// Server should close the connection (deadline) within ~10s.
+	// We allow 12s to absorb scheduling jitter.
+	conn.SetReadDeadline(time.Now().Add(12 * time.Second))
+	_, err = wire.Read(conn)
+	conn.SetReadDeadline(time.Time{})
+	if err == nil {
+		t.Fatal("expected connection to be closed by server deadline")
+	}
+}
+
+// TestTypedCapabilitiesNodeRoundTrip: capabilities declared in HELLO survive
+// through DoServer → entity registry → EntityJoined system event (Decision #7).
+func TestTypedCapabilitiesNodeRoundTrip(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	// watcher subscribes to system events before the capable client joins.
+	watcher := connect(t, addr)
+	defer watcher.close()
+	srv.AddRule(acl.Rule{
+		IdentityPattern: acl.EncodeIdentity(watcher.pub),
+		Action:          acl.ActionSubscribe,
+		SubjectPattern:  "lattice.system.>",
+		Effect:          acl.Allow,
+		Priority:        10,
+	})
+	watcher.subscribe(t, "lattice.system.>")
+
+	// Connect a client that declares typed capabilities.
+	_, joinerPriv, _ := ed25519.GenerateKey(rand.Reader)
+	tlsConn, err := tls.Dial("tcp", addr, &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer tlsConn.Close()
+
+	caps := []*pb.Capability{{Name: "sensor"}, {Name: "actuator"}}
+	if _, err := handshake.DoClient(tlsConn, joinerPriv, nil, caps); err != nil {
+		t.Fatalf("handshake: %v", err)
+	}
+
+	// Watcher receives EntityJoined with typed capabilities.
+	payload := watcher.expectDeliver(t, "lattice.system.entity.joined")
+	var evt pb.EntityJoined
+	if err := proto.Unmarshal(payload, &evt); err != nil {
+		t.Fatalf("unmarshal EntityJoined: %v", err)
+	}
+	if len(evt.Capabilities) != 2 {
+		t.Fatalf("expected 2 capabilities in EntityJoined, got %d", len(evt.Capabilities))
+	}
+	if evt.Capabilities[0].Name != "sensor" || evt.Capabilities[1].Name != "actuator" {
+		t.Fatalf("capability names mismatch: %v", evt.Capabilities)
 	}
 }
 

@@ -142,12 +142,16 @@ func (s *Server) HandleConn(conn net.Conn) {
 	remote := conn.RemoteAddr().String()
 	s.log.Info("client connected", "remote", remote)
 
+	// Deadline prevents a client that completes TLS but never sends HELLO from
+	// holding a goroutine indefinitely (Decision #17).
+	tlsConn.SetDeadline(time.Now().Add(10 * time.Second))
 	rec, err := handshake.DoServer(tlsConn, s.serverPriv, s.sessions, s.heartbeatInterval)
 	if err != nil {
 		s.log.Warn("handshake failed", "remote", remote, "err", err)
 		conn.Close()
 		return
 	}
+	tlsConn.SetDeadline(time.Time{})
 	s.log.Info("entity authenticated", "remote", remote, "session_id", rec.ID)
 
 	lc := &lockedConn{conn: conn}

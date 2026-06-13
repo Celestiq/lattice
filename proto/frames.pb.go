@@ -39,8 +39,8 @@ const (
 	FrameType_FRAME_TYPE_REQUEST       FrameType = 10
 	FrameType_FRAME_TYPE_RESPONSE      FrameType = 11
 	FrameType_FRAME_TYPE_DISCONNECT    FrameType = 12
-	FrameType_FRAME_TYPE_PING          FrameType = 13
-	FrameType_FRAME_TYPE_PONG          FrameType = 14
+	FrameType_FRAME_TYPE_PING          FrameType = 13 // Reserved — no handler; do not build client code against this
+	FrameType_FRAME_TYPE_PONG          FrameType = 14 // Reserved — no handler; do not build client code against this
 )
 
 // Enum value maps for FrameType.
@@ -108,27 +108,27 @@ func (FrameType) EnumDescriptor() ([]byte, []int) {
 	return file_proto_frames_proto_rawDescGZIP(), []int{0}
 }
 
-type RawFrame struct {
+type Capability struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	Payload       []byte                 `protobuf:"bytes,1,opt,name=payload,proto3" json:"payload,omitempty"`
+	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"` // capability identifier e.g. "sensor", "actuator"
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *RawFrame) Reset() {
-	*x = RawFrame{}
+func (x *Capability) Reset() {
+	*x = Capability{}
 	mi := &file_proto_frames_proto_msgTypes[0]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *RawFrame) String() string {
+func (x *Capability) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*RawFrame) ProtoMessage() {}
+func (*Capability) ProtoMessage() {}
 
-func (x *RawFrame) ProtoReflect() protoreflect.Message {
+func (x *Capability) ProtoReflect() protoreflect.Message {
 	mi := &file_proto_frames_proto_msgTypes[0]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
@@ -140,25 +140,26 @@ func (x *RawFrame) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use RawFrame.ProtoReflect.Descriptor instead.
-func (*RawFrame) Descriptor() ([]byte, []int) {
+// Deprecated: Use Capability.ProtoReflect.Descriptor instead.
+func (*Capability) Descriptor() ([]byte, []int) {
 	return file_proto_frames_proto_rawDescGZIP(), []int{0}
 }
 
-func (x *RawFrame) GetPayload() []byte {
+func (x *Capability) GetName() string {
 	if x != nil {
-		return x.Payload
+		return x.Name
 	}
-	return nil
+	return ""
 }
 
 type Hello struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Pubkey        []byte                 `protobuf:"bytes,1,opt,name=pubkey,proto3" json:"pubkey,omitempty"`       // Ed25519 public key (32 bytes)
-	Signature     []byte                 `protobuf:"bytes,2,opt,name=signature,proto3" json:"signature,omitempty"` // Ed25519 signature over TLS-exporter nonce (64 bytes)
-	Capabilities  []string               `protobuf:"bytes,3,rep,name=capabilities,proto3" json:"capabilities,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	Pubkey          []byte                 `protobuf:"bytes,1,opt,name=pubkey,proto3" json:"pubkey,omitempty"`       // Ed25519 public key (32 bytes)
+	Signature       []byte                 `protobuf:"bytes,2,opt,name=signature,proto3" json:"signature,omitempty"` // Ed25519 signature over client TLS-exporter nonce (64 bytes)
+	Capabilities    []*Capability          `protobuf:"bytes,3,rep,name=capabilities,proto3" json:"capabilities,omitempty"`
+	ProtocolVersion uint32                 `protobuf:"varint,4,opt,name=protocol_version,json=protocolVersion,proto3" json:"protocol_version,omitempty"` // must equal ProtocolVersion=1; server rejects mismatches
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *Hello) Reset() {
@@ -205,11 +206,18 @@ func (x *Hello) GetSignature() []byte {
 	return nil
 }
 
-func (x *Hello) GetCapabilities() []string {
+func (x *Hello) GetCapabilities() []*Capability {
 	if x != nil {
 		return x.Capabilities
 	}
 	return nil
+}
+
+func (x *Hello) GetProtocolVersion() uint32 {
+	if x != nil {
+		return x.ProtocolVersion
+	}
+	return 0
 }
 
 type HelloAck struct {
@@ -218,6 +226,7 @@ type HelloAck struct {
 	SessionToken      []byte                 `protobuf:"bytes,2,opt,name=session_token,json=sessionToken,proto3" json:"session_token,omitempty"`                 // 32 random bytes
 	ServerPubkey      []byte                 `protobuf:"bytes,3,opt,name=server_pubkey,json=serverPubkey,proto3" json:"server_pubkey,omitempty"`                 // Ed25519 public key (32 bytes)
 	HeartbeatInterval uint32                 `protobuf:"varint,4,opt,name=heartbeat_interval,json=heartbeatInterval,proto3" json:"heartbeat_interval,omitempty"` // seconds
+	ServerSignature   []byte                 `protobuf:"bytes,5,opt,name=server_signature,json=serverSignature,proto3" json:"server_signature,omitempty"`        // Ed25519 signature over server TLS-exporter nonce (64 bytes)
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
@@ -278,6 +287,13 @@ func (x *HelloAck) GetHeartbeatInterval() uint32 {
 		return x.HeartbeatInterval
 	}
 	return 0
+}
+
+func (x *HelloAck) GetServerSignature() []byte {
+	if x != nil {
+		return x.ServerSignature
+	}
+	return nil
 }
 
 type Heartbeat struct {
@@ -852,19 +868,22 @@ var File_proto_frames_proto protoreflect.FileDescriptor
 
 const file_proto_frames_proto_rawDesc = "" +
 	"\n" +
-	"\x12proto/frames.proto\x12\alattice\"$\n" +
-	"\bRawFrame\x12\x18\n" +
-	"\apayload\x18\x01 \x01(\fR\apayload\"a\n" +
+	"\x12proto/frames.proto\x12\alattice\" \n" +
+	"\n" +
+	"Capability\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\"\xa1\x01\n" +
 	"\x05Hello\x12\x16\n" +
 	"\x06pubkey\x18\x01 \x01(\fR\x06pubkey\x12\x1c\n" +
-	"\tsignature\x18\x02 \x01(\fR\tsignature\x12\"\n" +
-	"\fcapabilities\x18\x03 \x03(\tR\fcapabilities\"\xa2\x01\n" +
+	"\tsignature\x18\x02 \x01(\fR\tsignature\x127\n" +
+	"\fcapabilities\x18\x03 \x03(\v2\x13.lattice.CapabilityR\fcapabilities\x12)\n" +
+	"\x10protocol_version\x18\x04 \x01(\rR\x0fprotocolVersion\"\xcd\x01\n" +
 	"\bHelloAck\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x01 \x01(\tR\tsessionId\x12#\n" +
 	"\rsession_token\x18\x02 \x01(\fR\fsessionToken\x12#\n" +
 	"\rserver_pubkey\x18\x03 \x01(\fR\fserverPubkey\x12-\n" +
-	"\x12heartbeat_interval\x18\x04 \x01(\rR\x11heartbeatInterval\"\v\n" +
+	"\x12heartbeat_interval\x18\x04 \x01(\rR\x11heartbeatInterval\x12)\n" +
+	"\x10server_signature\x18\x05 \x01(\fR\x0fserverSignature\"\v\n" +
 	"\tHeartbeat\"\x0e\n" +
 	"\fHeartbeatAck\"%\n" +
 	"\tSubscribe\x12\x18\n" +
@@ -930,7 +949,7 @@ var file_proto_frames_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
 var file_proto_frames_proto_msgTypes = make([]protoimpl.MessageInfo, 15)
 var file_proto_frames_proto_goTypes = []any{
 	(FrameType)(0),       // 0: lattice.FrameType
-	(*RawFrame)(nil),     // 1: lattice.RawFrame
+	(*Capability)(nil),   // 1: lattice.Capability
 	(*Hello)(nil),        // 2: lattice.Hello
 	(*HelloAck)(nil),     // 3: lattice.HelloAck
 	(*Heartbeat)(nil),    // 4: lattice.Heartbeat
@@ -947,11 +966,12 @@ var file_proto_frames_proto_goTypes = []any{
 	(*Pong)(nil),         // 15: lattice.Pong
 }
 var file_proto_frames_proto_depIdxs = []int32{
-	0, // [0:0] is the sub-list for method output_type
-	0, // [0:0] is the sub-list for method input_type
-	0, // [0:0] is the sub-list for extension type_name
-	0, // [0:0] is the sub-list for extension extendee
-	0, // [0:0] is the sub-list for field type_name
+	1, // 0: lattice.Hello.capabilities:type_name -> lattice.Capability
+	1, // [1:1] is the sub-list for method output_type
+	1, // [1:1] is the sub-list for method input_type
+	1, // [1:1] is the sub-list for extension type_name
+	1, // [1:1] is the sub-list for extension extendee
+	0, // [0:1] is the sub-list for field type_name
 }
 
 func init() { file_proto_frames_proto_init() }

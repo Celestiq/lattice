@@ -2,10 +2,12 @@ package main
 
 import (
 	"crypto/tls"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -19,6 +21,7 @@ import (
 func main() {
 	addr := flag.String("addr", "localhost:4222", "lattice-node address")
 	keyFile := flag.String("key", "client.key", "Ed25519 private key file (created if missing)")
+	serverKeyFile := flag.String("server-key", "server.pin", "file storing the pinned server Ed25519 pubkey (hex); created on first connect)")
 	flag.Parse()
 
 	_, clientPriv, err := identity.LoadOrGenerate(*keyFile)
@@ -28,8 +31,18 @@ func main() {
 	}
 	fmt.Printf("identity loaded from %s\n", *keyFile)
 
+	// Load pinned server pubkey if the pin file exists.
+	var pinnedServerPubkey []byte
+	if data, err := os.ReadFile(*serverKeyFile); err == nil {
+		decoded, err := hex.DecodeString(strings.TrimSpace(string(data)))
+		if err == nil {
+			pinnedServerPubkey = decoded
+			fmt.Printf("server key pinned from %s\n", *serverKeyFile)
+		}
+	}
+
 	conn, err := tls.Dial("tcp", *addr, &tls.Config{
-		InsecureSkipVerify: true, // self-signed cert; replaced by CA pinning in later sessions
+		InsecureSkipVerify: true, // TLS cert is not the trust anchor; Ed25519 signature is
 		MinVersion:         tls.VersionTLS13,
 	})
 	if err != nil {
@@ -39,13 +52,21 @@ func main() {
 	defer conn.Close()
 	fmt.Printf("connected to %s\n", *addr)
 
-	cs, err := handshake.DoClient(conn, clientPriv)
+	cs, err := handshake.DoClient(conn, clientPriv, pinnedServerPubkey, nil)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "handshake: %v\n", err)
 		os.Exit(1)
 	}
 	fmt.Printf("authenticated  session_id=%s  heartbeat_interval=%s\n",
 		cs.SessionID, cs.HeartbeatInterval)
+
+	// On first connect (TOFU), pin the server pubkey for future connections.
+	if pinnedServerPubkey == nil {
+		pinHex := hex.EncodeToString(cs.ServerPubkey) + "\n"
+		if err := os.WriteFile(*serverKeyFile, []byte(pinHex), 0600); err == nil {
+			fmt.Printf("server identity pinned → %s\n", *serverKeyFile)
+		}
+	}
 
 	// Mutex protecting all writes so the heartbeat goroutine and main goroutine
 	// don't interleave their frame bytes.
