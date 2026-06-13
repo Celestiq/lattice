@@ -37,6 +37,7 @@ message Hello {
   bytes  signature        = 2; // Ed25519 signature over client TLS-exporter nonce (64 bytes)
   repeated Capability capabilities     = 3;
   uint32 protocol_version = 4; // must equal ProtocolVersion=1; server rejects mismatches
+  bytes  resume_token     = 5; // optional; 32-byte token from a prior HELLO_ACK (Decision #2)
 }
 
 message HelloAck {

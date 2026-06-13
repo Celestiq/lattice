@@ -158,6 +158,7 @@ type Hello struct {
 	Signature       []byte                 `protobuf:"bytes,2,opt,name=signature,proto3" json:"signature,omitempty"` // Ed25519 signature over client TLS-exporter nonce (64 bytes)
 	Capabilities    []*Capability          `protobuf:"bytes,3,rep,name=capabilities,proto3" json:"capabilities,omitempty"`
 	ProtocolVersion uint32                 `protobuf:"varint,4,opt,name=protocol_version,json=protocolVersion,proto3" json:"protocol_version,omitempty"` // must equal ProtocolVersion=1; server rejects mismatches
+	ResumeToken     []byte                 `protobuf:"bytes,5,opt,name=resume_token,json=resumeToken,proto3" json:"resume_token,omitempty"`              // optional; 32-byte token from a prior HELLO_ACK (Decision #2)
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
 }
@@ -218,6 +219,13 @@ func (x *Hello) GetProtocolVersion() uint32 {
 		return x.ProtocolVersion
 	}
 	return 0
+}
+
+func (x *Hello) GetResumeToken() []byte {
+	if x != nil {
+		return x.ResumeToken
+	}
+	return nil
 }
 
 type HelloAck struct {
@@ -935,12 +943,13 @@ const file_proto_frames_proto_rawDesc = "" +
 	"\x12proto/frames.proto\x12\alattice\" \n" +
 	"\n" +
 	"Capability\x12\x12\n" +
-	"\x04name\x18\x01 \x01(\tR\x04name\"\xa1\x01\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\"\xc4\x01\n" +
 	"\x05Hello\x12\x16\n" +
 	"\x06pubkey\x18\x01 \x01(\fR\x06pubkey\x12\x1c\n" +
 	"\tsignature\x18\x02 \x01(\fR\tsignature\x127\n" +
 	"\fcapabilities\x18\x03 \x03(\v2\x13.lattice.CapabilityR\fcapabilities\x12)\n" +
-	"\x10protocol_version\x18\x04 \x01(\rR\x0fprotocolVersion\"\xcd\x01\n" +
+	"\x10protocol_version\x18\x04 \x01(\rR\x0fprotocolVersion\x12!\n" +
+	"\fresume_token\x18\x05 \x01(\fR\vresumeToken\"\xcd\x01\n" +
 	"\bHelloAck\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x01 \x01(\tR\tsessionId\x12#\n" +

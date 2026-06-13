@@ -32,11 +32,12 @@ type Server struct {
 	acl               *acl.Engine
 	registry          *registry.Registry
 	calls             *call.Registry
-	seq               subjectSequencer   // per-subject monotonic DELIVER IDs (Decision #4)
+	tokens            *session.TokenStore // resume tokens keyed by session token (Decision #2)
+	seq               subjectSequencer    // per-subject monotonic DELIVER IDs (Decision #4)
 	serverPriv        ed25519.PrivateKey
 	serverPub         ed25519.PublicKey
 	heartbeatInterval uint32 // seconds
-	conns             sync.Map   // sessionID → *sessionWriter
+	conns             sync.Map // sessionID → *sessionWriter
 	wg                sync.WaitGroup
 	stopOnce          sync.Once
 	done              chan struct{}
@@ -44,7 +45,8 @@ type Server struct {
 
 // New creates a Server and starts the background heartbeat checker.
 // Default ACL rule: server identity is allowed to do everything.
-func New(log *slog.Logger, serverPriv ed25519.PrivateKey, heartbeatInterval uint32) *Server {
+// tokenTTL controls how long resume tokens are valid; defaults to 5 minutes.
+func New(log *slog.Logger, serverPriv ed25519.PrivateKey, heartbeatInterval uint32, tokenTTL ...time.Duration) *Server {
 	serverPub := serverPriv.Public().(ed25519.PublicKey)
 	engine := acl.New()
 	// Server identity can always publish and subscribe to any subject.
@@ -63,6 +65,11 @@ func New(log *slog.Logger, serverPriv ed25519.PrivateKey, heartbeatInterval uint
 		Priority:        1000,
 	})
 
+	ttl := 5 * time.Minute
+	if len(tokenTTL) > 0 && tokenTTL[0] > 0 {
+		ttl = tokenTTL[0]
+	}
+
 	s := &Server{
 		log:               log,
 		sessions:          session.NewTable(),
@@ -70,6 +77,7 @@ func New(log *slog.Logger, serverPriv ed25519.PrivateKey, heartbeatInterval uint
 		acl:               engine,
 		registry:          registry.New(),
 		calls:             call.New(),
+		tokens:            session.NewTokenStore(ttl),
 		serverPriv:        serverPriv,
 		serverPub:         serverPub,
 		heartbeatInterval: heartbeatInterval,
@@ -137,14 +145,14 @@ func (s *Server) HandleConn(conn net.Conn) {
 	// Deadline prevents a client that completes TLS but never sends HELLO from
 	// holding a goroutine indefinitely (Decision #17).
 	tlsConn.SetDeadline(time.Now().Add(10 * time.Second))
-	rec, err := handshake.DoServer(tlsConn, s.serverPriv, s.sessions, s.heartbeatInterval)
+	rec, resume, err := handshake.DoServer(tlsConn, s.serverPriv, s.sessions, s.tokens, s.heartbeatInterval)
 	if err != nil {
 		s.log.Warn("handshake failed", "remote", remote, "err", err)
 		conn.Close()
 		return
 	}
 	tlsConn.SetDeadline(time.Time{})
-	s.log.Info("entity authenticated", "remote", remote, "session_id", rec.ID)
+	s.log.Info("entity authenticated", "remote", remote, "session_id", rec.ID, "resumed", resume.Resumed)
 
 	// onWriteError is called by the writer goroutine when a write deadline fires.
 	// It performs the same cleanup as the normal disconnect defer, but publishes
@@ -176,9 +184,19 @@ func (s *Server) HandleConn(conn net.Conn) {
 		s.evictOldSession(oldEnt)
 	}
 
-	// Register entity and announce it.
+	// Register entity.
 	s.registry.Register(rec.ID, rec.Pubkey, rec.Capabilities)
-	s.publishEntityJoined(rec)
+
+	// On resume: restore subscriptions silently and call the durable-replay hook.
+	// On fresh connect: announce entity.joined so watchers know the entity arrived.
+	if resume.Resumed {
+		for _, pattern := range resume.Patterns {
+			_ = s.bus.Subscribe(rec.ID, pattern)
+		}
+		s.durableReplayHook(rec)
+	} else {
+		s.publishEntityJoined(rec)
+	}
 
 	// Cleanup: ordered to prevent fanout to dead connections.
 	defer func() {
@@ -565,15 +583,24 @@ func (s *Server) sendError(sw *sessionWriter, code, message string, refID ...str
 
 // teardownSession performs the cleanup for a graceful disconnect (DISCONNECT frame or
 // connection EOF). The CAS Remove ensures only the first caller does real work.
+// Subscription patterns are saved to the token store so the entity can resume later
+// (Decision #2).
 func (s *Server) teardownSession(rec *session.Record) {
 	if s.registry.Remove(rec.Pubkey, rec.ID) == nil {
 		return // eviction, heartbeat checker, or Shutdown already cleaned up
 	}
+	// Snapshot subscriptions and save under rec.Token BEFORE RemoveSession wipes them.
+	patterns := s.bus.GetPatterns(rec.ID)
+	s.tokens.Save(rec.Token, rec.Pubkey, patterns)
 	s.bus.RemoveSession(rec.ID)
 	s.conns.Delete(rec.ID)
 	s.sessions.Remove(rec.ID)
 	s.publishEntityLeft(rec)
 }
+
+// durableReplayHook is called after a successful token-based session resume.
+// In v0.1.1 this is a no-op stub; durable message replay is not yet implemented.
+func (s *Server) durableReplayHook(_ *session.Record) {}
 
 // evictOldSession forcibly removes an existing session when the same pubkey
 // reconnects (Decision #12). No entity.left is published — the reconnection

@@ -1,6 +1,6 @@
 # Lattice — System State
 
-**Scope:** Local orchestration only · **Language:** Go 1.23 · **v0.1.1 hardening:** Sessions 0–5 complete · **Branch:** `dev/v0.1.1-hardening`
+**Scope:** Local orchestration only · **Language:** Go 1.23 · **v0.1.1 hardening:** Sessions 0–6 complete · **Branch:** `dev/v0.1.1-hardening`
 
 This document captures the complete state of the Lattice codebase: what exists, how the pieces fit together, and the design decisions behind them. Start here before reading any source file.
 
@@ -100,8 +100,10 @@ TLS 1.3 handshake  (crypto/tls, self-signed Ed25519 cert)
     │
     ▼
 HELLO exchange  (internal/handshake)  — 10-second deadline enforced
-  client sends:  HELLO { pubkey, signature(clientNonce), protocol_version=1, capabilities }
+  client sends:  HELLO { pubkey, signature(clientNonce), protocol_version=1, capabilities, resume_token? }
   server checks: ed25519.Verify(pubkey, clientNonce, signature); version check
+  server checks: if resume_token present → tokens.Consume(token, pubkey) → ResumeResult{Resumed, Patterns}
+                 (mismatch/expired/not-found → Resumed=false; falls through to full registration silently)
   server sends:  HELLO_ACK { session_id, session_token, server_pubkey, server_signature, heartbeat_interval }
   client checks: ed25519.Verify(server_pubkey, serverNonce, server_signature); pinned-key check (TOFU)
     │
@@ -112,7 +114,12 @@ Post-handshake setup  (internal/node)
     calls.InvalidateTarget(oldSessionID) → ERROR TARGET_DISCONNECTED to each requester (Decision #6)
     sw.conn.Close() → old HandleConn read loop exits; its defer CAS-Remove returns nil → no entity.left
   registry.Register(sessionID, pubkey, capabilities)
-  publish lattice.system.entity.joined
+  if resume.Resumed:                          ← Decision #2
+    bus.Subscribe(sessionID, p) for each saved pattern   ← subscription restored without ACL recheck
+    durableReplayHook(rec)  ← no-op stub in v0.1.1
+    NO entity.joined published
+  else:
+    publish lattice.system.entity.joined
     │
     ▼
 Frame dispatch loop  (internal/node)
@@ -131,6 +138,8 @@ Cleanup on disconnect — four paths:
   GRACEFUL (client closes / read error / DISCONNECT):
     teardownSession(rec):
       registry.Remove(pubkey, sessionID) CAS → if nil, another path got here first; return
+      patterns := bus.GetPatterns(sessionID)             ← snapshot subscriptions BEFORE removal
+      tokens.Save(rec.Token, rec.Pubkey, patterns)       ← save for resume (Decision #2)
       bus.RemoveSession(sessionID)
       conns.Delete(sessionID)
       sessions.Remove(sessionID)
@@ -340,6 +349,39 @@ type Registry struct {
 
 ---
 
+### `session.TokenStore` — `internal/session/tokenstore.go`
+```go
+type ResumeState struct {
+    Pubkey    []byte
+    Patterns  []string
+    CreatedAt time.Time
+}
+
+type TokenStore struct {
+    mu     sync.Mutex
+    states map[string]*ResumeState // hex(token) → state
+    ttl    time.Duration
+}
+```
+Maps 32-byte session tokens to saved subscription patterns for token-based resume (Decision #2). `Consume(token, pubkey)` atomically removes and returns the patterns only if the entry is present, not expired, and the pubkey matches — preventing replay. `Save(token, pubkey, patterns)` is called in `teardownSession` before bus cleanup. `Delete` removes without returning state. `ExpireTokens` sweeps expired entries. Default TTL: 5 minutes; configurable via `node.New` variadic arg.
+
+`bus.GetPatterns(sessionID string) []string` returns all patterns to which a session is currently subscribed by iterating over the bus's pattern map under `RLock`.
+
+---
+
+### `handshake.ResumeResult` — `internal/handshake/handshake.go`
+```go
+type ResumeResult struct {
+    Resumed  bool
+    Patterns []string
+}
+```
+Returned by `DoServer` alongside `*session.Record`. `Resumed` is true only when the client presented a valid, unconsumed, non-expired token that matches the connecting pubkey. `DoServer` now takes `*session.TokenStore` as a parameter.
+
+`DoClient` now accepts an optional `resumeToken ...[]byte` variadic. When provided (and non-empty), the token is included in the HELLO frame.
+
+---
+
 ### `node.Server` — `internal/node/node.go`
 ```go
 type Server struct {
@@ -349,17 +391,22 @@ type Server struct {
     acl               *acl.Engine
     registry          *registry.Registry
     calls             *call.Registry
-    seq               subjectSequencer   // per-subject monotonic DELIVER IDs (Decision #4)
+    tokens            *session.TokenStore // resume tokens (Decision #2)
+    seq               subjectSequencer    // per-subject monotonic DELIVER IDs (Decision #4)
     serverPriv        ed25519.PrivateKey
     serverPub         ed25519.PublicKey
     heartbeatInterval uint32
-    conns             sync.Map   // sessionID → *sessionWriter
+    conns             sync.Map // sessionID → *sessionWriter
     wg                sync.WaitGroup
     stopOnce          sync.Once
     done              chan struct{}
 }
 ```
 Created once; `HandleConn` is called in a goroutine per accepted connection. The `wg` tracks all HandleConn goroutines and the two background goroutines (heartbeat checker, call timeout checker). `done` is closed by `Shutdown()` to signal them. `stopOnce` prevents double-close panics.
+
+`New(log, serverPriv, heartbeatInterval, tokenTTL ...time.Duration)` — the optional `tokenTTL` overrides the default 5-minute resume-token TTL.
+
+`durableReplayHook(*session.Record)` — called during resume after subscriptions are restored. No-op stub in v0.1.1; durable message replay is not yet implemented.
 
 ---
 
@@ -562,8 +609,8 @@ go test ./...
 | `internal/bus` | 26 | Wildcard matching (`*`, `>`), pattern/subject validation, subscribe/unsubscribe/fanout, deduplication, session cleanup; 9 `PatternsIntersect` cases (identical, gt-vs-exact, gt-vs-gt, broader-gt, star-vs-exact, different-prefix, private-vs-broader, disjoint-lengths, star-length-mismatch) |
 | `internal/schema` | 13 | Both schemas: valid payloads, out-of-range values, missing fields, invalid enum, string length, unknown subject |
 | `internal/acl` | 11 | Deny by default, exact allow, wildcard identity, priority ordering, deny overrides lower-priority allow; `AllowConcrete` empty-deny, allow, delivery-time deny (wildcard bypass fix), cache invalidation after `AddRule` |
-| `internal/node` | 46 | 39 black-box integration tests (pub/sub, wildcards, schema rejection, ACL, entity events, offline detection, call round-trip/timeout/ACL, graceful shutdown, typed capabilities, delivery-time wildcard deny, system-event delivery deny, reconnect eviction, join-on-reconnect, responder verification, eviction invalidates calls, DISCONNECT teardown, monotonic DELIVER id, per-subject isolation, publisher identity stamped, timestamp populated, request caller identity, caller identity not spoofable, error ref_id, timeout error ref_id); 7 white-box writer unit tests (delivery, write-error callback, idempotent close, close-waits-for-goroutine, channel overflow) |
-| **Total** | **114** | |
+| `internal/node` | 53 | 46 black-box integration tests (pub/sub, wildcards, schema rejection, ACL, entity events, offline detection, call round-trip/timeout/ACL, graceful shutdown, typed capabilities, delivery-time wildcard deny, system-event delivery deny, reconnect eviction, join-on-reconnect, responder verification, eviction invalidates calls, DISCONNECT teardown, monotonic DELIVER id, per-subject isolation, publisher identity stamped, timestamp populated, request caller identity, caller identity not spoofable, error ref_id, timeout error ref_id, resume restores subscriptions, token rotation prevents reuse, resume requires correct signature, resume token pubkey mismatch, expired token falls back, fresh connect unchanged, durable-replay hook no-op); 7 white-box writer unit tests (delivery, write-error callback, idempotent close, close-waits-for-goroutine, channel overflow) |
+| **Total** | **121** | |
 
 The `TestIntegrationSequence` test covers all 10 steps of the full integration scenario in a single sequential test with per-step log output.
 

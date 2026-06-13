@@ -45,6 +45,8 @@ func testServer(
 		t.Fatal(err)
 	}
 
+	tokens := session.NewTokenStore(5 * time.Minute)
+
 	go func() {
 		for {
 			conn, err := ln.Accept()
@@ -54,7 +56,7 @@ func testServer(
 			go func(c net.Conn) {
 				tlsConn := c.(*tls.Conn)
 				defer tlsConn.Close()
-				rec, err := handshake.DoServer(tlsConn, serverPriv, sessions, heartbeatInterval)
+				rec, _, err := handshake.DoServer(tlsConn, serverPriv, sessions, tokens, heartbeatInterval)
 				if err != nil {
 					return
 				}

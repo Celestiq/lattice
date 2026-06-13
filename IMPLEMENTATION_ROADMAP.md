@@ -20,7 +20,7 @@ All 18 decisions accounted for. Decision #13 (QUIC port) is explicitly deferred.
 | 3 | #11 | ACL correctness — delivery-time check + rule cache | **High** | `[x]` |
 | 4 | #12, #6, #8 | Session lifecycle correctness | Med | `[x]` |
 | 5 | #4, #18, #5 | Message provenance & correlation envelopes | Med | `[x]` |
-| 6 | #2 | Token-based session resume | Med | `[ ]` |
+| 6 | #2 | Token-based session resume | Med | `[x]` |
 | 7 | #14, #15, #16 | Dynamic schema registry + admin API | Med/Large | `[ ]` |
 
 **Deferred (post-v0.1.1):** #13 QUIC port, federation, durable messages, libp2p DHT.
@@ -293,7 +293,7 @@ Plus the session-specific new tests listed below.
 
 ### Decision
 
-- [ ] **#2 — Session resume via token**
+- [x] **#2 — Session resume via token**
   The session token is generated and sent in `HELLO_ACK` but nothing consumes it. On every reconnect the client does a full re-registration — new `entity.joined` event, empty subscription state, any durable messages during the gap lost.
 
   Fix: token-based resume path.

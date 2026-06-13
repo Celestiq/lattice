@@ -23,13 +23,14 @@ import (
 
 // newServer starts an in-process TLS server and returns the address, the live
 // *node.Server (for adding ACL rules), and a stop function.
-func newServer(t *testing.T, heartbeatInterval uint32) (addr string, srv *node.Server, stop func()) {
+// tokenTTL overrides the default 5-minute resume-token TTL (useful in tests).
+func newServer(t *testing.T, heartbeatInterval uint32, tokenTTL ...time.Duration) (addr string, srv *node.Server, stop func()) {
 	t.Helper()
 	_, serverPriv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv = node.New(slog.New(slog.NewTextHandler(nil, &slog.HandlerOptions{Level: slog.LevelError})), serverPriv, heartbeatInterval)
+	srv = node.New(slog.New(slog.NewTextHandler(nil, &slog.HandlerOptions{Level: slog.LevelError})), serverPriv, heartbeatInterval, tokenTTL...)
 
 	cert, err := wire.GenerateSelfSignedCert()
 	if err != nil {
@@ -1533,4 +1534,279 @@ func TestTimeoutErrorRefID(t *testing.T) {
 	if e.RefId != corrID {
 		t.Fatalf("Error.ref_id: got %q, want %q", e.RefId, corrID)
 	}
+}
+
+// ─── Session 6: token-based session resume (Decision #2) ─────────────────────
+
+// connectResume dials addr with a specific keypair and optional resume token.
+// It returns the testClient and the ClientSession (which carries the new token).
+func connectResume(t *testing.T, addr string, pub ed25519.PublicKey, priv ed25519.PrivateKey, token []byte) (*testClient, *handshake.ClientSession) {
+	t.Helper()
+	conn, err := tls.Dial("tcp", addr, &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cs, err := handshake.DoClient(conn, priv, nil, nil, token)
+	if err != nil {
+		conn.Close()
+		t.Fatalf("connectResume: %v", err)
+	}
+	return &testClient{conn: conn, pub: pub, priv: priv}, cs
+}
+
+// dialAndSendCraftedHello dials addr, completes TLS, sends hello directly (bypassing
+// DoClient), and returns the first frame the server sends back. Used to test
+// bad-signature paths without going through the full client handshake.
+func dialAndSendCraftedHello(t *testing.T, addr string, hello *pb.Hello) *wire.Frame {
+	t.Helper()
+	conn, err := tls.Dial("tcp", addr, &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	payload, _ := proto.Marshal(hello)
+	if err := wire.Write(conn, pb.FrameType_FRAME_TYPE_HELLO, payload); err != nil {
+		t.Fatalf("dialAndSendCraftedHello write: %v", err)
+	}
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	frame, err := wire.Read(conn)
+	if err != nil {
+		t.Fatalf("dialAndSendCraftedHello read: %v", err)
+	}
+	return frame
+}
+
+// TestResumeRestoresSubscriptions verifies that a token-based resume restores
+// subscriptions without firing entity.joined (Decision #2).
+func TestResumeRestoresSubscriptions(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	watcher := connect(t, addr)
+	defer watcher.close()
+	allowAll(t, srv, watcher.pub)
+	watcher.subscribe(t, "lattice.system.>")
+
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	allowAll(t, srv, pub)
+
+	// E connects, subscribes, then disconnects cleanly.
+	e1, cs1 := connectResume(t, addr, pub, priv, nil)
+	watcher.expectDeliver(t, "lattice.system.entity.joined")
+	e1.subscribe(t, "home.sensor.temperature")
+	token := cs1.SessionToken
+	e1.close()
+	watcher.expectDeliver(t, "lattice.system.entity.left")
+	time.Sleep(50 * time.Millisecond) // ensure teardownSession saved the token
+
+	// E resumes — no entity.joined should fire.
+	e2, _ := connectResume(t, addr, pub, priv, token)
+	defer e2.close()
+	watcher.expectNoDeliver(t, 300*time.Millisecond)
+
+	// Subscription was restored: a publisher's message reaches E2.
+	publisher := connect(t, addr)
+	defer publisher.close()
+	allowAll(t, srv, publisher.pub)
+	publisher.publish(t, "home.sensor.temperature", tempReading(21.0))
+	e2.expectDeliver(t, "home.sensor.temperature")
+}
+
+// TestTokenRotationPreventsReuse verifies that a consumed token cannot be
+// used a second time (Decision #2).
+func TestTokenRotationPreventsReuse(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	watcher := connect(t, addr)
+	defer watcher.close()
+	allowAll(t, srv, watcher.pub)
+	watcher.subscribe(t, "lattice.system.>")
+
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	allowAll(t, srv, pub)
+
+	// First connect → get T1.
+	e1, cs1 := connectResume(t, addr, pub, priv, nil)
+	watcher.expectDeliver(t, "lattice.system.entity.joined")
+	t1 := cs1.SessionToken
+	e1.close()
+	watcher.expectDeliver(t, "lattice.system.entity.left")
+	time.Sleep(50 * time.Millisecond)
+
+	// Second connect with T1 → resume (T1 consumed, T2 issued).
+	e2, _ := connectResume(t, addr, pub, priv, t1)
+	watcher.expectNoDeliver(t, 200*time.Millisecond) // resume: no entity.joined
+	e2.close()
+	watcher.expectDeliver(t, "lattice.system.entity.left")
+	time.Sleep(50 * time.Millisecond)
+
+	// Third connect with T1 again (already consumed) → full registration.
+	e3, _ := connectResume(t, addr, pub, priv, t1)
+	defer e3.close()
+	watcher.expectDeliver(t, "lattice.system.entity.joined")
+}
+
+// TestResumeRequiresCorrectSignature verifies that a zero/invalid signature is
+// rejected before the token is looked up, so the token remains unconsumed
+// (Decision #2).
+func TestResumeRequiresCorrectSignature(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	watcher := connect(t, addr)
+	defer watcher.close()
+	allowAll(t, srv, watcher.pub)
+	watcher.subscribe(t, "lattice.system.>")
+
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	allowAll(t, srv, pub)
+
+	e1, cs1 := connectResume(t, addr, pub, priv, nil)
+	watcher.expectDeliver(t, "lattice.system.entity.joined")
+	token := cs1.SessionToken
+	e1.close()
+	watcher.expectDeliver(t, "lattice.system.entity.left")
+	time.Sleep(50 * time.Millisecond)
+
+	// Zero signature + valid token → INVALID_SIGNATURE; token NOT consumed.
+	frame := dialAndSendCraftedHello(t, addr, &pb.Hello{
+		Pubkey:          pub,
+		Signature:       make([]byte, 64), // zeroed — invalid
+		ProtocolVersion: handshake.ProtocolVersion,
+		ResumeToken:     token,
+	})
+	if frame.Type != pb.FrameType_FRAME_TYPE_ERROR {
+		t.Fatalf("expected ERROR, got %v", frame.Type)
+	}
+	var sigErr pb.Error
+	proto.Unmarshal(frame.Payload, &sigErr)
+	if sigErr.Code != "INVALID_SIGNATURE" {
+		t.Fatalf("expected INVALID_SIGNATURE, got %q", sigErr.Code)
+	}
+
+	// Token is still valid — correct reconnect must succeed as a resume.
+	e2, _ := connectResume(t, addr, pub, priv, token)
+	defer e2.close()
+	watcher.expectNoDeliver(t, 200*time.Millisecond) // resume: no entity.joined
+}
+
+// TestResumeTokenPubkeyMismatch verifies that a token issued for key A cannot
+// be used to resume as key B (Decision #2).
+func TestResumeTokenPubkeyMismatch(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	watcher := connect(t, addr)
+	defer watcher.close()
+	allowAll(t, srv, watcher.pub)
+	watcher.subscribe(t, "lattice.system.>")
+
+	pubA, privA, _ := ed25519.GenerateKey(rand.Reader)
+	pubB, privB, _ := ed25519.GenerateKey(rand.Reader)
+	allowAll(t, srv, pubA)
+	allowAll(t, srv, pubB)
+
+	// A connects, gets T_A, disconnects.
+	eA, csA := connectResume(t, addr, pubA, privA, nil)
+	watcher.expectDeliver(t, "lattice.system.entity.joined")
+	tokenA := csA.SessionToken
+	eA.close()
+	watcher.expectDeliver(t, "lattice.system.entity.left")
+	time.Sleep(50 * time.Millisecond)
+
+	// B presents T_A → pubkey mismatch → full registration as B.
+	eB, _ := connectResume(t, addr, pubB, privB, tokenA)
+	defer eB.close()
+	payload := watcher.expectDeliver(t, "lattice.system.entity.joined")
+	var joined pb.EntityJoined
+	proto.Unmarshal(payload, &joined)
+	if acl.EncodeIdentity(joined.Pubkey) != acl.EncodeIdentity(pubB) {
+		t.Fatalf("entity.joined is not for B — pubkey mismatch should have triggered full registration")
+	}
+}
+
+// TestExpiredTokenFallsBack verifies that a token past its TTL causes a full
+// registration rather than a resume (Decision #2).
+func TestExpiredTokenFallsBack(t *testing.T) {
+	addr, srv, stop := newServer(t, 30, 10*time.Millisecond) // very short TTL
+	defer stop()
+
+	watcher := connect(t, addr)
+	defer watcher.close()
+	allowAll(t, srv, watcher.pub)
+	watcher.subscribe(t, "lattice.system.>")
+
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	allowAll(t, srv, pub)
+
+	e1, cs1 := connectResume(t, addr, pub, priv, nil)
+	watcher.expectDeliver(t, "lattice.system.entity.joined")
+	token := cs1.SessionToken
+	e1.close()
+	watcher.expectDeliver(t, "lattice.system.entity.left")
+
+	// Wait for the token to expire.
+	time.Sleep(50 * time.Millisecond)
+
+	// Expired token → full registration.
+	e2, _ := connectResume(t, addr, pub, priv, token)
+	defer e2.close()
+	watcher.expectDeliver(t, "lattice.system.entity.joined")
+}
+
+// TestFreshConnectWithoutTokenUnchanged verifies that the existing full-registration
+// path is not affected by the resume feature (regression).
+func TestFreshConnectWithoutTokenUnchanged(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	watcher := connect(t, addr)
+	defer watcher.close()
+	allowAll(t, srv, watcher.pub)
+	watcher.subscribe(t, "lattice.system.>")
+
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	allowAll(t, srv, pub)
+
+	// Fresh connect without any token → normal registration.
+	e, _ := connectResume(t, addr, pub, priv, nil)
+	defer e.close()
+	watcher.expectDeliver(t, "lattice.system.entity.joined")
+
+	// Subscribe and receive normally.
+	e.subscribe(t, "home.sensor.temperature")
+	publisher := connect(t, addr)
+	defer publisher.close()
+	allowAll(t, srv, publisher.pub)
+	watcher.expectDeliver(t, "lattice.system.entity.joined") // publisher joined
+	publisher.publish(t, "home.sensor.temperature", tempReading(20.0))
+	e.expectDeliver(t, "home.sensor.temperature")
+}
+
+// TestDurableReplayHookNoOp verifies that the durable-replay stub is invoked
+// during a resume and leaves the connection fully functional (Decision #2,
+// v0.1.1 stub).
+func TestDurableReplayHookNoOp(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	allowAll(t, srv, pub)
+
+	e1, cs1 := connectResume(t, addr, pub, priv, nil)
+	e1.subscribe(t, "home.sensor.temperature")
+	token := cs1.SessionToken
+	e1.close()
+	time.Sleep(50 * time.Millisecond)
+
+	// Resume — durableReplayHook runs as a no-op; connection must still work.
+	e2, _ := connectResume(t, addr, pub, priv, token)
+	defer e2.close()
+
+	publisher := connect(t, addr)
+	defer publisher.close()
+	allowAll(t, srv, publisher.pub)
+	publisher.publish(t, "home.sensor.temperature", tempReading(19.0))
+	e2.expectDeliver(t, "home.sensor.temperature")
 }
