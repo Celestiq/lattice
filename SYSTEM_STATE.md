@@ -1,6 +1,6 @@
 # Lattice — System State
 
-**Scope:** Local orchestration only · **Language:** Go 1.23 · **v0.1.1 hardening:** Sessions 0–3 complete · **Branch:** `dev/v0.1.1-hardening`
+**Scope:** Local orchestration only · **Language:** Go 1.23 · **v0.1.1 hardening:** Sessions 0–4 complete · **Branch:** `dev/v0.1.1-hardening`
 
 This document captures the complete state of the Lattice codebase: what exists, how the pieces fit together, and the design decisions behind them. Start here before reading any source file.
 
@@ -107,6 +107,10 @@ HELLO exchange  (internal/handshake)  — 10-second deadline enforced
     │
     ▼
 Post-handshake setup  (internal/node)
+  evictOldSession(existing)  ← if same pubkey already in registry (Decision #12)
+    registry.Remove(pubkey, oldSessionID) CAS → bus.RemoveSession → conns.LoadAndDelete → sessions.Remove
+    calls.InvalidateTarget(oldSessionID) → ERROR TARGET_DISCONNECTED to each requester (Decision #6)
+    sw.conn.Close() → old HandleConn read loop exits; its defer CAS-Remove returns nil → no entity.left
   registry.Register(sessionID, pubkey, capabilities)
   publish lattice.system.entity.joined
     │
@@ -116,39 +120,50 @@ Frame dispatch loop  (internal/node)
   SUBSCRIBE      → acl.Allow(subscribe) → bus.Subscribe
   UNSUBSCRIBE    → bus.Unsubscribe
   PUBLISH        → ValidateSubject → acl.Allow(publish) → schema.Validate → bus.Fanout → for each subscriber: acl.AllowConcrete(subscribe, subject) → DELIVER
-  REQUEST        → acl.Allow(call) → registry.Get(target) → calls.Add → forward REQUEST to target
-  RESPONSE       → calls.Remove(correlationID) → forward RESPONSE to requester
+  REQUEST        → acl.Allow(call) → registry.Get(target) → calls.Add(corrID, requesterSID, targetSID) → forward REQUEST to target
+  RESPONSE       → calls.Peek(corrID) → verify sender.sessionID == pending.TargetSessionID (→ ERROR NOT_AUTHORIZED if mismatch) → calls.Remove → forward RESPONSE to requester
+  DISCONNECT     → teardownSession (CAS Remove + bus/conns/sessions cleanup + entity.left) → return
   anything else  → logged, ignored
     │
     ▼
-Cleanup on disconnect — three paths:
+Cleanup on disconnect — four paths:
 
-  GRACEFUL (client closes / read error):
-    registry.Remove(pubkey) → returns record (non-nil)
-    bus.RemoveSession(sessionID)
-    conns.Delete(sessionID)
-    sessions.Remove(sessionID)
-    publish lattice.system.entity.left
+  GRACEFUL (client closes / read error / DISCONNECT):
+    teardownSession(rec):
+      registry.Remove(pubkey, sessionID) CAS → if nil, another path got here first; return
+      bus.RemoveSession(sessionID)
+      conns.Delete(sessionID)
+      sessions.Remove(sessionID)
+      publish lattice.system.entity.left
     conn.Close()     → interrupts any pending write in sessionWriter
     sw.close()       → waits for writer goroutine to exit
 
+  EVICTION (same pubkey reconnects — Decision #12):
+    evictOldSession(old):
+      registry.Remove(old.Pubkey, old.SessionID) CAS → if nil, return
+      calls.InvalidateTarget(old.SessionID) → ERROR TARGET_DISCONNECTED to requesters
+      bus.RemoveSession(old.SessionID)
+      conns.LoadAndDelete(old.SessionID) → sw.conn.Close()
+      sessions.Remove(old.SessionID)
+      NO entity.left published — reconnect supersedes old session
+    → old HandleConn's read loop exits (conn closed) → defer teardownSession CAS-Remove → nil → no-op
+
   OFFLINE (heartbeat checker marks stale):
-    registry.Remove(pubkey) → returns record (non-nil)
+    registry.Remove(pubkey, sessionID) CAS → if nil, return
     bus.RemoveSession(sessionID)
-    conns.LoadAndDelete(sessionID)
+    conns.LoadAndDelete(sessionID) → sw.conn.Close()
     sessions.Remove(sessionID)
     publish lattice.system.entity.offline
-    sw.conn.Close()  → writer goroutine detects error, calls onWriteError (no-op: already removed), exits
-    → HandleConn defer: registry.Remove returns nil → skips entity.left; sw.close() fast-returns
+    → HandleConn defer: teardownSession CAS-Remove returns nil → skips entity.left; sw.close() fast-returns
 
   WRITE TIMEOUT (5-second per-write deadline in sessionWriter):
-    sessionWriter.write() detects error → conn.Close() → onWriteError closure fires
-    registry.Remove(pubkey) → if nil, return (another path got here first)
-    bus.RemoveSession(sessionID)
-    conns.Delete(sessionID)
-    sessions.Remove(sessionID)
-    publish lattice.system.entity.offline
-    → HandleConn read loop exits (conn closed) → defer: registry.Remove returns nil → skips entity.left
+    onWriteError closure fires:
+      registry.Remove(pubkey, sessionID) CAS → if nil, return
+      bus.RemoveSession(sessionID)
+      conns.Delete(sessionID)
+      sessions.Remove(sessionID)
+      publish lattice.system.entity.offline
+    → HandleConn read loop exits (conn closed) → defer teardownSession CAS-Remove → nil → no-op
 ```
 
 Both TLS exporter nonces are derived via `tls.ConnectionState.ExportKeyingMaterial`. Two distinct labels prevent the same bytes from being signed in both directions:
@@ -162,7 +177,7 @@ Both TLS exporter nonces are derived via `tls.ConnectionState.ExportKeyingMateri
 `srv.Shutdown()` performs an ordered drain:
 
 1. `close(s.done)` — signals background goroutines (heartbeat checker, call timeout checker) to stop.
-2. Iterates `registry.All()` snapshot; calls `registry.Remove` for each (prevents HandleConn defers from double-publishing).
+2. Iterates `registry.All()` snapshot; calls `registry.Remove(pubkey, sessionID)` (CAS) for each (prevents HandleConn defers from double-publishing).
 3. Publishes `lattice.system.entity.left` for each removed entity (frames are enqueued into subscriber writers' data channels while those writers are still running).
 4. `conns.Range` — for each `sessionWriter`: calls `sw.close()` (drains buffered frames including entity.left, with 5-second write deadline per frame), then `sw.conn.Close()` so HandleConn's read loop exits.
 5. `s.wg.Wait()` — blocks until all HandleConn goroutines and both background goroutines have exited.
@@ -206,6 +221,8 @@ type Table struct {
 }
 ```
 Dual-indexed so it can be looked up by session ID (frame routing) or by pubkey.
+
+`Remove(id)` uses a CAS on the `byPubkey` entry: it only deletes `byPubkey[k]` when it still references the session being removed. This prevents evicting S1 (when the same pubkey reconnects as S2) from wiping S2's pubkey index.
 
 ---
 
@@ -296,7 +313,7 @@ type Registry struct {
     entities map[string]*EntityRecord // hex(pubkey) → record
 }
 ```
-`Remove(pubkey)` returns the record if it existed, or `nil` if already removed. This nil-check is the sentinel that prevents the graceful, offline, write-timeout, and shutdown disconnect paths from all firing for the same entity.
+`Remove(pubkey, sessionID)` is a **compare-and-swap**: only removes the entry if `record.SessionID == sessionID`, returns the removed record or nil. This is the sentinel that prevents all four disconnect paths from racing — and crucially, prevents a reconnecting entity's old-session defer from wiping the new session's registry entry.
 
 `Get(pubkey)` returns the record without removing it — used by `handleRequest` for target lookup.
 
@@ -306,6 +323,7 @@ type Registry struct {
 ```go
 type PendingCall struct {
     RequesterSessionID string
+    TargetSessionID    string // the session that must send the RESPONSE (Decision #6)
     Deadline           time.Time
 }
 
@@ -314,7 +332,11 @@ type Registry struct {
     pending map[string]*PendingCall // correlationID → call
 }
 ```
-`Add` is called before forwarding the REQUEST to the target (prevents a race where the response arrives before the entry exists). `Remove` returns nil if not found (stale or already expired). `Expired(now)` removes and returns all entries past their deadline atomically.
+- `Add(corrID, requesterSID, targetSID, deadline)` — registered before forwarding the REQUEST (race-prevention).
+- `Peek(corrID)` — non-destructive lookup; used by `handleResponse` to verify the responder's session before committing a Remove.
+- `Remove(corrID)` — returns nil if not found (stale or expired).
+- `Expired(now)` — removes and returns all entries past their deadline atomically.
+- `InvalidateTarget(targetSID)` — bulk-removes all calls targeting `targetSID`; used in `evictOldSession` to cancel in-flight calls when a target reconnects (returns `[]ExpiredCall` so callers can send `TARGET_DISCONNECTED` to requesters).
 
 ---
 
@@ -406,8 +428,9 @@ Client A sends REQUEST { correlation_id, target_pubkey=B, payload, timeout_ms }
     ├─ registry.Get(B.pubkey)
     │      → ERROR NOT_FOUND if B not connected
     │
-    ├─ calls.Add(correlation_id, A.sessionID, now+timeout_ms)
+    ├─ calls.Add(correlation_id, A.sessionID, B.sessionID, now+timeout_ms)
     │      registered BEFORE forwarding (avoids response-arrives-first race)
+    │      B.sessionID stored so the responder can be verified
     │
     └─ targetSw.enqueue(REQUEST, payload) ───────────────────► Client B receives REQUEST
 
@@ -415,12 +438,18 @@ Client B sends RESPONSE { correlation_id, payload }
     │
     ▼  node.handleResponse
     │
-    ├─ calls.Remove(correlation_id) → *PendingCall
+    ├─ calls.Peek(correlation_id) → *PendingCall
     │      → ERROR NOT_FOUND if correlation_id unknown or already expired
+    │
+    ├─ verify pending.TargetSessionID == sender.sessionID
+    │      → ERROR NOT_AUTHORIZED if mismatch (call stays pending; legitimate target can still respond)
+    │
+    ├─ calls.Remove(correlation_id) → confirm still present (may have expired between Peek and Remove)
     │
     └─ requesterSw.enqueue(RESPONSE, payload) ───────────────► Client A receives RESPONSE
 
 (If no RESPONSE within timeout_ms, runCallTimeoutChecker fires ERROR TIMEOUT to A via enqueueControl)
+(If B evicted before responding, evictOldSession fires ERROR TARGET_DISCONNECTED to A immediately)
 ```
 
 ---
@@ -443,13 +472,13 @@ The offline entity's own subscriptions are removed *before* its offline event is
 
 `runHeartbeatChecker` ticks every `heartbeatInterval` seconds. For each entity with `now − LastHeartbeatAt > 3 × interval`, `markOffline` is called:
 
-1. `registry.Remove` — if nil, another goroutine already handled it; return.
+1. `registry.Remove(pubkey, sessionID)` (CAS) — if nil, another goroutine already handled it; return.
 2. Remove subscriptions from the bus.
 3. Remove `*sessionWriter` from `conns` via `LoadAndDelete`.
 4. Remove session from the session table.
 5. Publish `entity.offline` (while other subscribers are still in `conns`).
-6. `sw.conn.Close()` → HandleConn's `wire.Read` returns error; the sessionWriter goroutine detects the closed conn on its next write, calls `onWriteError` (which is a no-op since the entity is already removed), and exits.
-7. HandleConn defer: `registry.Remove` returns nil → skips `entity.left`; `sw.close()` fast-returns (goroutine already exited).
+6. `sw.conn.Close()` → HandleConn's `wire.Read` returns error; the sessionWriter goroutine detects the closed conn on its next write, calls `onWriteError` (which is a no-op since the entity is already removed by CAS), and exits.
+7. HandleConn defer: `teardownSession` calls `registry.Remove(pubkey, sessionID)` → returns nil → no-op (already cleaned up); `sw.close()` fast-returns (goroutine already exited).
 
 ---
 
@@ -511,8 +540,8 @@ go test ./...
 | `internal/bus` | 26 | Wildcard matching (`*`, `>`), pattern/subject validation, subscribe/unsubscribe/fanout, deduplication, session cleanup; 9 `PatternsIntersect` cases (identical, gt-vs-exact, gt-vs-gt, broader-gt, star-vs-exact, different-prefix, private-vs-broader, disjoint-lengths, star-length-mismatch) |
 | `internal/schema` | 13 | Both schemas: valid payloads, out-of-range values, missing fields, invalid enum, string length, unknown subject |
 | `internal/acl` | 11 | Deny by default, exact allow, wildcard identity, priority ordering, deny overrides lower-priority allow; `AllowConcrete` empty-deny, allow, delivery-time deny (wildcard bypass fix), cache invalidation after `AddRule` |
-| `internal/node` | 33 | 26 black-box integration tests (pub/sub, wildcards, schema rejection, ACL, entity events, offline detection, call round-trip/timeout/ACL, graceful shutdown, typed capabilities, delivery-time wildcard deny, system-event delivery deny); 7 white-box writer unit tests (delivery, write-error callback, idempotent close, close-waits-for-goroutine, channel overflow) |
-| **Total** | **101** | |
+| `internal/node` | 38 | 31 black-box integration tests (pub/sub, wildcards, schema rejection, ACL, entity events, offline detection, call round-trip/timeout/ACL, graceful shutdown, typed capabilities, delivery-time wildcard deny, system-event delivery deny, reconnect eviction, join-on-reconnect, responder verification, eviction invalidates calls, DISCONNECT teardown); 7 white-box writer unit tests (delivery, write-error callback, idempotent close, close-waits-for-goroutine, channel overflow) |
+| **Total** | **106** | |
 
 The `TestIntegrationSequence` test covers all 10 steps of the full integration scenario in a single sequential test with per-step log output.
 

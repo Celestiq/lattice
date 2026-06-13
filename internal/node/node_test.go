@@ -1046,3 +1046,234 @@ func TestSystemEventDeliveryDeny(t *testing.T) {
 
 	watcher.expectNoDeliver(t, 300*time.Millisecond)
 }
+
+// ─── Session 4: session lifecycle correctness (Decisions #12, #6, #8) ─────────
+
+// connectWithKey connects and authenticates using the supplied keypair instead
+// of generating a fresh one. Used to simulate same-identity reconnects.
+func connectWithKey(t *testing.T, addr string, pub ed25519.PublicKey, priv ed25519.PrivateKey) *testClient {
+	t.Helper()
+	conn, err := tls.Dial("tcp", addr, &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := handshake.DoClient(conn, priv, nil, nil); err != nil {
+		conn.Close()
+		t.Fatalf("connectWithKey handshake: %v", err)
+	}
+	return &testClient{conn: conn, pub: pub, priv: priv}
+}
+
+// TestReconnectEvictsOldSession verifies that when the same pubkey reconnects,
+// the server closes the old connection and the new session remains fully live.
+func TestReconnectEvictsOldSession(t *testing.T) {
+	addr, _, stop := newServer(t, 30)
+	defer stop()
+
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+
+	c1 := connectWithKey(t, addr, pub, priv)
+
+	// c2 connecting with the same key must evict c1.
+	c2 := connectWithKey(t, addr, pub, priv)
+	defer c2.close()
+
+	// Give the server time to close c1's connection.
+	time.Sleep(50 * time.Millisecond)
+
+	// c2 must still be alive.
+	c2.send(pb.FrameType_FRAME_TYPE_HEARTBEAT, nil)
+	f := c2.recv(t, time.Second)
+	if f.Type != pb.FrameType_FRAME_TYPE_HEARTBEAT_ACK {
+		t.Fatalf("c2: expected HEARTBEAT_ACK after reconnect, got %v", f.Type)
+	}
+
+	// c1's server-side connection must have been closed by the eviction.
+	c1.conn.(*tls.Conn).SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	_, err := wire.Read(c1.conn)
+	if err == nil {
+		t.Fatal("c1: expected connection closed by server after eviction, but read succeeded")
+	}
+	c1.conn.Close()
+}
+
+// TestAtLeastOnceJoinOnReconnect verifies that reconnecting the same pubkey
+// produces two entity.joined events and zero entity.left events — the eviction
+// does not publish a spurious left, and the new session announces itself.
+func TestAtLeastOnceJoinOnReconnect(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	watcher := connect(t, addr)
+	defer watcher.close()
+	srv.AddRule(acl.Rule{
+		IdentityPattern: acl.EncodeIdentity(watcher.pub),
+		Action:          acl.ActionSubscribe,
+		SubjectPattern:  "lattice.system.>",
+		Effect:          acl.Allow,
+		Priority:        10,
+	})
+	watcher.subscribe(t, "lattice.system.>")
+
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	c1 := connectWithKey(t, addr, pub, priv)
+	c2 := connectWithKey(t, addr, pub, priv)
+	defer c2.close()
+	c1.conn.Close()
+
+	// Collect all system events delivered within 1 second.
+	joined, left := 0, 0
+	watcher.conn.(*tls.Conn).SetReadDeadline(time.Now().Add(time.Second))
+	for {
+		frame, err := wire.Read(watcher.conn)
+		if err != nil {
+			break
+		}
+		if frame.Type != pb.FrameType_FRAME_TYPE_DELIVER {
+			continue
+		}
+		var d pb.Deliver
+		proto.Unmarshal(frame.Payload, &d)
+		switch d.Subject {
+		case "lattice.system.entity.joined":
+			joined++
+		case "lattice.system.entity.left":
+			left++
+		}
+	}
+
+	if joined < 2 {
+		t.Fatalf("expected ≥ 2 entity.joined (c1 + c2 reconnect), got %d", joined)
+	}
+	if left != 0 {
+		t.Fatalf("expected 0 entity.left (eviction suppresses it), got %d", left)
+	}
+}
+
+// TestResponderVerification verifies that a RESPONSE from an entity that is not
+// the intended target is rejected with NOT_AUTHORIZED (Decision #6), and that
+// the pending call remains valid so the legitimate target can still respond.
+func TestResponderVerification(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	a := connect(t, addr)
+	defer a.close()
+	b := connect(t, addr)
+	defer b.close()
+	c := connect(t, addr)
+	defer c.close()
+
+	allowCall(t, srv, a.pub, b.pub)
+
+	corrID := "responder-verify"
+	a.send(pb.FrameType_FRAME_TYPE_REQUEST, &pb.Request{
+		CorrelationId: corrID,
+		TargetPubkey:  b.pub,
+		Payload:       []byte("ping"),
+		TimeoutMs:     5000,
+	})
+
+	// B receives the forwarded REQUEST.
+	b.expectFrame(t, pb.FrameType_FRAME_TYPE_REQUEST)
+
+	// C (imposter) sends RESPONSE with A's correlation ID — must be rejected.
+	c.send(pb.FrameType_FRAME_TYPE_RESPONSE, &pb.Response{
+		CorrelationId: corrID,
+		Payload:       []byte("spoofed"),
+	})
+	e := c.expectError(t)
+	if e.Code != "NOT_AUTHORIZED" {
+		t.Fatalf("expected NOT_AUTHORIZED from imposter, got %q", e.Code)
+	}
+
+	// The call must still be pending — B responds legitimately.
+	b.send(pb.FrameType_FRAME_TYPE_RESPONSE, &pb.Response{
+		CorrelationId: corrID,
+		Payload:       []byte("real-pong"),
+	})
+	frame := a.recv(t, 2*time.Second)
+	if frame.Type != pb.FrameType_FRAME_TYPE_RESPONSE {
+		t.Fatalf("a: expected RESPONSE from B, got %v", frame.Type)
+	}
+	var resp pb.Response
+	proto.Unmarshal(frame.Payload, &resp)
+	if string(resp.Payload) != "real-pong" {
+		t.Fatalf("a: response payload: got %q, want %q", resp.Payload, "real-pong")
+	}
+}
+
+// TestEvictionInvalidatesCalls verifies that pending calls targeting an evicted
+// session are cancelled with TARGET_DISCONNECTED (Decision #6 ↔ #12 coupling).
+func TestEvictionInvalidatesCalls(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	a := connect(t, addr)
+	defer a.close()
+
+	bPub, bPriv, _ := ed25519.GenerateKey(rand.Reader)
+	b1 := connectWithKey(t, addr, bPub, bPriv)
+
+	allowCall(t, srv, a.pub, bPub)
+
+	corrID := "evict-invalidate"
+	a.send(pb.FrameType_FRAME_TYPE_REQUEST, &pb.Request{
+		CorrelationId: corrID,
+		TargetPubkey:  bPub,
+		Payload:       []byte("ping"),
+		TimeoutMs:     30000, // long — must not expire before eviction fires
+	})
+
+	// Drain b1's REQUEST to confirm the call is registered before eviction.
+	b1.expectFrame(t, pb.FrameType_FRAME_TYPE_REQUEST)
+
+	// B reconnects with the same key — evicts b1 and invalidates the pending call.
+	b2 := connectWithKey(t, addr, bPub, bPriv)
+	defer b2.close()
+	b1.conn.Close()
+
+	// A must receive TARGET_DISCONNECTED.
+	e := a.expectError(t)
+	if e.Code != "TARGET_DISCONNECTED" {
+		t.Fatalf("expected TARGET_DISCONNECTED, got %q", e.Code)
+	}
+}
+
+// TestDisconnectTeardown verifies that a DISCONNECT frame triggers an immediate
+// entity.left event, rather than waiting up to 3× heartbeat_interval (Decision #8).
+func TestDisconnectTeardown(t *testing.T) {
+	addr, srv, stop := newServer(t, 30) // 30-second interval — left would take ~90s without fix
+	defer stop()
+
+	watcher := connect(t, addr)
+	defer watcher.close()
+	srv.AddRule(acl.Rule{
+		IdentityPattern: acl.EncodeIdentity(watcher.pub),
+		Action:          acl.ActionSubscribe,
+		SubjectPattern:  "lattice.system.>",
+		Effect:          acl.Allow,
+		Priority:        10,
+	})
+	watcher.subscribe(t, "lattice.system.>")
+
+	c := connect(t, addr)
+	defer c.close()
+
+	// Drain entity.joined for c before testing the disconnect path.
+	watcher.recv(t, 2*time.Second)
+
+	// c signals graceful shutdown.
+	c.send(pb.FrameType_FRAME_TYPE_DISCONNECT, nil)
+
+	// entity.left must arrive well within the 30-second heartbeat interval.
+	frame := watcher.recv(t, 2*time.Second)
+	if frame.Type != pb.FrameType_FRAME_TYPE_DELIVER {
+		t.Fatalf("expected DELIVER after DISCONNECT, got %v", frame.Type)
+	}
+	var d pb.Deliver
+	proto.Unmarshal(frame.Payload, &d)
+	if d.Subject != "lattice.system.entity.left" {
+		t.Fatalf("expected entity.left after DISCONNECT, got %q", d.Subject)
+	}
+}

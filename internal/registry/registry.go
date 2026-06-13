@@ -54,15 +54,19 @@ func (r *Registry) UpdateHeartbeat(pubkey []byte) {
 	}
 }
 
-// Remove deletes the entity for pubkey and returns the record.
-// Returns nil if not found.
-func (r *Registry) Remove(pubkey []byte) *EntityRecord {
+// Remove deletes the entity for pubkey only if its current SessionID matches
+// sessionID (compare-and-swap). Returns the removed record, or nil if not
+// found or if a newer session has already been registered under this pubkey.
+func (r *Registry) Remove(pubkey []byte, sessionID string) *EntityRecord {
 	key := hex.EncodeToString(pubkey)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	rec, ok := r.entities[key]
 	if !ok {
 		return nil
+	}
+	if rec.SessionID != sessionID {
+		return nil // a newer session is already registered under this pubkey
 	}
 	delete(r.entities, key)
 	return rec

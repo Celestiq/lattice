@@ -18,7 +18,7 @@ All 18 decisions accounted for. Decision #13 (QUIC port) is explicitly deferred.
 | 1 | #1, #3, #7, #9, #17 | Handshake & identity hardening | **High** | `[x]` |
 | 2 | #10 | Bus flow control — per-session writer queues | **Highest** | `[x]` |
 | 3 | #11 | ACL correctness — delivery-time check + rule cache | **High** | `[x]` |
-| 4 | #12, #6, #8 | Session lifecycle correctness | Med | `[ ]` |
+| 4 | #12, #6, #8 | Session lifecycle correctness | Med | `[x]` |
 | 5 | #4, #18, #5 | Message provenance & correlation envelopes | Med | `[ ]` |
 | 6 | #2 | Token-based session resume | Med | `[ ]` |
 | 7 | #14, #15, #16 | Dynamic schema registry + admin API | Med/Large | `[ ]` |
@@ -204,19 +204,19 @@ Plus the session-specific new tests listed below.
 
 ### Decisions
 
-- [ ] **#12 — Same-identity reconnect: compare-and-swap registry remove**
+- [x] **#12 — Same-identity reconnect: compare-and-swap registry remove**
   The current race: entity K connects (S1), network blips, K reconnects (S2) before the server detects S1 dead. Registry maps K→S2. S1's read loop then errors; its `defer` calls `registry.Remove(K)` which deletes S2's record and publishes `entity.left`. S2 is still connected but invisible to heartbeat tracking, call routing, and system events.
 
   Fix: `registry.Remove(pubkey, sessionID string)` becomes a compare-and-swap — only deletes if `record.SessionID == sessionID`. S1's defer calls `Remove(K, S1)`, finds S2 in the registry, and does nothing.
 
   On new `HELLO` from an already-active pubkey: evict the old session silently (no `entity.left` — the new join supersedes it), register the new session, publish a single `entity.joined`. Document that `entity.joined` is at-least-once and does not imply a prior disconnection.
 
-- [ ] **#6 — Call response responder verification**
+- [x] **#6 — Call response responder verification**
   `handleResponse` forwards any `RESPONSE` whose `correlation_id` matches a pending entry, from any connected entity. Fix: store `TargetSessionID` in `PendingCall` at `Add` time. In `handleResponse`, verify the responding session ID matches before forwarding. Mismatch → send `ERROR NOT_AUTHORIZED` to the responder and drop the frame.
 
   **Amendment (#6 ↔ #12 coupling):** when CAS eviction displaces the old session, scan the call registry and ERROR-out all pending calls whose `TargetSessionID` matches the evicted session — send `ERROR { code: "TARGET_DISCONNECTED", … }` to each requester. The new session has a different session ID and is not bound by the old calls.
 
-- [ ] **#8 — DISCONNECT frame: handle graceful teardown**
+- [x] **#8 — DISCONNECT frame: handle graceful teardown**
   `DISCONNECT` currently falls into the default-ignore branch in `HandleConn`. Fix: handle `FRAME_TYPE_DISCONNECT` with immediate clean teardown — remove from registry, remove from bus and session table, publish `entity.left`, close the connection. The entity must not remain in the registry until the heartbeat checker fires (up to 3× heartbeat interval).
 
 ### Files to Modify

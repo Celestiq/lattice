@@ -98,7 +98,7 @@ func (s *Server) Shutdown() {
 	// enqueued into each subscriber's data channel before any conn is closed,
 	// so sw.close() below can drain and deliver them.
 	for _, ent := range s.registry.All() {
-		if s.registry.Remove(ent.Pubkey) == nil {
+		if s.registry.Remove(ent.Pubkey, ent.SessionID) == nil {
 			continue // concurrent disconnect already handled it
 		}
 		payload, _ := proto.Marshal(&pb.EntityLeft{
@@ -149,8 +149,8 @@ func (s *Server) HandleConn(conn net.Conn) {
 	// It performs the same cleanup as the normal disconnect defer, but publishes
 	// entity.offline instead of entity.left.
 	onWriteError := func() {
-		if s.registry.Remove(rec.Pubkey) == nil {
-			return // heartbeat checker or Shutdown already cleaned up
+		if s.registry.Remove(rec.Pubkey, rec.ID) == nil {
+			return // heartbeat checker, eviction, or Shutdown already cleaned up
 		}
 		s.log.Info("entity offline (write timeout)",
 			"session_id", rec.ID,
@@ -168,23 +168,22 @@ func (s *Server) HandleConn(conn net.Conn) {
 	sw := newSessionWriter(conn, rec.ID, s.log, onWriteError)
 	s.conns.Store(rec.ID, sw)
 
+	// Evict any existing session for this pubkey before registering the new one
+	// (Decision #12: same-identity reconnect). No entity.left is published —
+	// the new connection supersedes the old one.
+	if oldEnt := s.registry.Get(rec.Pubkey); oldEnt != nil {
+		s.evictOldSession(oldEnt)
+	}
+
 	// Register entity and announce it.
 	s.registry.Register(rec.ID, rec.Pubkey, rec.Capabilities)
 	s.publishEntityJoined(rec)
 
 	// Cleanup: ordered to prevent fanout to dead connections.
 	defer func() {
-		// Remove from registry — returns nil if heartbeat checker, write-timeout
-		// handler, or Shutdown already removed it.
-		if ent := s.registry.Remove(rec.Pubkey); ent != nil {
-			// Normal (graceful) disconnect path.
-			s.bus.RemoveSession(rec.ID)
-			s.conns.Delete(rec.ID)
-			s.sessions.Remove(rec.ID)
-			s.publishEntityLeft(rec)
-		}
-		conn.Close()   // interrupt any pending write; idempotent if already closed
-		sw.close()     // wait for writer goroutine to finish
+		s.teardownSession(rec)          // no-op if DISCONNECT, eviction, or Shutdown already cleaned up
+		conn.Close()                    // interrupt any pending write; idempotent
+		sw.close()                      // wait for writer goroutine to finish
 		s.log.Info("client disconnected", "remote", remote, "session_id", rec.ID)
 	}()
 
@@ -219,7 +218,14 @@ func (s *Server) HandleConn(conn net.Conn) {
 			s.handleRequest(sw, rec, frame.Payload)
 
 		case pb.FrameType_FRAME_TYPE_RESPONSE:
-			s.handleResponse(sw, frame.Payload)
+			s.handleResponse(sw, rec, frame.Payload)
+
+		case pb.FrameType_FRAME_TYPE_DISCONNECT:
+			// Graceful teardown requested by the client (Decision #8).
+			// Perform cleanup now so entity.left is published immediately,
+			// rather than waiting for the heartbeat checker (up to 3× interval).
+			s.teardownSession(rec)
+			return
 
 		default:
 			s.log.Warn("unhandled frame", "remote", remote, "type", frame.Type)
@@ -326,7 +332,7 @@ func (s *Server) handleRequest(sw *sessionWriter, rec *session.Record, payload [
 
 	// Register before forwarding to prevent a race where the target responds
 	// before the pending entry exists.
-	s.calls.Add(req.CorrelationId, rec.ID, deadline)
+	s.calls.Add(req.CorrelationId, rec.ID, targetEnt.SessionID, deadline)
 
 	if !targetSw.enqueue(pb.FrameType_FRAME_TYPE_REQUEST, payload) {
 		s.calls.Remove(req.CorrelationId)
@@ -334,17 +340,30 @@ func (s *Server) handleRequest(sw *sessionWriter, rec *session.Record, payload [
 	}
 }
 
-func (s *Server) handleResponse(sw *sessionWriter, payload []byte) {
+func (s *Server) handleResponse(sw *sessionWriter, rec *session.Record, payload []byte) {
 	var resp pb.Response
 	if err := proto.Unmarshal(payload, &resp); err != nil {
 		s.sendError(sw, "INVALID_PAYLOAD", "cannot unmarshal RESPONSE")
 		return
 	}
 
-	pending := s.calls.Remove(resp.CorrelationId)
+	// Verify the responder is the intended target before removing the call (Decision #6).
+	// Peek leaves the call intact so the legitimate target can still respond if this
+	// is a spoofed RESPONSE from a third party.
+	pending := s.calls.Peek(resp.CorrelationId)
 	if pending == nil {
 		s.sendError(sw, "NOT_FOUND", "unknown or expired correlation_id")
 		return
+	}
+	if pending.TargetSessionID != rec.ID {
+		s.sendError(sw, "NOT_AUTHORIZED", "response from unexpected entity")
+		return
+	}
+
+	// Target verified — remove and forward.
+	pending = s.calls.Remove(resp.CorrelationId)
+	if pending == nil {
+		return // expired between Peek and Remove; silently drop
 	}
 
 	v, ok := s.conns.Load(pending.RequesterSessionID)
@@ -454,8 +473,8 @@ func (s *Server) runHeartbeatChecker() {
 // markOffline handles the offline path for an entity that missed heartbeats.
 // It performs cleanup in the correct order and publishes entity.offline.
 func (s *Server) markOffline(ent *registry.EntityRecord) {
-	// Remove from registry first. If nil, another goroutine already handled it.
-	if removed := s.registry.Remove(ent.Pubkey); removed == nil {
+	// Remove from registry first (CAS). If nil, another goroutine already handled it.
+	if removed := s.registry.Remove(ent.Pubkey, ent.SessionID); removed == nil {
 		return
 	}
 	s.log.Info("entity offline (missed heartbeats)",
@@ -509,4 +528,41 @@ func (s *Server) fanout(subject string, innerPayload []byte) {
 func (s *Server) sendError(sw *sessionWriter, code, message string) {
 	payload, _ := proto.Marshal(&pb.Error{Code: code, Message: message})
 	_ = sw.enqueueControl(pb.FrameType_FRAME_TYPE_ERROR, payload)
+}
+
+// teardownSession performs the cleanup for a graceful disconnect (DISCONNECT frame or
+// connection EOF). The CAS Remove ensures only the first caller does real work.
+func (s *Server) teardownSession(rec *session.Record) {
+	if s.registry.Remove(rec.Pubkey, rec.ID) == nil {
+		return // eviction, heartbeat checker, or Shutdown already cleaned up
+	}
+	s.bus.RemoveSession(rec.ID)
+	s.conns.Delete(rec.ID)
+	s.sessions.Remove(rec.ID)
+	s.publishEntityLeft(rec)
+}
+
+// evictOldSession forcibly removes an existing session when the same pubkey
+// reconnects (Decision #12). No entity.left is published — the reconnection
+// supersedes the old session. Pending calls targeting the old session are
+// cancelled with TARGET_DISCONNECTED (Decision #6 amendment).
+func (s *Server) evictOldSession(old *registry.EntityRecord) {
+	if s.registry.Remove(old.Pubkey, old.SessionID) == nil {
+		return // already gone (concurrent cleanup beat us here)
+	}
+	for _, exp := range s.calls.InvalidateTarget(old.SessionID) {
+		if v, ok := s.conns.Load(exp.RequesterSessionID); ok {
+			payload, _ := proto.Marshal(&pb.Error{
+				Code:    "TARGET_DISCONNECTED",
+				Message: "target entity reconnected with a new session",
+			})
+			_ = v.(*sessionWriter).enqueueControl(pb.FrameType_FRAME_TYPE_ERROR, payload)
+		}
+	}
+	s.bus.RemoveSession(old.SessionID)
+	if v, ok := s.conns.LoadAndDelete(old.SessionID); ok {
+		v.(*sessionWriter).conn.Close() // unblocks the old HandleConn read loop
+	}
+	s.sessions.Remove(old.SessionID)
+	// No entity.left: the reconnect supersedes the old session.
 }

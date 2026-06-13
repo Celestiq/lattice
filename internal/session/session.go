@@ -75,6 +75,9 @@ func (t *Table) ByPubkey(pubkey []byte) *Record {
 }
 
 // Remove deletes a session by ID. No-op if not found.
+// It only removes the byPubkey entry when it still references this session —
+// if the same pubkey has already reconnected (byPubkey points to a newer session),
+// the byPubkey entry is left intact.
 func (t *Table) Remove(id string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -83,7 +86,10 @@ func (t *Table) Remove(id string) {
 		return
 	}
 	delete(t.byID, id)
-	delete(t.byPubkey, hex.EncodeToString(rec.Pubkey))
+	key := hex.EncodeToString(rec.Pubkey)
+	if current, exists := t.byPubkey[key]; exists && current.ID == id {
+		delete(t.byPubkey, key)
+	}
 }
 
 // Len returns the number of active sessions.
