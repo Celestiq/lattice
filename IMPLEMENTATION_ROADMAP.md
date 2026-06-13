@@ -21,7 +21,7 @@ All 18 decisions accounted for. Decision #13 (QUIC port) is explicitly deferred.
 | 4 | #12, #6, #8 | Session lifecycle correctness | Med | `[x]` |
 | 5 | #4, #18, #5 | Message provenance & correlation envelopes | Med | `[x]` |
 | 6 | #2 | Token-based session resume | Med | `[x]` |
-| 7 | #14, #15, #16 | Dynamic schema registry + admin API | Med/Large | `[ ]` |
+| 7 | #14, #15, #16 | Dynamic schema registry + admin API | Med/Large | `[x]` |
 
 **Deferred (post-v0.1.1):** #13 QUIC port, federation, durable messages, libp2p DHT.
 **Sequencing constraint to carry forward:** Session 2 (writer queues) must be complete before QUIC is started. The per-session outbound queue maps directly onto per-stream writes in quic-go — porting blocking fanout onto QUIC forfeits the head-of-line-blocking benefit.
@@ -334,15 +334,15 @@ Plus the session-specific new tests listed below.
 
 ### Decisions
 
-- [ ] **#14 — Dynamic schema registry with raw `FileDescriptorProto`**
+- [x] **#14 — Dynamic schema registry with raw `FileDescriptorProto`**
   Replace the two hardcoded validators in `internal/schema/schema.go` with a runtime registry backed by `google.golang.org/protobuf/types/descriptorpb.FileDescriptorProto` and `google.golang.org/protobuf/types/dynamicpb`. Developers POST compiled `.proto` descriptors to the admin endpoint to register subjects.
 
   **Custom proto options for field-level validation (per user decision):** define `lattice.range` and `lattice.max_length` proto extensions in a new `proto/lattice_options.proto`. The dynamic registry reads these options from the descriptor and enforces them — preserving `value ∈ [-50, 150]` and `len(unit) ≤ 10` validation semantics. This is also the compile target the v1 Lattice DSL will need: custom options are the natural extension point.
 
-- [ ] **#15 — Admin API: localhost-only binding**
+- [x] **#15 — Admin API: localhost-only binding**
   The admin API (for schema registration and future management operations) binds to `127.0.0.1` only — not `0.0.0.0`. The API surface stays stable for when enterprise deployments require remote administration with identity-auth. Implementation: a lightweight HTTP server (stdlib `net/http`), no external dependencies.
 
-- [ ] **#16 — Schema versioning: additive-only in-place updates**
+- [x] **#16 — Schema versioning: additive-only in-place updates**
   In-place schema version bumps are allowed only for additive changes (new optional fields with defaults). Breaking changes (new enum values, changed field types, removed fields, added required fields) require registering a new subject pattern. The `schema_version` field in `Deliver` (from session 5) carries the version tag; subscribers use it to route to the correct decoder. Clear rule documented in `DEV.md`.
 
 ### Files to Modify

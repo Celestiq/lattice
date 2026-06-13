@@ -1,6 +1,6 @@
 # Lattice — System State
 
-**Scope:** Local orchestration only · **Language:** Go 1.23 · **v0.1.1 hardening:** Sessions 0–6 complete · **Branch:** `dev/v0.1.1-hardening`
+**Scope:** Local orchestration only · **Language:** Go 1.23 · **v0.1.1 hardening:** Sessions 0–7 complete · **Branch:** `dev/v0.1.1-hardening`
 
 This document captures the complete state of the Lattice codebase: what exists, how the pieces fit together, and the design decisions behind them. Start here before reading any source file.
 
@@ -32,14 +32,16 @@ lattice/
 │   ├── session/           # authenticated session table
 │   ├── handshake/         # HELLO exchange (both sides)
 │   ├── bus/               # subject validation + subscription registry
-│   ├── schema/            # payload validators for registered subjects
+│   ├── schema/            # dynamic schema registry; payload validators
 │   ├── acl/               # access-control engine
 │   ├── registry/          # entity liveness tracking
 │   ├── call/              # pending REQUEST/RESPONSE registry
+│   ├── admin/             # localhost-only HTTP admin API (Decision #15)
 │   └── node/              # server connection handler (owns all of the above)
 ├── proto/
 │   ├── frames.proto       # 14 frame types + message definitions
-│   ├── schemas.proto      # TemperatureReading, LightCommand
+│   ├── schemas.proto      # TemperatureReading, LightCommand (with lattice.* options)
+│   ├── lattice_options.proto  # custom field options: range, max_length, required
 │   └── events.proto       # EntityJoined, EntityLeft, EntityOffline
 ├── DEV.md                 # developer guide: how to run, flags, architecture
 ├── DEMO.md                # step-by-step feature walkthrough
@@ -126,7 +128,7 @@ Frame dispatch loop  (internal/node)
   HEARTBEAT      → registry.UpdateHeartbeat → HEARTBEAT_ACK (ctrl-priority lane)
   SUBSCRIBE      → acl.Allow(subscribe) → bus.Subscribe
   UNSUBSCRIBE    → bus.Unsubscribe
-  PUBLISH        → ValidateSubject → acl.Allow(publish) → schema.Validate → bus.Fanout → for each subscriber: acl.AllowConcrete(subscribe, subject) → DELIVER
+  PUBLISH        → ValidateSubject → acl.Allow(publish) → s.schema.Validate → bus.Fanout → for each subscriber: acl.AllowConcrete(subscribe, subject) → DELIVER
   REQUEST        → acl.Allow(call) → registry.Get(target) → calls.Add(corrID, requesterSID, targetSID) → forward REQUEST to target
   RESPONSE       → calls.Peek(corrID) → verify sender.sessionID == pending.TargetSessionID (→ ERROR NOT_AUTHORIZED if mismatch) → calls.Remove → forward RESPONSE to requester
   DISCONNECT     → teardownSession (CAS Remove + bus/conns/sessions cleanup + entity.left) → return
@@ -391,7 +393,8 @@ type Server struct {
     acl               *acl.Engine
     registry          *registry.Registry
     calls             *call.Registry
-    tokens            *session.TokenStore // resume tokens (Decision #2)
+    tokens            *session.TokenStore  // resume tokens (Decision #2)
+    schema            *schema.Registry    // dynamic schema registry (Decision #14)
     seq               subjectSequencer    // per-subject monotonic DELIVER IDs (Decision #4)
     serverPriv        ed25519.PrivateKey
     serverPub         ed25519.PublicKey
@@ -405,6 +408,8 @@ type Server struct {
 Created once; `HandleConn` is called in a goroutine per accepted connection. The `wg` tracks all HandleConn goroutines and the two background goroutines (heartbeat checker, call timeout checker). `done` is closed by `Shutdown()` to signal them. `stopOnce` prevents double-close panics.
 
 `New(log, serverPriv, heartbeatInterval, tokenTTL ...time.Duration)` — the optional `tokenTTL` overrides the default 5-minute resume-token TTL.
+
+`SchemaRegistry() *schema.Registry` — returns the server's dynamic schema registry. Used by `admin.New` to wire the admin HTTP server to the same registry instance.
 
 `durableReplayHook(*session.Record)` — called during resume after subscriptions are restored. No-op stub in v0.1.1; durable message replay is not yet implemented.
 
@@ -453,8 +458,8 @@ Client B sends PUBLISH { subject: "home.sensor.temperature", payload: <proto byt
     │      walks rules in priority order; first match wins; default deny
     │      → ERROR { ref_id: message_id } if denied; delivery stops here
     │
-    ├─ schema.Validate("home.sensor.temperature", payload)
-    │      unmarshals TemperatureReading, checks value ∈ [-50, 150], unit ≤ 10 chars
+    ├─ s.schema.Validate("home.sensor.temperature", payload)
+    │      unmarshals via dynamicpb; enforces lattice.required, lattice.range, lattice.max_length options
     │      → ERROR { ref_id: message_id } if invalid; delivery stops here
     │
     ├─ bus.Fanout("home.sensor.temperature")
@@ -570,18 +575,61 @@ The offline entity's own subscriptions are removed *before* its offline event is
 
 ---
 
-## Schema Registry
+## Schema Registry (Decision #14)
 
-Two subjects have registered schemas (hardcoded in `internal/schema/schema.go`). Publishing to any other subject returns `SCHEMA_ERROR: unknown subject`.
+The schema registry is dynamic. Subjects are registered with a compiled `FileDescriptorProto` (binary-encoded); validation uses `google.golang.org/protobuf/types/dynamicpb` to unmarshal payloads against the stored `MessageDescriptor` and enforce custom field options.
+
+Two built-in subjects are pre-registered by `schema.DefaultRegistry()` at server startup:
 
 | Subject | Message type | Constraints |
 |---|---|---|
 | `home.sensor.temperature` | `TemperatureReading` | `value` required (float32, −50..150), `unit` optional (string, ≤10 chars) |
-| `home.light.command` | `LightCommand` | `action` required (ON/OFF/TOGGLE), `brightness` optional (float32, 0.0..1.0) |
+| `home.light.command` | `LightCommand` | `action` required, range [1,3] (enum ON/OFF/TOGGLE), `brightness` optional (float32, 0.0..1.0) |
 
-Proto3 `optional` is used for all fields so the validator can distinguish "not set" from "set to zero value".
+### Custom proto options — `proto/lattice_options.proto`
 
-> **Production note:** A real schema registry would be dynamic — schemas registered at runtime using Protobuf `FileDescriptorProto` and `dynamicpb`. The hardcoded `schemas.proto` is a development scaffold.
+Three extensions on `google.protobuf.FieldOptions`:
+
+| Extension | Field tag | Go variable | Purpose |
+|-----------|-----------|-------------|---------|
+| `lattice.range` | 50001 | `pb.E_Range` | Min/max for numeric or enum field (`RangeOptions{Min, Max float32}`) |
+| `lattice.max_length` | 50002 | `pb.E_MaxLength` | Max byte length for string/bytes field (`uint32`) |
+| `lattice.required` | 50003 | `pb.E_Required` | Field must be present in the payload (`bool`) |
+
+The generated `schemas.pb.go` embeds these option values in field descriptors; `extractConstraints` reads them via `proto.HasExtension` / `proto.GetExtension`.
+
+### `schema.Registry` — `internal/schema/registry.go`
+
+```go
+type Registry struct {
+    mu      sync.RWMutex
+    entries map[string]*registryEntry // subject → entry
+}
+```
+
+- **`NewRegistry()`** — creates an empty registry.
+- **`DefaultRegistry()`** — returns a registry pre-populated with `home.sensor.temperature` → `TemperatureReading` and `home.light.command` → `LightCommand` at version 1.
+- **`Register(subject, messageName string, fdBytes []byte) error`** — parses the `FileDescriptorProto`, builds a `FileDescriptor` via `protodesc.NewFile(fd, protoregistry.GlobalFiles)`, finds the named message, extracts constraints, enforces additive-only versioning, and stores the entry. Version increments by 1 on each accepted upgrade.
+- **`Validate(subject string, payload []byte) error`** — unmarshals using `dynamicpb.NewMessage`, walks fields, enforces `required`, `range`, and `max_length` constraints.
+- **`Version(subject string) uint32`** — returns current version (0 if not registered).
+- **`List() []SubjectInfo`** — returns all subjects with versions; used by the admin GET endpoint.
+
+**Additive-only versioning (Decision #16):** `checkAdditive` walks all fields in the old descriptor and verifies each is present in the new one with the same kind. Field removal or type change returns an error — the `Register` call is rejected and the version is not bumped.
+
+Proto3 `optional` is used for all built-in message fields so the `Has(field)` presence check distinguishes "not set" from "set to zero value".
+
+### Admin API — `internal/admin/admin.go` (Decision #15)
+
+A lightweight stdlib `net/http` server. Accessible via `cmd/lattice-node --admin-addr` (default `127.0.0.1:4223`). `ListenAndServe` validates that the bind address resolves to a loopback IP before binding.
+
+| Method | Path | Body | Response |
+|--------|------|------|----------|
+| `POST` | `/schema` | `{"subject": "...", "message_name": "...", "descriptor": "<base64 FileDescriptorProto>"}` | `204 No Content` or `422` |
+| `GET` | `/schema` | — | `200 JSON [{"subject":"...","schema_version":N}]` |
+
+`admin.Server` also exposes `Serve(net.Listener)` for tests (skips the loopback address check).
+
+The server binary exposes `srv.SchemaRegistry() *schema.Registry` to pass to `admin.New`.
 
 ---
 
@@ -607,10 +655,10 @@ go test ./...
 | `internal/wire` | 7 | Frame encode/decode, 256 KiB boundary, concurrent clients, mid-read disconnect |
 | `internal/handshake` | 11 | Valid HELLO, corrupted signature, mismatched pubkey, concurrent sessions, HEARTBEAT round-trip, session token, server signature verify/forge, pin mismatch, unsupported protocol version, typed capabilities, handshake deadline (10s, skipped in short mode) |
 | `internal/bus` | 26 | Wildcard matching (`*`, `>`), pattern/subject validation, subscribe/unsubscribe/fanout, deduplication, session cleanup; 9 `PatternsIntersect` cases (identical, gt-vs-exact, gt-vs-gt, broader-gt, star-vs-exact, different-prefix, private-vs-broader, disjoint-lengths, star-length-mismatch) |
-| `internal/schema` | 13 | Both schemas: valid payloads, out-of-range values, missing fields, invalid enum, string length, unknown subject |
+| `internal/schema` | 13 | Both schemas: valid payloads, out-of-range values, missing fields, invalid enum, string length, unknown subject (all validated via dynamic registry + custom options) |
 | `internal/acl` | 11 | Deny by default, exact allow, wildcard identity, priority ordering, deny overrides lower-priority allow; `AllowConcrete` empty-deny, allow, delivery-time deny (wildcard bypass fix), cache invalidation after `AddRule` |
-| `internal/node` | 53 | 46 black-box integration tests (pub/sub, wildcards, schema rejection, ACL, entity events, offline detection, call round-trip/timeout/ACL, graceful shutdown, typed capabilities, delivery-time wildcard deny, system-event delivery deny, reconnect eviction, join-on-reconnect, responder verification, eviction invalidates calls, DISCONNECT teardown, monotonic DELIVER id, per-subject isolation, publisher identity stamped, timestamp populated, request caller identity, caller identity not spoofable, error ref_id, timeout error ref_id, resume restores subscriptions, token rotation prevents reuse, resume requires correct signature, resume token pubkey mismatch, expired token falls back, fresh connect unchanged, durable-replay hook no-op); 7 white-box writer unit tests (delivery, write-error callback, idempotent close, close-waits-for-goroutine, channel overflow) |
-| **Total** | **121** | |
+| `internal/node` | 61 | 54 black-box integration tests (pub/sub, wildcards, schema rejection, ACL, entity events, offline detection, call round-trip/timeout/ACL, graceful shutdown, typed capabilities, delivery-time wildcard deny, system-event delivery deny, reconnect eviction, join-on-reconnect, responder verification, eviction invalidates calls, DISCONNECT teardown, monotonic DELIVER id, per-subject isolation, publisher identity stamped, timestamp populated, request caller identity, caller identity not spoofable, error ref_id, timeout error ref_id, resume restores subscriptions, token rotation prevents reuse, resume requires correct signature, resume token pubkey mismatch, expired token falls back, fresh connect unchanged, durable-replay hook no-op, runtime schema registration, custom range enforced, custom max_length enforced, additive version bump, breaking change rejected, admin localhost-only, admin GET schema, admin register schema); 7 white-box writer unit tests |
+| **Total** | **129** | |
 
 The `TestIntegrationSequence` test covers all 10 steps of the full integration scenario in a single sequential test with per-step log output.
 
@@ -620,17 +668,18 @@ The `TestIntegrationSequence` test covers all 10 steps of the full integration s
 
 ```
 cmd/lattice-node
-    └── internal/node
-            ├── internal/handshake
-            │       ├── internal/session
-            │       ├── internal/wire
-            │       └── proto/
-            ├── internal/bus
-            ├── internal/schema    ──► proto/
-            ├── internal/acl       ──► internal/bus (Match)
-            ├── internal/registry
-            ├── internal/call
-            └── internal/wire
+    ├── internal/node
+    │       ├── internal/handshake
+    │       │       ├── internal/session
+    │       │       ├── internal/wire
+    │       │       └── proto/
+    │       ├── internal/bus
+    │       ├── internal/schema    ──► proto/ (dynamicpb, protodesc, protoregistry)
+    │       ├── internal/acl       ──► internal/bus (Match)
+    │       ├── internal/registry
+    │       ├── internal/call
+    │       └── internal/wire
+    └── internal/admin ──► internal/schema
 
 cmd/lattice-client
     ├── internal/handshake

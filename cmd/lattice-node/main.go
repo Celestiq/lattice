@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"lattice/internal/admin"
 	"lattice/internal/identity"
 	"lattice/internal/node"
 	"lattice/internal/wire"
@@ -17,6 +18,7 @@ import (
 
 func main() {
 	addr := flag.String("addr", ":4222", "listen address")
+	adminAddr := flag.String("admin-addr", "127.0.0.1:4223", "admin HTTP API listen address (loopback only)")
 	keyFile := flag.String("key", "node.key", "Ed25519 private key file (created if missing)")
 	heartbeatInterval := flag.Uint("heartbeat", 30, "heartbeat interval sent to clients (seconds)")
 	flag.Parse()
@@ -47,6 +49,14 @@ func main() {
 
 	srv := node.New(log, serverPriv, uint32(*heartbeatInterval))
 	log.Info("lattice-node listening", "addr", *addr, "tls", true)
+
+	adminSrv := admin.New(srv.SchemaRegistry())
+	go func() {
+		if err := adminSrv.ListenAndServe(*adminAddr); err != nil {
+			log.Warn("admin server stopped", "err", err)
+		}
+	}()
+	log.Info("admin API listening", "addr", *adminAddr)
 
 	// Graceful shutdown on SIGINT or SIGTERM.
 	sigCh := make(chan os.Signal, 1)

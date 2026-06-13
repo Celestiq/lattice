@@ -1,20 +1,28 @@
 package node_test
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/tls"
+	"encoding/base64"
+	"encoding/json"
 	"log/slog"
 	"net"
+	"net/http"
 	"sync"
 	"testing"
 	"time"
 
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protodesc"
+	"google.golang.org/protobuf/types/descriptorpb"
 
 	"lattice/internal/acl"
+	"lattice/internal/admin"
 	"lattice/internal/handshake"
 	"lattice/internal/node"
+	"lattice/internal/schema"
 	"lattice/internal/wire"
 	pb "lattice/proto"
 )
@@ -1809,4 +1817,257 @@ func TestDurableReplayHookNoOp(t *testing.T) {
 	allowAll(t, srv, publisher.pub)
 	publisher.publish(t, "home.sensor.temperature", tempReading(19.0))
 	e2.expectDeliver(t, "home.sensor.temperature")
+}
+
+// ─── Session 7: dynamic schema registry + admin API (Decisions #14, #15, #16) ─
+
+// buildFDBytes marshals the FileDescriptorProto for the given compiled proto message's file.
+func buildFDBytes(m proto.Message) []byte {
+	fdp := protodesc.ToFileDescriptorProto(m.ProtoReflect().Descriptor().ParentFile())
+	b, _ := proto.Marshal(fdp)
+	return b
+}
+
+// buildSimpleFD constructs a minimal FileDescriptorProto with one or two float fields.
+func buildSimpleFD(name string, fields []*descriptorpb.FieldDescriptorProto) []byte {
+	fdp := &descriptorpb.FileDescriptorProto{
+		Name:    proto.String(name),
+		Syntax:  proto.String("proto3"),
+		Package: proto.String("test"),
+		MessageType: []*descriptorpb.DescriptorProto{{
+			Name:  proto.String("TestMsg"),
+			Field: fields,
+		}},
+	}
+	b, _ := proto.Marshal(fdp)
+	return b
+}
+
+func floatField(name string, number int32) *descriptorpb.FieldDescriptorProto {
+	return &descriptorpb.FieldDescriptorProto{
+		Name:   proto.String(name),
+		Number: proto.Int32(number),
+		Type:   descriptorpb.FieldDescriptorProto_TYPE_FLOAT.Enum(),
+		Label:  descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum(),
+	}
+}
+
+// startAdminServer creates an admin server and starts it on a random loopback port.
+// Returns the server's base URL and a stop function.
+func startAdminServer(t *testing.T, r *schema.Registry) (baseURL string, stop func()) {
+	t.Helper()
+	a := admin.New(r)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go a.Serve(ln) //nolint:errcheck
+	return "http://" + ln.Addr().String(), func() { ln.Close() }
+}
+
+// TestRuntimeSchemaRegistration verifies that a schema registered at runtime via
+// srv.SchemaRegistry().Register is used for subsequent PUBLISH validation.
+func TestRuntimeSchemaRegistration(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	sub := connect(t, addr)
+	defer sub.close()
+	pub := connect(t, addr)
+	defer pub.close()
+	id := acl.EncodeIdentity(pub.pub)
+	subID := acl.EncodeIdentity(sub.pub)
+	srv.AddRule(acl.Rule{IdentityPattern: id, Action: acl.ActionPublish, SubjectPattern: "home.>", Effect: acl.Allow, Priority: 10})
+	srv.AddRule(acl.Rule{IdentityPattern: subID, Action: acl.ActionSubscribe, SubjectPattern: "home.>", Effect: acl.Allow, Priority: 10})
+
+	// Register a new subject using TemperatureReading as the schema.
+	fdBytes := buildFDBytes(&pb.TemperatureReading{})
+	if err := srv.SchemaRegistry().Register("home.sensor.humidity", "TemperatureReading", fdBytes); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	sub.subscribe(t, "home.sensor.humidity")
+
+	// Valid publish to the newly registered subject.
+	pub.publish(t, "home.sensor.humidity", tempReading(55.0))
+	sub.expectDeliver(t, "home.sensor.humidity")
+}
+
+// TestCustomRangeEnforced verifies that a dynamically registered schema with a
+// range constraint rejects values outside the range.
+func TestCustomRangeEnforced(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	pub := connect(t, addr)
+	defer pub.close()
+	allowAll(t, srv, pub.pub)
+
+	// Register TemperatureReading for home.sensor.humidity (inherits its range constraints).
+	fdBytes := buildFDBytes(&pb.TemperatureReading{})
+	if err := srv.SchemaRegistry().Register("home.sensor.humidity", "TemperatureReading", fdBytes); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	// value=999 exceeds max 150 — schema error.
+	bad, _ := proto.Marshal(&pb.TemperatureReading{Value: func() *float32 { v := float32(999); return &v }()})
+	pub.publish(t, "home.sensor.humidity", bad)
+	e := pub.expectError(t)
+	if e.Code != "SCHEMA_ERROR" {
+		t.Fatalf("expected SCHEMA_ERROR, got %q", e.Code)
+	}
+}
+
+// TestCustomMaxLengthEnforced verifies that the max_length constraint from a
+// dynamically registered schema is enforced at publish time.
+func TestCustomMaxLengthEnforced(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	pub := connect(t, addr)
+	defer pub.close()
+	allowAll(t, srv, pub.pub)
+
+	// Register TemperatureReading for a new subject; unit max_length=10 applies.
+	fdBytes := buildFDBytes(&pb.TemperatureReading{})
+	if err := srv.SchemaRegistry().Register("home.sensor.pressure", "TemperatureReading", fdBytes); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	unit := "12345678901" // 11 chars > max 10
+	val := float32(1.0)
+	bad, _ := proto.Marshal(&pb.TemperatureReading{Value: &val, Unit: &unit})
+	pub.publish(t, "home.sensor.pressure", bad)
+	e := pub.expectError(t)
+	if e.Code != "SCHEMA_ERROR" {
+		t.Fatalf("expected SCHEMA_ERROR, got %q", e.Code)
+	}
+}
+
+// TestAdditiveVersionBump verifies that registering an updated schema with an
+// additional field increments the version number (Decision #16).
+func TestAdditiveVersionBump(t *testing.T) {
+	reg := schema.DefaultRegistry()
+
+	fdv1 := buildSimpleFD("v1.proto", []*descriptorpb.FieldDescriptorProto{
+		floatField("value", 1),
+	})
+	if err := reg.Register("test.additive", "TestMsg", fdv1); err != nil {
+		t.Fatalf("Register v1: %v", err)
+	}
+	if v := reg.Version("test.additive"); v != 1 {
+		t.Fatalf("expected version 1 after initial registration, got %d", v)
+	}
+
+	// v2 adds a new optional field — additive change.
+	fdv2 := buildSimpleFD("v1.proto", []*descriptorpb.FieldDescriptorProto{
+		floatField("value", 1),
+		floatField("extra", 2),
+	})
+	if err := reg.Register("test.additive", "TestMsg", fdv2); err != nil {
+		t.Fatalf("Register v2: %v", err)
+	}
+	if v := reg.Version("test.additive"); v != 2 {
+		t.Fatalf("expected version 2 after additive bump, got %d", v)
+	}
+}
+
+// TestBreakingChangeRejected verifies that removing a field is rejected with an
+// error and the schema version is not bumped (Decision #16).
+func TestBreakingChangeRejected(t *testing.T) {
+	reg := schema.DefaultRegistry()
+
+	// v1 has two fields.
+	fdv1 := buildSimpleFD("break.proto", []*descriptorpb.FieldDescriptorProto{
+		floatField("value", 1),
+		floatField("extra", 2),
+	})
+	if err := reg.Register("test.breaking", "TestMsg", fdv1); err != nil {
+		t.Fatalf("Register v1: %v", err)
+	}
+
+	// v2 removes "extra" (field 2) — breaking change.
+	fdv2 := buildSimpleFD("break.proto", []*descriptorpb.FieldDescriptorProto{
+		floatField("value", 1),
+	})
+	err := reg.Register("test.breaking", "TestMsg", fdv2)
+	if err == nil {
+		t.Fatal("expected error for breaking change, got nil")
+	}
+	// Version must remain at 1.
+	if v := reg.Version("test.breaking"); v != 1 {
+		t.Fatalf("expected version 1 after rejected bump, got %d", v)
+	}
+}
+
+// TestAdminLocalhostOnly verifies that ListenAndServe rejects non-loopback addresses.
+func TestAdminLocalhostOnly(t *testing.T) {
+	a := admin.New(schema.DefaultRegistry())
+	err := a.ListenAndServe("0.0.0.0:0")
+	if err == nil {
+		t.Fatal("expected error for non-loopback bind, got nil")
+	}
+}
+
+// TestAdminGetSchema verifies that GET /schema returns a JSON list of registered subjects.
+func TestAdminGetSchema(t *testing.T) {
+	r := schema.DefaultRegistry()
+	baseURL, stop := startAdminServer(t, r)
+	defer stop()
+
+	resp, err := http.Get(baseURL + "/schema")
+	if err != nil {
+		t.Fatalf("GET /schema: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	var list []schema.SubjectInfo
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	subjects := make(map[string]bool)
+	for _, s := range list {
+		subjects[s.Subject] = true
+	}
+	if !subjects["home.sensor.temperature"] || !subjects["home.light.command"] {
+		t.Fatalf("expected built-in subjects in list, got %v", list)
+	}
+}
+
+// TestAdminRegisterSchema verifies that POST /schema registers a new subject that
+// the server then validates against.
+func TestAdminRegisterSchema(t *testing.T) {
+	r := schema.DefaultRegistry()
+	baseURL, stop := startAdminServer(t, r)
+	defer stop()
+
+	fdBytes := buildFDBytes(&pb.TemperatureReading{})
+	body, _ := json.Marshal(map[string]string{
+		"subject":      "home.sensor.co2",
+		"message_name": "TemperatureReading",
+		"descriptor":   base64.StdEncoding.EncodeToString(fdBytes),
+	})
+	resp, err := http.Post(baseURL+"/schema", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /schema: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d", resp.StatusCode)
+	}
+
+	// Subject is now registered — schema validates correctly.
+	if err := r.Validate("home.sensor.co2", tempReading(42.0)); err != nil {
+		t.Fatalf("Validate after registration: %v", err)
+	}
+	// Unknown value (out of range) is rejected.
+	bad, _ := proto.Marshal(&pb.TemperatureReading{Value: func() *float32 { v := float32(9999); return &v }()})
+	if err := r.Validate("home.sensor.co2", bad); err == nil {
+		t.Fatal("expected validation error for out-of-range value")
+	}
 }

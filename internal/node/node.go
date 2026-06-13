@@ -32,7 +32,8 @@ type Server struct {
 	acl               *acl.Engine
 	registry          *registry.Registry
 	calls             *call.Registry
-	tokens            *session.TokenStore // resume tokens keyed by session token (Decision #2)
+	tokens            *session.TokenStore  // resume tokens keyed by session token (Decision #2)
+	schema            *schema.Registry    // dynamic schema registry (Decision #14)
 	seq               subjectSequencer    // per-subject monotonic DELIVER IDs (Decision #4)
 	serverPriv        ed25519.PrivateKey
 	serverPub         ed25519.PublicKey
@@ -78,6 +79,7 @@ func New(log *slog.Logger, serverPriv ed25519.PrivateKey, heartbeatInterval uint
 		registry:          registry.New(),
 		calls:             call.New(),
 		tokens:            session.NewTokenStore(ttl),
+		schema:            schema.DefaultRegistry(),
 		serverPriv:        serverPriv,
 		serverPub:         serverPub,
 		heartbeatInterval: heartbeatInterval,
@@ -92,6 +94,12 @@ func New(log *slog.Logger, serverPriv ed25519.PrivateKey, heartbeatInterval uint
 // AddRule inserts an ACL rule. Used by tests and future admin API.
 func (s *Server) AddRule(r acl.Rule) {
 	s.acl.AddRule(r)
+}
+
+// SchemaRegistry returns the server's schema registry (Decision #14).
+// Used by the admin server to register schemas at runtime.
+func (s *Server) SchemaRegistry() *schema.Registry {
+	return s.schema
 }
 
 // ─── Connection handling ──────────────────────────────────────────────────────
@@ -302,7 +310,7 @@ func (s *Server) handlePublish(sw *sessionWriter, rec *session.Record, payload [
 	}
 
 	// Schema validation.
-	if err := schema.Validate(msg.Subject, msg.Payload); err != nil {
+	if err := s.schema.Validate(msg.Subject, msg.Payload); err != nil {
 		s.sendError(sw, "SCHEMA_ERROR", err.Error(), msg.MessageId)
 		return
 	}
@@ -442,7 +450,7 @@ func (s *Server) publishSystemEvent(subject string, payload []byte) {
 		Payload:           payload,
 		PublisherIdentity: acl.EncodeIdentity(s.serverPub),
 		PublishedAt:       time.Now().UnixMilli(),
-		SchemaVersion:     schema.Version(subject), // 0 for system subjects
+		SchemaVersion:     s.schema.Version(subject), // 0 for system subjects
 	})
 	if err != nil {
 		return
@@ -551,7 +559,7 @@ func (s *Server) fanout(subject string, innerPayload []byte, publisherPubkey []b
 		Payload:           innerPayload,
 		PublisherIdentity: acl.EncodeIdentity(publisherPubkey),
 		PublishedAt:       time.Now().UnixMilli(),
-		SchemaVersion:     schema.Version(subject),
+		SchemaVersion:     s.schema.Version(subject),
 	})
 	if err != nil {
 		return

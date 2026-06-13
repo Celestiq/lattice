@@ -12,6 +12,7 @@ cd "$REPO_ROOT"
 protoc \
   --go_out=. \
   --go_opt=paths=source_relative \
+  proto/lattice_options.proto \
   proto/frames.proto \
   proto/schemas.proto \
   proto/events.proto
