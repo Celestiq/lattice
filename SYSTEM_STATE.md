@@ -1,6 +1,6 @@
 # Lattice — System State
 
-**Scope:** Local orchestration + federation (in progress) · **Language:** Go 1.25 · **v0.1.1:** Sessions 0–7 complete · **v0.2 Federation S1:** QUIC transport foundation complete · **Branch:** `dev/v0.2`
+**Scope:** Local orchestration + federation (in progress) · **Language:** Go 1.25 · **v0.1.1:** Sessions 0–7 complete · **v0.2 Federation S1+S2:** QUIC transport + symmetric FedHello handshake + SQLite persistence · **Branch:** `dev/v0.2`
 
 This document captures the complete state of the Lattice codebase: what exists, how the pieces fit together, and the design decisions behind them. Start here before reading any source file.
 
@@ -38,13 +38,23 @@ lattice/
 │   ├── call/              # pending REQUEST/RESPONSE registry
 │   ├── admin/             # localhost-only HTTP admin API (Decision #15)
 │   ├── node/              # server connection handler (owns all of the above)
-│   └── transport/         # v0.2: federation transport abstraction (S1)
-│       ├── transport.go   #   Stream / Dialer / Listener interfaces
-│       └── quic/          #   QUIC implementation (quic-go v0.60)
-│           ├── tls.go     #     TLS configs; ALPN "lattice-fed-v1"
-│           ├── keepalive.go #   application-level PING/PONG keepalive
-│           ├── quic.go    #     Listener, Dialer, quicStream, lazyServerStream
-│           └── quic_test.go #  15 tests (topology / fault / race / e2e)
+│   ├── transport/         # v0.2: federation transport abstraction (S1)
+│   │   ├── transport.go   #   Stream / Dialer / Listener interfaces
+│   │   └── quic/          #   QUIC implementation (quic-go v0.60)
+│   │       ├── tls.go     #     TLS configs; ALPN "lattice-fed-v1"
+│   │       ├── keepalive.go #   application-level PING/PONG keepalive
+│   │       ├── quic.go    #     Listener, Dialer, quicStream, lazyServerStream
+│   │       └── quic_test.go #  15 tests (topology / fault / race / e2e)
+│   └── federation/        # v0.2: federation logic (S2+)
+│       ├── handshake/     #   symmetric FedHello exchange (S2)
+│       │   ├── handshake.go  # DoFederatedHandshake; rejectAndClose
+│       │   └── handshake_test.go # 8 tests
+│       ├── peer/          #   PeerConn state machine (S2)
+│       │   ├── peer.go    #     Pending→Active→Paused↔Active→Revoked
+│       │   └── peer_test.go  # 4 tests
+│       └── store/         #   SQLite peer persistence (S2)
+│           ├── store.go   #     modernc.org/sqlite; 4 tables; CRUD
+│           └── store_test.go # 5 tests
 ├── proto/
 │   ├── frames.proto       # 23 frame types (0-14 client, 15-23 federation)
 │   ├── federation.proto   # v0.2: FedHello, FedPolicy, FedDeliver, FedRequest, ...
@@ -55,7 +65,7 @@ lattice/
 │   └── v0.2-IMPLEMENTATION.md  # 6-session federation blueprint
 ├── DEV.md                 # developer guide: how to run, flags, architecture
 ├── DEMO.md                # step-by-step feature walkthrough
-└── go.mod                 # deps: google.golang.org/protobuf, quic-go, x/crypto, x/net, x/sys
+└── go.mod                 # deps: google.golang.org/protobuf, quic-go, x/crypto, x/net, x/sys, modernc.org/sqlite
 ```
 
 ---
@@ -730,6 +740,83 @@ The interface boundary isolates upper layers (FedHello handshake, policy engine,
 
 ---
 
+## v0.2 Federation Handshake + Persistence (Session 2)
+
+### `internal/federation/handshake/handshake.go`
+
+`DoFederatedHandshake(ctx, stream, nonce, localPriv) (peerPubkey []byte, err error)` — symmetric FedHello exchange. Neither side is initiator or responder; both send and receive simultaneously.
+
+**Nonce**: 32-byte TLS keying material derived by the caller before dialing/accepting:
+```go
+conn.ConnectionState().TLS.ExportKeyingMaterial("lattice-fed-hello-v1", nil, 32)
+```
+Both sides of the same QUIC connection derive identical material, so no extra round-trip is needed. In tests, any shared 32-byte value works.
+
+**Protocol (two concurrent-write phases):**
+1. Phase 1: both sides concurrently send `FED_HELLO{pubkey, sig=Sign(localPriv, nonce), protocol_version=1}` and receive the peer's FED_HELLO.
+2. Validate: check `protocol_version == 1`, pubkey length, `ed25519.Verify(peerPub, nonce, peerSig)`. On failure: write `FED_REJECT`, close stream, return error.
+3. Phase 2: both sides concurrently send and receive an empty `FED_HELLO_ACK` to signal mutual verification.
+
+**Deadline**: `min(ctx.Deadline(), now+10s)` set on the stream via `SetDeadline`. Cleared by defer on return.
+
+**Errors**: `ErrInvalidSignature`, `ErrProtocolVersion`, `ErrHandshakeRejected` (wrapped in `errors.Is`-compatible chain).
+
+**TLS exporter label**: `"lattice-fed-hello-v1"` (distinct from client labels `"lattice-hello-v1"` and `"lattice-hello-server-v1"` — cross-context replay is structurally impossible).
+
+---
+
+### `internal/federation/peer/peer.go`
+
+`PeerConn` tracks the lifecycle of a single federation peer connection. All methods are goroutine-safe.
+
+```
+Pending ──Activate(stream)──► Active ──Pause()──► Paused
+                                │                   │
+                              Revoke()            Resume(stream)
+                                │                   │
+                                ▼                   ▼
+                             Revoked           (back to Active)
+```
+
+- `New(pubkey, name, addr)` — creates a PeerConn in Pending. Copies pubkey.
+- `Activate(stream)` — Pending → Active. Returns `ErrIllegalTransition` if not Pending.
+- `Pause()` — Active → Paused.
+- `Resume(stream)` — Paused → Active (may attach a new stream on re-dial).
+- `Revoke()` — Active/Paused → Revoked; calls `stream.Close()` after releasing the lock. Returns `ErrAlreadyRevoked` on double-revoke.
+- `State()`, `PeerPubkey()`, `PeerName()`, `Addr()`, `Stream()` — accessors.
+
+---
+
+### `internal/federation/store/store.go`
+
+SQLite-backed persistence via `modernc.org/sqlite` (pure Go, no CGo). Four tables:
+
+| Table | Purpose |
+|-------|---------|
+| `federation_peers` | Peer identity, address, consent state (`pending`/`active`/`paused`/`revoked`) |
+| `federation_outbound_policy` | Subject forwarding rules (effect: `forward`/`deny`) per peer, in position order |
+| `federation_inbound_policy` | Subject acceptance rules (effect: `accept`/`deny`) per peer, in position order |
+| `remote_entities` | entity_pubkey_hex → peer_pubkey_hex routing index (populated from received `FedPolicy`) |
+
+**Public API:**
+
+| Method | Description |
+|--------|-------------|
+| `Open(path)` | Opens/creates DB; applies schema; WAL mode; `MaxOpenConns(1)` |
+| `UpsertPeer(hex, name, addr, intro, state)` | INSERT … ON CONFLICT DO UPDATE — preserves `created_at` and `introduction_method` |
+| `UpdatePeerState(hex, state)` | Updates state + `updated_at` only |
+| `GetPeer(hex)` | Returns `*PeerRecord` or nil |
+| `AllActivePeers()` | WHERE state = 'active' |
+| `AllPeers()` | All peers regardless of state |
+| `SetOutboundPolicy(hex, []PolicyRule)` | Replaces all outbound rules for peer in a transaction |
+| `SetInboundPolicy(hex, []PolicyRule)` | Replaces all inbound rules for peer in a transaction |
+| `GetOutboundPolicy(hex)` / `GetInboundPolicy(hex)` | Returns rules in position order |
+| `SetExportList(hex, []entityHex)` | Replaces all `remote_entities` rows for peer in a transaction |
+| `GetRemoteEntityMap()` | Returns `map[entityHex]peerHex`; hydrates the in-memory routing table at startup |
+| `Close()` | Closes the DB connection |
+
+---
+
 ## Test Coverage
 
 ```
@@ -749,7 +836,10 @@ go test ./...
 | `internal/admin` | 6 | ListenAndServe rejects non-loopback, GET /schema returns built-ins, POST /schema registers subject, invalid base64, invalid JSON, body too large (413) |
 | `internal/node` | 64 | 57 black-box integration tests (pub/sub, wildcards, schema rejection, ACL, entity events, offline detection, call round-trip/timeout/ACL, graceful shutdown, typed capabilities, delivery-time wildcard deny, system-event delivery deny, reconnect eviction, join-on-reconnect, responder verification, eviction invalidates calls, DISCONNECT teardown, monotonic DELIVER id, per-subject isolation, publisher identity stamped, timestamp populated, request caller identity, caller identity not spoofable, error ref_id, timeout error ref_id, resume restores subscriptions, token rotation prevents reuse, resume requires correct signature, resume token pubkey mismatch, expired token falls back, fresh connect unchanged, durable-replay hook no-op, **resume drops wholly-denied pattern** (M-5), runtime schema registration, custom range enforced, custom max_length enforced, additive version bump, breaking change rejected, cardinality change rejected, new required field rejected, admin localhost-only, admin GET schema, admin register schema); 7 white-box writer unit tests |
 | `internal/transport/quic` | 15 | **Topology:** basic frame round-trip, bidirectional frames, ALPN isolation (wrong-ALPN client rejected), 5 concurrent dials. **Fault injection:** truncated mid-frame, cancelled-context dial, closed listener. **Race conditions:** keepalive round-trip, keepalive timeout, Stop+GotPong concurrent race, race with stream close. **E2E:** all 9 FED_* frame types round-trip, 256 KiB max payload, 256 KiB+1 overflow rejection, 20-frame sequencing, listener addr non-zero |
-| **Total** | **175** | |
+| `internal/federation/handshake` | 8 | Mutual auth (both pubkeys correct), known-peer flow, unknown-peer flow, bad signature → ErrInvalidSignature, wrong protocol version → ErrProtocolVersion + FED_REJECT, 200ms deadline fires without goroutine leak, stream close midway returns error, 3 concurrent handshakes same peer pubkey (race-detector clean) |
+| `internal/federation/peer` | 4 | All legal transitions (Pending→Active→Paused→Active→Revoked + stream.Close called), illegal transitions from Revoked return ErrIllegalTransition/ErrAlreadyRevoked, 20 goroutines concurrent Pause/Resume (race-detector clean), Revoke while writing (no panic, write returns error) |
+| `internal/federation/store` | 5 | Full round-trip (write peer + 3 outbound + 2 inbound rules + 5 export entities; close; reopen; verify all), bad path returns error, 10 concurrent UpsertPeer goroutines (no SQLITE_BUSY), persist+restart (2 active peers + entity maps survive close/reopen), revoked peer absent from AllActivePeers |
+| **Total** | **192** | |
 
 The `TestIntegrationSequence` test covers all 10 steps of the full integration scenario in a single sequential test with per-step log output.
 
@@ -778,16 +868,21 @@ cmd/lattice-client
     ├── internal/wire
     └── proto/
 
-internal/wire                   ──► proto/
-internal/identity                  (stdlib only)
-internal/session                   (stdlib only)
-internal/registry                  (stdlib only)
-internal/call                      (stdlib only)
-internal/acl                    ──► internal/bus
-internal/transport/quic (v0.2)  ──► internal/transport (interfaces)
-                                ──► internal/wire (wire.Write/Read for keepalive)
-                                ──► proto/ (FrameType_FRAME_TYPE_PING)
-                                ──► github.com/quic-go/quic-go v0.60.0
+internal/wire                       ──► proto/
+internal/identity                      (stdlib only)
+internal/session                       (stdlib only)
+internal/registry                      (stdlib only)
+internal/call                          (stdlib only)
+internal/acl                        ──► internal/bus
+internal/transport/quic (v0.2)      ──► internal/transport (interfaces)
+                                    ──► internal/wire (wire.Write/Read for keepalive)
+                                    ──► proto/ (FrameType_FRAME_TYPE_PING)
+                                    ──► github.com/quic-go/quic-go v0.60.0
+internal/federation/handshake (v0.2) ──► internal/transport (Stream interface)
+                                    ──► internal/wire (Read/Write)
+                                    ──► proto/ (FedHello, FedHelloAck, FedReject)
+internal/federation/peer (v0.2)     ──► internal/transport (Stream interface)
+internal/federation/store (v0.2)    ──► modernc.org/sqlite v1.52.0
 ```
 
-No import cycles. The `proto/` package is a leaf. `internal/transport` is also a leaf (interface definitions only). The v0.1.1 `internal/node` package does not yet import `internal/transport/quic` — the federation manager hook-up happens in Session 3.
+No import cycles. `proto/` and `internal/transport` are leaves. `internal/federation/*` packages are new leaves in S2 — they do not import `internal/node`. The federation manager hook-up (node.go integration) happens in Session 3.
