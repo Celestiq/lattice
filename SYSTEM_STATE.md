@@ -153,8 +153,7 @@ Cleanup on disconnect — four paths:
     sw.close()       → waits for writer goroutine to exit
 
   EVICTION (same pubkey reconnects — Decision #12):
-    evictOldSession(old):
-      registry.Remove(old.Pubkey, old.SessionID) CAS → if nil, return
+    evictCapturedSession(old):  ← registry already updated by RegisterAndEvict; no CAS here
       calls.InvalidateTarget(old.SessionID) → ERROR TARGET_DISCONNECTED to requesters
       bus.RemoveSession(old.SessionID)
       conns.LoadAndDelete(old.SessionID) → sw.conn.Close()
@@ -194,7 +193,7 @@ Both TLS exporter nonces are derived via `tls.ConnectionState.ExportKeyingMateri
 2. Iterates `registry.All()` snapshot; calls `registry.Remove(pubkey, sessionID)` (CAS) for each (prevents HandleConn defers from double-publishing).
 3. Publishes `lattice.system.entity.left` for each removed entity (frames are enqueued into subscriber writers' data channels while those writers are still running).
 4. `conns.Range` — for each `sessionWriter`: calls `sw.close()` (drains buffered frames including entity.left, with 5-second write deadline per frame), then `sw.conn.Close()` so HandleConn's read loop exits.
-5. `s.wg.Wait()` — blocks until all HandleConn goroutines and both background goroutines have exited.
+5. `s.wg.Wait()` — blocks until all HandleConn goroutines and three background goroutines (heartbeat checker, call timeout checker, token expirer) have exited.
 
 The CLI binary hooks SIGINT/SIGTERM: closes the listener first (stops new connections), then calls `srv.Shutdown()`.
 
