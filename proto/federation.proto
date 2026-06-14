@@ -1,0 +1,102 @@
+syntax = "proto3";
+
+package lattice;
+
+option go_package = "lattice/proto";
+
+// Federation messages — only exchanged on QUIC node-to-node connections.
+// Never sent on client TLS-over-TCP connections.
+
+// ─── Session 2: symmetric handshake ─────────────────────────────────────────
+
+// FedHello is sent by both nodes simultaneously immediately after the QUIC
+// handshake. Neither side waits for the other — both send and receive
+// concurrently. The TLS-exporter nonce is derived under the label
+// "lattice-fed-hello-v1" (distinct from the client label "lattice-hello-v1").
+message FedHello {
+  bytes  pubkey           = 1; // Ed25519 public key (32 bytes)
+  bytes  signature        = 2; // sig over TLS-exporter nonce, label "lattice-fed-hello-v1"
+  uint32 protocol_version = 3; // must equal FedProtocolVersion = 1
+  string node_name        = 4; // human-readable display name; informational only
+}
+
+// FedHelloAck is an empty acknowledgment sent after verifying the peer's
+// FedHello. Receipt confirms that both parties verified each other's identity.
+message FedHelloAck {}
+
+// FedReject is sent when a connection is not accepted. The stream is closed
+// immediately after this frame. Reasons: peer is revoked, peer is unknown
+// (unsolicited), or signature/version check failed.
+message FedReject {
+  string reason = 1;
+}
+
+// FedPending is sent to an unknown peer whose connection was accepted for
+// operator review. The stream is closed after this frame. The operator must
+// call POST /federation/accept before the peer can reconnect and be activated.
+message FedPending {
+  string introduction_id = 1; // opaque token for operator-side correlation
+}
+
+// ─── Session 3: consent and policy exchange ──────────────────────────────────
+
+// FedPolicy is sent after a successful handshake on an active connection.
+// It carries the forwarding policy and the list of locally-exported entity
+// pubkeys (for cross-federation call routing).
+message FedPolicy {
+  repeated FedPolicyRule outbound         = 1; // subjects forwarded to the peer
+  repeated FedPolicyRule inbound          = 2; // subjects accepted from the peer
+  repeated bytes         exported_pubkeys = 3; // Ed25519 pubkeys of exported local entities
+}
+
+// FedPolicyRule is a single forwarding policy entry. Rules are evaluated in
+// insertion order (first match wins). Default: deny.
+message FedPolicyRule {
+  string subject_pattern = 1;
+  // outbound effect: "forward" | "deny"
+  // inbound effect:  "accept"  | "deny"
+  string effect = 2;
+}
+
+// FedStatus notifies the peer of a connection state change. After sending
+// FedStatus{"revoked"}, the stream is closed.
+message FedStatus {
+  string state  = 1; // "active" | "paused" | "revoked"
+  string reason = 2;
+}
+
+// ─── Session 4: forwarded Channel messages ───────────────────────────────────
+
+// FedDeliver carries a forwarded Channel message across a federation boundary.
+// schema_descriptor is present only on the first delivery of a given subject
+// to a peer (schema propagation). Subsequent deliveries of the same subject
+// omit the descriptor (schema already registered on the receiving node).
+message FedDeliver {
+  string subject            = 1;
+  bytes  payload            = 2;
+  string publisher_identity = 3; // base32(origin entity pubkey), stamped by origin node
+  int64  published_at       = 4; // Unix milliseconds
+  uint32 schema_version     = 5;
+  bytes  schema_descriptor  = 6; // raw FileDescriptorProto bytes; nil after first delivery of subject
+}
+
+// ─── Session 5: cross-federation call routing ────────────────────────────────
+
+// FedRequest carries a forwarded call REQUEST across a federation boundary.
+// caller_identity and received_at are stamped by the origin node (not the
+// requesting entity) — the receiving node can trust these fields.
+message FedRequest {
+  string correlation_id     = 1;
+  bytes  target_pubkey      = 2;
+  bytes  payload            = 3;
+  uint32 timeout_ms         = 4;
+  string caller_identity    = 5; // base32(requester entity pubkey), stamped by origin node
+  int64  received_at        = 6; // Unix milliseconds, stamped by origin node
+  bytes  requester_node_pub = 7; // origin node's Ed25519 pubkey, for response routing
+}
+
+// FedResponse carries a call RESPONSE back across the federation boundary.
+message FedResponse {
+  string correlation_id = 1;
+  bytes  payload        = 2;
+}

@@ -1,6 +1,6 @@
 # Lattice — System State
 
-**Scope:** Local orchestration only · **Language:** Go 1.23 · **v0.1.1 hardening:** Sessions 0–7 complete · **Branch:** `dev/v0.1.1-hardening`
+**Scope:** Local orchestration + federation (in progress) · **Language:** Go 1.25 · **v0.1.1:** Sessions 0–7 complete · **v0.2 Federation S1:** QUIC transport foundation complete · **Branch:** `dev/v0.2`
 
 This document captures the complete state of the Lattice codebase: what exists, how the pieces fit together, and the design decisions behind them. Start here before reading any source file.
 
@@ -37,15 +37,25 @@ lattice/
 │   ├── registry/          # entity liveness tracking
 │   ├── call/              # pending REQUEST/RESPONSE registry
 │   ├── admin/             # localhost-only HTTP admin API (Decision #15)
-│   └── node/              # server connection handler (owns all of the above)
+│   ├── node/              # server connection handler (owns all of the above)
+│   └── transport/         # v0.2: federation transport abstraction (S1)
+│       ├── transport.go   #   Stream / Dialer / Listener interfaces
+│       └── quic/          #   QUIC implementation (quic-go v0.60)
+│           ├── tls.go     #     TLS configs; ALPN "lattice-fed-v1"
+│           ├── keepalive.go #   application-level PING/PONG keepalive
+│           ├── quic.go    #     Listener, Dialer, quicStream, lazyServerStream
+│           └── quic_test.go #  15 tests (topology / fault / race / e2e)
 ├── proto/
-│   ├── frames.proto       # 14 frame types + message definitions
+│   ├── frames.proto       # 23 frame types (0-14 client, 15-23 federation)
+│   ├── federation.proto   # v0.2: FedHello, FedPolicy, FedDeliver, FedRequest, ...
 │   ├── schemas.proto      # TemperatureReading, LightCommand (with lattice.* options)
 │   ├── lattice_options.proto  # custom field options: range, max_length, required
 │   └── events.proto       # EntityJoined, EntityLeft, EntityOffline
+├── 01-Claude/
+│   └── v0.2-IMPLEMENTATION.md  # 6-session federation blueprint
 ├── DEV.md                 # developer guide: how to run, flags, architecture
 ├── DEMO.md                # step-by-step feature walkthrough
-└── go.mod                 # single dependency: google.golang.org/protobuf
+└── go.mod                 # deps: google.golang.org/protobuf, quic-go, x/crypto, x/net, x/sys
 ```
 
 ---
@@ -69,9 +79,13 @@ Every message on the wire is a **frame**. A frame has a 5-byte header followed b
 
 ---
 
-## The 14 Frame Types
+## Frame Types
 
-| # | Name | Direction | Purpose | Session |
+Values 0–14 are client↔server frames (TLS-over-TCP). Values 15–23 are federation frames (QUIC peer connections only; never sent on client connections).
+
+### Client frames (0–14)
+
+| # | Name | Direction | Purpose | v0.1.1 session |
 |---|------|-----------|---------|---------|
 | 1 | `HELLO` | client → server | Identity claim: pubkey + signature | 2 |
 | 2 | `HELLO_ACK` | server → client | Session ID, token, heartbeat interval | 2 |
@@ -85,8 +99,22 @@ Every message on the wire is a **frame**. A frame has a 5-byte header followed b
 | 10 | `REQUEST` | client → server → client | Point-to-point call; server stamps `caller_identity` + `received_at` | 7 |
 | 11 | `RESPONSE` | client → server → client | Reply to a REQUEST | 7 |
 | 12 | `DISCONNECT` | client → server | Graceful disconnect notification | 8 |
-| 13 | `PING` | either | Explicit latency probe | reserved |
-| 14 | `PONG` | either | Ping reply | reserved |
+| 13 | `PING` | either | Application-level keepalive probe (used by federation Keepalive) | reserved |
+| 14 | `PONG` | either | Ping reply (call `Keepalive.GotPong()` when received) | reserved |
+
+### Federation frames (15–23) — QUIC connections only (v0.2)
+
+| # | Name | Direction | Purpose | v0.2 session |
+|---|------|-----------|---------|---------|
+| 15 | `FED_HELLO` | peer → peer | Identity claim over QUIC: pubkey + Ed25519 sig over TLS exporter | S2 |
+| 16 | `FED_HELLO_ACK` | peer → peer | Acknowledgment; both sides verified | S2 |
+| 17 | `FED_REJECT` | peer → peer | Connection not accepted; stream closed after this | S2 |
+| 18 | `FED_PENDING` | peer → peer | Unknown peer accepted for operator review | S2 |
+| 19 | `FED_POLICY` | peer → peer | Forwarding policy + exported pubkeys | S3 |
+| 20 | `FED_STATUS` | peer → peer | Connection state change (active/paused/revoked) | S3 |
+| 21 | `FED_DELIVER` | peer → peer | Forwarded channel message with schema descriptor | S4 |
+| 22 | `FED_REQUEST` | peer → peer | Forwarded call request across federation boundary | S5 |
+| 23 | `FED_RESPONSE` | peer → peer | Forwarded call response | S5 |
 
 ---
 
@@ -666,6 +694,42 @@ The server generates a **fresh self-signed TLS certificate at each startup** (no
 
 ---
 
+## v0.2 Federation Transport (Session 1)
+
+### `internal/transport/transport.go` — interface definitions
+
+```go
+type Stream interface {
+    Read(p []byte) (int, error)
+    Write(p []byte) (int, error)
+    SetDeadline(t time.Time) error
+    Close() error
+}
+type Dialer  interface { DialPeer(ctx, peerAddr string) (Stream, error) }
+type Listener interface { AcceptPeer(ctx) (Stream, error); Addr() net.Addr; Close() error }
+```
+
+The interface boundary isolates upper layers (FedHello handshake, policy engine, fanout) from the transport. A future libp2p swap needs only a new `Dialer`/`Listener` implementation.
+
+### `internal/transport/quic/` — QUIC implementation
+
+**`tls.go`**: `newServerTLSConfig()` generates an ephemeral Ed25519 TLS cert (via `wire.GenerateSelfSignedCert`) and configures ALPN `"lattice-fed-v1"`. `newClientTLSConfig()` sets `InsecureSkipVerify: true` — the trust anchor is the FedHello Ed25519 signature (Session 2), not the TLS cert.
+
+**`quic.go`**: Two concrete stream types:
+- `quicStream` (dialer side) — wraps `*quic.Stream` + `*quic.Conn`; `Close()` terminates both, making pending `Read`/`Write` calls return errors immediately.
+- `lazyServerStream` (listener side) — wraps `*quic.Conn` and starts `AcceptStream` in a background goroutine. `AcceptPeer` returns immediately; the stream pointer is resolved on the first `Read`/`Write`/`SetDeadline` call. This is necessary because in QUIC a stream only becomes visible to the server after the client writes data (no stream frame is sent by `OpenStreamSync` alone).
+
+**`keepalive.go`**: `Keepalive` sends `FRAME_TYPE_PING` every `interval` and expects `GotPong()` to be called within `timeout`. If no PONG arrives, `onTimeout` fires once and the goroutine exits. `Stop()` is idempotent.
+
+**Key design decisions:**
+- One QUIC connection, one bidirectional stream per peer pair.
+- TLS cert is ephemeral; `InsecureSkipVerify: true`; identity trust deferred to FedHello.
+- Existing `wire.Read`/`wire.Write` run unchanged on QUIC streams (same 5-byte header framing).
+- `quic.Config{KeepAlivePeriod: 15s, MaxIdleTimeout: 5m}` for NAT traversal + idle eviction.
+- Race-detector clean (`go test -race ./internal/transport/...`).
+
+---
+
 ## Test Coverage
 
 ```
@@ -684,7 +748,8 @@ go test ./...
 | `internal/call` | 5 | Add/Peek/Remove round-trip, Peek non-destructive, Peek/Remove unknown, Expired removes only past-deadline, InvalidateTarget bulk-removes by target |
 | `internal/admin` | 6 | ListenAndServe rejects non-loopback, GET /schema returns built-ins, POST /schema registers subject, invalid base64, invalid JSON, body too large (413) |
 | `internal/node` | 64 | 57 black-box integration tests (pub/sub, wildcards, schema rejection, ACL, entity events, offline detection, call round-trip/timeout/ACL, graceful shutdown, typed capabilities, delivery-time wildcard deny, system-event delivery deny, reconnect eviction, join-on-reconnect, responder verification, eviction invalidates calls, DISCONNECT teardown, monotonic DELIVER id, per-subject isolation, publisher identity stamped, timestamp populated, request caller identity, caller identity not spoofable, error ref_id, timeout error ref_id, resume restores subscriptions, token rotation prevents reuse, resume requires correct signature, resume token pubkey mismatch, expired token falls back, fresh connect unchanged, durable-replay hook no-op, **resume drops wholly-denied pattern** (M-5), runtime schema registration, custom range enforced, custom max_length enforced, additive version bump, breaking change rejected, cardinality change rejected, new required field rejected, admin localhost-only, admin GET schema, admin register schema); 7 white-box writer unit tests |
-| **Total** | **160** | |
+| `internal/transport/quic` | 15 | **Topology:** basic frame round-trip, bidirectional frames, ALPN isolation (wrong-ALPN client rejected), 5 concurrent dials. **Fault injection:** truncated mid-frame, cancelled-context dial, closed listener. **Race conditions:** keepalive round-trip, keepalive timeout, Stop+GotPong concurrent race, race with stream close. **E2E:** all 9 FED_* frame types round-trip, 256 KiB max payload, 256 KiB+1 overflow rejection, 20-frame sequencing, listener addr non-zero |
+| **Total** | **175** | |
 
 The `TestIntegrationSequence` test covers all 10 steps of the full integration scenario in a single sequential test with per-step log output.
 
@@ -713,12 +778,16 @@ cmd/lattice-client
     ├── internal/wire
     └── proto/
 
-internal/wire       ──► proto/
-internal/identity      (stdlib only)
-internal/session       (stdlib only)
-internal/registry      (stdlib only)
-internal/call          (stdlib only)
-internal/acl        ──► internal/bus
+internal/wire                   ──► proto/
+internal/identity                  (stdlib only)
+internal/session                   (stdlib only)
+internal/registry                  (stdlib only)
+internal/call                      (stdlib only)
+internal/acl                    ──► internal/bus
+internal/transport/quic (v0.2)  ──► internal/transport (interfaces)
+                                ──► internal/wire (wire.Write/Read for keepalive)
+                                ──► proto/ (FrameType_FRAME_TYPE_PING)
+                                ──► github.com/quic-go/quic-go v0.60.0
 ```
 
-No import cycles. The `proto/` package is a leaf — nothing in it imports internal packages.
+No import cycles. The `proto/` package is a leaf. `internal/transport` is also a leaf (interface definitions only). The v0.1.1 `internal/node` package does not yet import `internal/transport/quic` — the federation manager hook-up happens in Session 3.

@@ -5,7 +5,8 @@ package lattice;
 option go_package = "lattice/proto";
 
 // ─── Frame type enum ────────────────────────────────────────────────────────
-// All 14 frame types used across sessions 1–7.
+// Values 0–14: client↔server frames (TLS-over-TCP connections).
+// Values 15–23: federation frames (QUIC peer connections only; never on client connections).
 enum FrameType {
   FRAME_TYPE_UNKNOWN      = 0;
   FRAME_TYPE_HELLO        = 1;
@@ -22,6 +23,17 @@ enum FrameType {
   FRAME_TYPE_DISCONNECT   = 12;
   FRAME_TYPE_PING         = 13; // Reserved — no handler; do not build client code against this
   FRAME_TYPE_PONG         = 14; // Reserved — no handler; do not build client code against this
+
+  // Federation frames — QUIC peer connections only (v0.2+)
+  FRAME_TYPE_FED_HELLO     = 15;
+  FRAME_TYPE_FED_HELLO_ACK = 16;
+  FRAME_TYPE_FED_REJECT    = 17;
+  FRAME_TYPE_FED_PENDING   = 18;
+  FRAME_TYPE_FED_POLICY    = 19;
+  FRAME_TYPE_FED_STATUS    = 20;
+  FRAME_TYPE_FED_DELIVER   = 21;
+  FRAME_TYPE_FED_REQUEST   = 22;
+  FRAME_TYPE_FED_RESPONSE  = 23;
 }
 
 // ─── Session 1, Decision #7: typed capability descriptor ────────────────────

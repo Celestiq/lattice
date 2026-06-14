@@ -22,7 +22,8 @@ const (
 )
 
 // ─── Frame type enum ────────────────────────────────────────────────────────
-// All 14 frame types used across sessions 1–7.
+// Values 0–14: client↔server frames (TLS-over-TCP connections).
+// Values 15–23: federation frames (QUIC peer connections only; never on client connections).
 type FrameType int32
 
 const (
@@ -41,6 +42,16 @@ const (
 	FrameType_FRAME_TYPE_DISCONNECT    FrameType = 12
 	FrameType_FRAME_TYPE_PING          FrameType = 13 // Reserved — no handler; do not build client code against this
 	FrameType_FRAME_TYPE_PONG          FrameType = 14 // Reserved — no handler; do not build client code against this
+	// Federation frames — QUIC peer connections only (v0.2+)
+	FrameType_FRAME_TYPE_FED_HELLO     FrameType = 15
+	FrameType_FRAME_TYPE_FED_HELLO_ACK FrameType = 16
+	FrameType_FRAME_TYPE_FED_REJECT    FrameType = 17
+	FrameType_FRAME_TYPE_FED_PENDING   FrameType = 18
+	FrameType_FRAME_TYPE_FED_POLICY    FrameType = 19
+	FrameType_FRAME_TYPE_FED_STATUS    FrameType = 20
+	FrameType_FRAME_TYPE_FED_DELIVER   FrameType = 21
+	FrameType_FRAME_TYPE_FED_REQUEST   FrameType = 22
+	FrameType_FRAME_TYPE_FED_RESPONSE  FrameType = 23
 )
 
 // Enum value maps for FrameType.
@@ -61,6 +72,15 @@ var (
 		12: "FRAME_TYPE_DISCONNECT",
 		13: "FRAME_TYPE_PING",
 		14: "FRAME_TYPE_PONG",
+		15: "FRAME_TYPE_FED_HELLO",
+		16: "FRAME_TYPE_FED_HELLO_ACK",
+		17: "FRAME_TYPE_FED_REJECT",
+		18: "FRAME_TYPE_FED_PENDING",
+		19: "FRAME_TYPE_FED_POLICY",
+		20: "FRAME_TYPE_FED_STATUS",
+		21: "FRAME_TYPE_FED_DELIVER",
+		22: "FRAME_TYPE_FED_REQUEST",
+		23: "FRAME_TYPE_FED_RESPONSE",
 	}
 	FrameType_value = map[string]int32{
 		"FRAME_TYPE_UNKNOWN":       0,
@@ -78,6 +98,15 @@ var (
 		"FRAME_TYPE_DISCONNECT":    12,
 		"FRAME_TYPE_PING":          13,
 		"FRAME_TYPE_PONG":          14,
+		"FRAME_TYPE_FED_HELLO":     15,
+		"FRAME_TYPE_FED_HELLO_ACK": 16,
+		"FRAME_TYPE_FED_REJECT":    17,
+		"FRAME_TYPE_FED_PENDING":   18,
+		"FRAME_TYPE_FED_POLICY":    19,
+		"FRAME_TYPE_FED_STATUS":    20,
+		"FRAME_TYPE_FED_DELIVER":   21,
+		"FRAME_TYPE_FED_REQUEST":   22,
+		"FRAME_TYPE_FED_RESPONSE":  23,
 	}
 )
 
@@ -997,7 +1026,7 @@ const file_proto_frames_proto_rawDesc = "" +
 	"\x04Ping\x12\x14\n" +
 	"\x05nonce\x18\x01 \x01(\fR\x05nonce\"\x1c\n" +
 	"\x04Pong\x12\x14\n" +
-	"\x05nonce\x18\x01 \x01(\fR\x05nonce*\xfd\x02\n" +
+	"\x05nonce\x18\x01 \x01(\fR\x05nonce*\xf7\x04\n" +
 	"\tFrameType\x12\x16\n" +
 	"\x12FRAME_TYPE_UNKNOWN\x10\x00\x12\x14\n" +
 	"\x10FRAME_TYPE_HELLO\x10\x01\x12\x18\n" +
@@ -1014,7 +1043,16 @@ const file_proto_frames_proto_rawDesc = "" +
 	"\x13FRAME_TYPE_RESPONSE\x10\v\x12\x19\n" +
 	"\x15FRAME_TYPE_DISCONNECT\x10\f\x12\x13\n" +
 	"\x0fFRAME_TYPE_PING\x10\r\x12\x13\n" +
-	"\x0fFRAME_TYPE_PONG\x10\x0eB\x0fZ\rlattice/protob\x06proto3"
+	"\x0fFRAME_TYPE_PONG\x10\x0e\x12\x18\n" +
+	"\x14FRAME_TYPE_FED_HELLO\x10\x0f\x12\x1c\n" +
+	"\x18FRAME_TYPE_FED_HELLO_ACK\x10\x10\x12\x19\n" +
+	"\x15FRAME_TYPE_FED_REJECT\x10\x11\x12\x1a\n" +
+	"\x16FRAME_TYPE_FED_PENDING\x10\x12\x12\x19\n" +
+	"\x15FRAME_TYPE_FED_POLICY\x10\x13\x12\x19\n" +
+	"\x15FRAME_TYPE_FED_STATUS\x10\x14\x12\x1a\n" +
+	"\x16FRAME_TYPE_FED_DELIVER\x10\x15\x12\x1a\n" +
+	"\x16FRAME_TYPE_FED_REQUEST\x10\x16\x12\x1b\n" +
+	"\x17FRAME_TYPE_FED_RESPONSE\x10\x17B\x0fZ\rlattice/protob\x06proto3"
 
 var (
 	file_proto_frames_proto_rawDescOnce sync.Once
