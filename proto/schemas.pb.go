@@ -130,7 +130,7 @@ func (x *TemperatureReading) GetUnit() string {
 }
 
 // LightCommand is published to home.light.command.
-// action is required (ON/OFF/TOGGLE); brightness is optional (0.0..1.0).
+// action is required (ON/OFF/TOGGLE, range 1..3); brightness is optional (0.0..1.0).
 type LightCommand struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Action        *LightAction           `protobuf:"varint,1,opt,name=action,proto3,enum=lattice.LightAction,oneof" json:"action,omitempty"`
@@ -187,16 +187,19 @@ var File_proto_schemas_proto protoreflect.FileDescriptor
 
 const file_proto_schemas_proto_rawDesc = "" +
 	"\n" +
-	"\x13proto/schemas.proto\x12\alattice\"[\n" +
-	"\x12TemperatureReading\x12\x19\n" +
-	"\x05value\x18\x01 \x01(\x02H\x00R\x05value\x88\x01\x01\x12\x17\n" +
-	"\x04unit\x18\x02 \x01(\tH\x01R\x04unit\x88\x01\x01B\b\n" +
+	"\x13proto/schemas.proto\x12\alattice\x1a\x1bproto/lattice_options.proto\"u\n" +
+	"\x12TemperatureReading\x12-\n" +
+	"\x05value\x18\x01 \x01(\x02B\x12\x8a\xb5\x18\n" +
+	"\r\x00\x00H\xc2\x15\x00\x00\x16C\x98\xb5\x18\x01H\x00R\x05value\x88\x01\x01\x12\x1d\n" +
+	"\x04unit\x18\x02 \x01(\tB\x04\x90\xb5\x18\n" +
+	"H\x01R\x04unit\x88\x01\x01B\b\n" +
 	"\x06_valueB\a\n" +
-	"\x05_unit\"\x80\x01\n" +
-	"\fLightCommand\x121\n" +
-	"\x06action\x18\x01 \x01(\x0e2\x14.lattice.LightActionH\x00R\x06action\x88\x01\x01\x12#\n" +
+	"\x05_unit\"\x9f\x01\n" +
+	"\fLightCommand\x12E\n" +
+	"\x06action\x18\x01 \x01(\x0e2\x14.lattice.LightActionB\x12\x8a\xb5\x18\n" +
+	"\r\x00\x00\x80?\x15\x00\x00@@\x98\xb5\x18\x01H\x00R\x06action\x88\x01\x01\x12.\n" +
 	"\n" +
-	"brightness\x18\x02 \x01(\x02H\x01R\n" +
+	"brightness\x18\x02 \x01(\x02B\t\x8a\xb5\x18\x05\x15\x00\x00\x80?H\x01R\n" +
 	"brightness\x88\x01\x01B\t\n" +
 	"\a_actionB\r\n" +
 	"\v_brightness*o\n" +
@@ -239,6 +242,7 @@ func file_proto_schemas_proto_init() {
 	if File_proto_schemas_proto != nil {
 		return
 	}
+	file_proto_lattice_options_proto_init()
 	file_proto_schemas_proto_msgTypes[0].OneofWrappers = []any{}
 	file_proto_schemas_proto_msgTypes[1].OneofWrappers = []any{}
 	type x struct{}

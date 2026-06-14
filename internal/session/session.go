@@ -7,15 +7,17 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	pb "lattice/proto"
 )
 
 // Record holds state for a single authenticated connection.
 type Record struct {
-	ID           string    // UUID v4
-	Pubkey       []byte    // Ed25519 public key (32 bytes)
-	Token        []byte    // 32-byte random session token
+	ID           string           // UUID v4
+	Pubkey       []byte           // Ed25519 public key (32 bytes)
+	Token        []byte           // 32-byte random session token
 	CreatedAt    time.Time
-	Capabilities []string  // subjects declared at HELLO time; informational only
+	Capabilities []*pb.Capability // declared at HELLO time; informational only
 }
 
 // Table is a thread-safe session store indexed by session ID and by pubkey.
@@ -73,6 +75,9 @@ func (t *Table) ByPubkey(pubkey []byte) *Record {
 }
 
 // Remove deletes a session by ID. No-op if not found.
+// It only removes the byPubkey entry when it still references this session —
+// if the same pubkey has already reconnected (byPubkey points to a newer session),
+// the byPubkey entry is left intact.
 func (t *Table) Remove(id string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -81,7 +86,10 @@ func (t *Table) Remove(id string) {
 		return
 	}
 	delete(t.byID, id)
-	delete(t.byPubkey, hex.EncodeToString(rec.Pubkey))
+	key := hex.EncodeToString(rec.Pubkey)
+	if current, exists := t.byPubkey[key]; exists && current.ID == id {
+		delete(t.byPubkey, key)
+	}
 }
 
 // Len returns the number of active sessions.

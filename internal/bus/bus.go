@@ -52,6 +52,19 @@ func (b *Bus) RemoveSession(sessionID string) {
 	}
 }
 
+// GetPatterns returns all patterns to which sessionID is subscribed.
+func (b *Bus) GetPatterns(sessionID string) []string {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	var result []string
+	for pattern, set := range b.subs {
+		if _, ok := set[sessionID]; ok {
+			result = append(result, pattern)
+		}
+	}
+	return result
+}
+
 // Fanout returns the deduplicated list of session IDs whose patterns match subject.
 func (b *Bus) Fanout(subject string) []string {
 	b.mu.RLock()

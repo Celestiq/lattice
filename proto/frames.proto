@@ -20,22 +20,24 @@ enum FrameType {
   FRAME_TYPE_REQUEST      = 10;
   FRAME_TYPE_RESPONSE     = 11;
   FRAME_TYPE_DISCONNECT   = 12;
-  FRAME_TYPE_PING         = 13;
-  FRAME_TYPE_PONG         = 14;
+  FRAME_TYPE_PING         = 13; // Reserved — no handler; do not build client code against this
+  FRAME_TYPE_PONG         = 14; // Reserved — no handler; do not build client code against this
 }
 
-// ─── Session 1: raw echo (no semantic payload yet) ───────────────────────────
+// ─── Session 1, Decision #7: typed capability descriptor ────────────────────
 
-message RawFrame {
-  bytes payload = 1;
+message Capability {
+  string name = 1; // capability identifier e.g. "sensor", "actuator"
 }
 
-// ─── Session 2: HELLO / HELLO_ACK / HEARTBEAT ────────────────────────────────
+// ─── Session 1: HELLO / HELLO_ACK / HEARTBEAT ────────────────────────────────
 
 message Hello {
-  bytes  pubkey    = 1; // Ed25519 public key (32 bytes)
-  bytes  signature = 2; // Ed25519 signature over TLS-exporter nonce (64 bytes)
-  repeated string capabilities = 3;
+  bytes  pubkey           = 1; // Ed25519 public key (32 bytes)
+  bytes  signature        = 2; // Ed25519 signature over client TLS-exporter nonce (64 bytes)
+  repeated Capability capabilities     = 3;
+  uint32 protocol_version = 4; // must equal ProtocolVersion=1; server rejects mismatches
+  bytes  resume_token     = 5; // optional; 32-byte token from a prior HELLO_ACK (Decision #2)
 }
 
 message HelloAck {
@@ -43,6 +45,7 @@ message HelloAck {
   bytes  session_token      = 2; // 32 random bytes
   bytes  server_pubkey      = 3; // Ed25519 public key (32 bytes)
   uint32 heartbeat_interval = 4; // seconds
+  bytes  server_signature   = 5; // Ed25519 signature over server TLS-exporter nonce (64 bytes)
 }
 
 message Heartbeat {}
@@ -60,22 +63,29 @@ message Unsubscribe {
 }
 
 message Publish {
-  string subject = 1;
-  bytes  payload = 2;
+  string subject    = 1;
+  bytes  payload    = 2;
+  string message_id = 3; // client-assigned; echoed in Error.ref_id on failure (Decision #5)
 }
 
 message Deliver {
-  string subject = 1;
-  bytes  payload = 2;
+  string subject             = 1;
+  bytes  payload             = 2;
+  uint64 id                  = 3; // per-subject monotonic counter, server-assigned (Decision #4)
+  string publisher_identity  = 4; // base32 pubkey of publisher, server-stamped (Decision #4)
+  int64  published_at        = 5; // Unix milliseconds, server timestamp (Decision #4)
+  uint32 schema_version      = 6; // from schema registry; 0 if no registered schema (Decision #4)
 }
 
 // ─── Session 7: call primitive ───────────────────────────────────────────────
 
 message Request {
-  string correlation_id = 1;
-  bytes  target_pubkey  = 2; // Ed25519 public key of target entity (32 bytes)
-  bytes  payload        = 3;
-  uint32 timeout_ms     = 4;
+  string correlation_id  = 1;
+  bytes  target_pubkey   = 2; // Ed25519 public key of target entity (32 bytes)
+  bytes  payload         = 3;
+  uint32 timeout_ms      = 4;
+  string caller_identity = 5; // base32 pubkey of requester, server-stamped; client-supplied value is overwritten (Decision #18)
+  int64  received_at     = 6; // Unix milliseconds, server timestamp (Decision #18)
 }
 
 message Response {
@@ -88,6 +98,7 @@ message Response {
 message Error {
   string code    = 1;
   string message = 2;
+  string ref_id  = 3; // echoes Publish.message_id on publish errors, or correlation_id on call timeout (Decision #5)
 }
 
 message Disconnect {

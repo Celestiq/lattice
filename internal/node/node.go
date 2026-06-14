@@ -32,10 +32,13 @@ type Server struct {
 	acl               *acl.Engine
 	registry          *registry.Registry
 	calls             *call.Registry
+	tokens            *session.TokenStore  // resume tokens keyed by session token (Decision #2)
+	schema            *schema.Registry    // dynamic schema registry (Decision #14)
+	seq               subjectSequencer    // per-subject monotonic DELIVER IDs (Decision #4)
 	serverPriv        ed25519.PrivateKey
 	serverPub         ed25519.PublicKey
 	heartbeatInterval uint32 // seconds
-	conns             sync.Map   // sessionID → *lockedConn
+	conns             sync.Map // sessionID → *sessionWriter
 	wg                sync.WaitGroup
 	stopOnce          sync.Once
 	done              chan struct{}
@@ -43,7 +46,8 @@ type Server struct {
 
 // New creates a Server and starts the background heartbeat checker.
 // Default ACL rule: server identity is allowed to do everything.
-func New(log *slog.Logger, serverPriv ed25519.PrivateKey, heartbeatInterval uint32) *Server {
+// tokenTTL controls how long resume tokens are valid; defaults to 5 minutes.
+func New(log *slog.Logger, serverPriv ed25519.PrivateKey, heartbeatInterval uint32, tokenTTL ...time.Duration) *Server {
 	serverPub := serverPriv.Public().(ed25519.PublicKey)
 	engine := acl.New()
 	// Server identity can always publish and subscribe to any subject.
@@ -62,6 +66,11 @@ func New(log *slog.Logger, serverPriv ed25519.PrivateKey, heartbeatInterval uint
 		Priority:        1000,
 	})
 
+	ttl := 5 * time.Minute
+	if len(tokenTTL) > 0 && tokenTTL[0] > 0 {
+		ttl = tokenTTL[0]
+	}
+
 	s := &Server{
 		log:               log,
 		sessions:          session.NewTable(),
@@ -69,14 +78,17 @@ func New(log *slog.Logger, serverPriv ed25519.PrivateKey, heartbeatInterval uint
 		acl:               engine,
 		registry:          registry.New(),
 		calls:             call.New(),
+		tokens:            session.NewTokenStore(ttl),
+		schema:            schema.DefaultRegistry(),
 		serverPriv:        serverPriv,
 		serverPub:         serverPub,
 		heartbeatInterval: heartbeatInterval,
 		done:              make(chan struct{}),
 	}
-	s.wg.Add(2)
+	s.wg.Add(3)
 	go s.runHeartbeatChecker()
 	go s.runCallTimeoutChecker()
+	go s.runTokenExpirer()
 	return s
 }
 
@@ -85,30 +97,26 @@ func (s *Server) AddRule(r acl.Rule) {
 	s.acl.AddRule(r)
 }
 
+// SchemaRegistry returns the server's schema registry (Decision #14).
+// Used by the admin server to register schemas at runtime.
+func (s *Server) SchemaRegistry() *schema.Registry {
+	return s.schema
+}
+
 // ─── Connection handling ──────────────────────────────────────────────────────
 
-// lockedConn serialises concurrent writes to one connection.
-type lockedConn struct {
-	mu   sync.Mutex
-	conn net.Conn
-}
-
-func (lc *lockedConn) writeFrame(ft pb.FrameType, payload []byte) error {
-	lc.mu.Lock()
-	defer lc.mu.Unlock()
-	return wire.Write(lc.conn, ft, payload)
-}
-
 // Shutdown gracefully stops the server. It publishes entity.left for every
-// connected entity, closes all connections, and waits for all goroutines to
-// exit. Safe to call once; subsequent calls are no-ops.
+// connected entity, drains pending frames via each session's writer, then
+// closes all connections and waits for all goroutines to exit.
+// Safe to call once; subsequent calls are no-ops.
 func (s *Server) Shutdown() {
 	s.stopOnce.Do(func() { close(s.done) })
 
-	// Publish entity.left for all connected entities while their connections are
-	// still open, so observers subscribed to lattice.system.> can receive it.
+	// Publish entity.left for all connected entities. Entity.left frames are
+	// enqueued into each subscriber's data channel before any conn is closed,
+	// so sw.close() below can drain and deliver them.
 	for _, ent := range s.registry.All() {
-		if s.registry.Remove(ent.Pubkey) == nil {
+		if s.registry.Remove(ent.Pubkey, ent.SessionID) == nil {
 			continue // concurrent disconnect already handled it
 		}
 		payload, _ := proto.Marshal(&pb.EntityLeft{
@@ -118,11 +126,12 @@ func (s *Server) Shutdown() {
 		s.publishSystemEvent("lattice.system.entity.left", payload)
 	}
 
-	// Close all connections so HandleConn goroutines see EOF and exit.
-	// HandleConn defers get nil from registry.Remove (already removed above)
-	// and skip the entity.left publish.
+	// For each writer: drain queued frames (including entity.left) then close
+	// the conn so the HandleConn read loop exits.
 	s.conns.Range(func(_, value any) bool {
-		value.(*lockedConn).conn.Close()
+		sw := value.(*sessionWriter)
+		sw.close()      // drain pending frames with write deadline, then wait
+		sw.conn.Close() // close conn so HandleConn read loop exits
 		return true
 	})
 
@@ -142,32 +151,73 @@ func (s *Server) HandleConn(conn net.Conn) {
 	remote := conn.RemoteAddr().String()
 	s.log.Info("client connected", "remote", remote)
 
-	rec, err := handshake.DoServer(tlsConn, s.serverPriv, s.sessions, s.heartbeatInterval)
+	// Deadline prevents a client that completes TLS but never sends HELLO from
+	// holding a goroutine indefinitely (Decision #17).
+	tlsConn.SetDeadline(time.Now().Add(10 * time.Second))
+	rec, resume, err := handshake.DoServer(tlsConn, s.serverPriv, s.sessions, s.tokens, s.heartbeatInterval)
 	if err != nil {
 		s.log.Warn("handshake failed", "remote", remote, "err", err)
 		conn.Close()
 		return
 	}
-	s.log.Info("entity authenticated", "remote", remote, "session_id", rec.ID)
+	tlsConn.SetDeadline(time.Time{})
+	s.log.Info("entity authenticated", "remote", remote, "session_id", rec.ID, "resumed", resume.Resumed)
 
-	lc := &lockedConn{conn: conn}
-	s.conns.Store(rec.ID, lc)
+	// onWriteError is called by the writer goroutine when a write deadline fires.
+	// It performs the same cleanup as the normal disconnect defer, but publishes
+	// entity.offline instead of entity.left.
+	onWriteError := func() {
+		if s.registry.Remove(rec.Pubkey, rec.ID) == nil {
+			return // heartbeat checker, eviction, or Shutdown already cleaned up
+		}
+		s.log.Info("entity offline (write timeout)",
+			"session_id", rec.ID,
+			"pubkey", acl.EncodeIdentity(rec.Pubkey)[:8]+"...",
+		)
+		s.bus.RemoveSession(rec.ID)
+		s.conns.Delete(rec.ID)
+		s.sessions.Remove(rec.ID)
+		s.publishEntityOffline(&registry.EntityRecord{
+			Pubkey:    rec.Pubkey,
+			SessionID: rec.ID,
+		})
+	}
 
-	// Register entity and announce it.
-	s.registry.Register(rec.ID, rec.Pubkey, rec.Capabilities)
-	s.publishEntityJoined(rec)
+	sw := newSessionWriter(conn, rec.ID, s.log, onWriteError)
+	s.conns.Store(rec.ID, sw)
+
+	// Atomically register the new session and capture any previous session for
+	// this pubkey (Decision #12: same-identity reconnect). RegisterAndEvict holds
+	// the registry lock for the entire read+write, eliminating the race window
+	// between concurrent reconnects from the same identity.
+	if old := s.registry.RegisterAndEvict(rec.ID, rec.Pubkey, rec.Capabilities); old != nil {
+		s.evictCapturedSession(old)
+	}
+
+	// On resume: restore subscriptions silently and call the durable-replay hook.
+	// Patterns that are now wholly-denied (ACL changed during disconnect window)
+	// are silently dropped — delivery-time AllowConcrete would block them anyway,
+	// but an explicit drop here keeps the bus clean (M-5 fix).
+	// On fresh connect: announce entity.joined so watchers know the entity arrived.
+	if resume.Resumed {
+		for _, pattern := range resume.Patterns {
+			if !s.acl.AllowPattern(rec.Pubkey, acl.ActionSubscribe, pattern) {
+				s.log.Debug("resume: dropping wholly-denied pattern",
+					"session_id", rec.ID, "pattern", pattern)
+				continue
+			}
+			_ = s.bus.Subscribe(rec.ID, pattern)
+		}
+		s.durableReplayHook(rec)
+	} else {
+		s.publishEntityJoined(rec)
+	}
 
 	// Cleanup: ordered to prevent fanout to dead connections.
 	defer func() {
-		// Remove from registry — returns nil if heartbeat checker already removed it.
-		if ent := s.registry.Remove(rec.Pubkey); ent != nil {
-			// Normal (graceful) disconnect path.
-			s.bus.RemoveSession(rec.ID)
-			s.conns.Delete(rec.ID)
-			s.sessions.Remove(rec.ID)
-			s.publishEntityLeft(rec)
-		}
-		conn.Close()
+		s.teardownSession(rec)          // no-op if DISCONNECT, eviction, or Shutdown already cleaned up
+		conn.Close()                    // interrupt any pending write; idempotent
+		sw.close()                      // wait for writer goroutine to finish
 		s.log.Info("client disconnected", "remote", remote, "session_id", rec.ID)
 	}()
 
@@ -187,24 +237,29 @@ func (s *Server) HandleConn(conn net.Conn) {
 		switch frame.Type {
 		case pb.FrameType_FRAME_TYPE_HEARTBEAT:
 			s.registry.UpdateHeartbeat(rec.Pubkey)
-			if err := lc.writeFrame(pb.FrameType_FRAME_TYPE_HEARTBEAT_ACK, nil); err != nil {
-				return
-			}
+			sw.enqueueControl(pb.FrameType_FRAME_TYPE_HEARTBEAT_ACK, nil)
 
 		case pb.FrameType_FRAME_TYPE_SUBSCRIBE:
-			s.handleSubscribe(lc, rec, frame.Payload)
+			s.handleSubscribe(sw, rec, frame.Payload)
 
 		case pb.FrameType_FRAME_TYPE_UNSUBSCRIBE:
 			s.handleUnsubscribe(rec, frame.Payload)
 
 		case pb.FrameType_FRAME_TYPE_PUBLISH:
-			s.handlePublish(lc, rec, frame.Payload)
+			s.handlePublish(sw, rec, frame.Payload)
 
 		case pb.FrameType_FRAME_TYPE_REQUEST:
-			s.handleRequest(lc, rec, frame.Payload)
+			s.handleRequest(sw, rec, frame.Payload)
 
 		case pb.FrameType_FRAME_TYPE_RESPONSE:
-			s.handleResponse(lc, rec, frame.Payload)
+			s.handleResponse(sw, rec, frame.Payload)
+
+		case pb.FrameType_FRAME_TYPE_DISCONNECT:
+			// Graceful teardown requested by the client (Decision #8).
+			// Perform cleanup now so entity.left is published immediately,
+			// rather than waiting for the heartbeat checker (up to 3× interval).
+			s.teardownSession(rec)
+			return
 
 		default:
 			s.log.Warn("unhandled frame", "remote", remote, "type", frame.Type)
@@ -214,19 +269,22 @@ func (s *Server) HandleConn(conn net.Conn) {
 
 // ─── Frame handlers ───────────────────────────────────────────────────────────
 
-func (s *Server) handleSubscribe(lc *lockedConn, rec *session.Record, payload []byte) {
+func (s *Server) handleSubscribe(sw *sessionWriter, rec *session.Record, payload []byte) {
 	var msg pb.Subscribe
 	if err := proto.Unmarshal(payload, &msg); err != nil {
-		s.sendError(lc, "INVALID_PAYLOAD", "cannot unmarshal SUBSCRIBE")
+		s.sendError(sw, "INVALID_PAYLOAD", "cannot unmarshal SUBSCRIBE")
 		return
 	}
-	// ACL check before touching the registry.
-	if !s.acl.Allow(rec.Pubkey, acl.ActionSubscribe, msg.Subject) {
-		s.sendError(lc, "PERMISSION_DENIED", "subscribe denied by ACL")
+	// Wholly-denied check: reject the subscription only when no concrete subject
+	// under the pattern would be permitted (Decision #11). Subscriptions where at
+	// least one permitted subject exists are accepted; delivery-time AllowConcrete
+	// filters individual frames that hit narrower deny rules.
+	if !s.acl.AllowPattern(rec.Pubkey, acl.ActionSubscribe, msg.Subject) {
+		s.sendError(sw, "PERMISSION_DENIED", "subscribe denied by ACL")
 		return
 	}
 	if err := s.bus.Subscribe(rec.ID, msg.Subject); err != nil {
-		s.sendError(lc, "INVALID_SUBJECT", err.Error())
+		s.sendError(sw, "INVALID_SUBJECT", err.Error())
 		return
 	}
 	s.log.Debug("subscribed", "session_id", rec.ID, "pattern", msg.Subject)
@@ -241,44 +299,44 @@ func (s *Server) handleUnsubscribe(rec *session.Record, payload []byte) {
 	s.log.Debug("unsubscribed", "session_id", rec.ID, "pattern", msg.Subject)
 }
 
-func (s *Server) handlePublish(lc *lockedConn, rec *session.Record, payload []byte) {
+func (s *Server) handlePublish(sw *sessionWriter, rec *session.Record, payload []byte) {
 	var msg pb.Publish
 	if err := proto.Unmarshal(payload, &msg); err != nil {
-		s.sendError(lc, "INVALID_PAYLOAD", "cannot unmarshal PUBLISH")
+		s.sendError(sw, "INVALID_PAYLOAD", "cannot unmarshal PUBLISH")
 		return
 	}
 
 	// Reject wildcards and the reserved namespace before touching ACL.
 	if err := bus.ValidateSubject(msg.Subject); err != nil {
-		s.sendError(lc, "INVALID_SUBJECT", err.Error())
+		s.sendError(sw, "INVALID_SUBJECT", err.Error(), msg.MessageId)
 		return
 	}
 
 	// ACL check: session exists → ACL → schema → fan-out.
 	if !s.acl.Allow(rec.Pubkey, acl.ActionPublish, msg.Subject) {
 		s.log.Debug("publish denied by ACL", "session_id", rec.ID, "subject", msg.Subject)
-		s.sendError(lc, "PERMISSION_DENIED", "publish denied by ACL")
+		s.sendError(sw, "PERMISSION_DENIED", "publish denied by ACL", msg.MessageId)
 		return
 	}
 
 	// Schema validation.
-	if err := schema.Validate(msg.Subject, msg.Payload); err != nil {
-		s.sendError(lc, "SCHEMA_ERROR", err.Error())
+	if err := s.schema.Validate(msg.Subject, msg.Payload); err != nil {
+		s.sendError(sw, "SCHEMA_ERROR", err.Error(), msg.MessageId)
 		return
 	}
 
-	// Fan-out.
-	s.fanout(msg.Subject, msg.Payload)
+	// Fan-out — pass publisher pubkey for server-stamped provenance (Decision #4).
+	s.fanout(msg.Subject, msg.Payload, rec.Pubkey)
 }
 
-func (s *Server) handleRequest(lc *lockedConn, rec *session.Record, payload []byte) {
+func (s *Server) handleRequest(sw *sessionWriter, rec *session.Record, payload []byte) {
 	var req pb.Request
 	if err := proto.Unmarshal(payload, &req); err != nil {
-		s.sendError(lc, "INVALID_PAYLOAD", "cannot unmarshal REQUEST")
+		s.sendError(sw, "INVALID_PAYLOAD", "cannot unmarshal REQUEST")
 		return
 	}
 	if len(req.TargetPubkey) != ed25519.PublicKeySize {
-		s.sendError(lc, "INVALID_PUBKEY", "target_pubkey must be 32 bytes")
+		s.sendError(sw, "INVALID_PUBKEY", "target_pubkey must be 32 bytes")
 		return
 	}
 
@@ -286,22 +344,22 @@ func (s *Server) handleRequest(lc *lockedConn, rec *session.Record, payload []by
 	// SubjectPattern in call rules holds the target identity or "*" / ">".
 	targetIdentity := acl.EncodeIdentity(req.TargetPubkey)
 	if !s.acl.Allow(rec.Pubkey, acl.ActionCall, targetIdentity) {
-		s.sendError(lc, "PERMISSION_DENIED", "call denied by ACL")
+		s.sendError(sw, "PERMISSION_DENIED", "call denied by ACL")
 		return
 	}
 
 	// Target must be present in the entity registry.
 	targetEnt := s.registry.Get(req.TargetPubkey)
 	if targetEnt == nil {
-		s.sendError(lc, "NOT_FOUND", "target entity not connected")
+		s.sendError(sw, "NOT_FOUND", "target entity not connected")
 		return
 	}
 	v, ok := s.conns.Load(targetEnt.SessionID)
 	if !ok {
-		s.sendError(lc, "NOT_FOUND", "target entity not connected")
+		s.sendError(sw, "NOT_FOUND", "target entity not connected")
 		return
 	}
-	targetLc := v.(*lockedConn)
+	targetSw := v.(*sessionWriter)
 
 	timeoutMs := req.TimeoutMs
 	if timeoutMs == 0 {
@@ -311,32 +369,51 @@ func (s *Server) handleRequest(lc *lockedConn, rec *session.Record, payload []by
 
 	// Register before forwarding to prevent a race where the target responds
 	// before the pending entry exists.
-	s.calls.Add(req.CorrelationId, rec.ID, deadline)
+	s.calls.Add(req.CorrelationId, rec.ID, targetEnt.SessionID, deadline)
 
-	if err := targetLc.writeFrame(pb.FrameType_FRAME_TYPE_REQUEST, payload); err != nil {
+	// Stamp caller_identity and received_at server-side before forwarding so the
+	// target can trust these fields (Decision #18). Client-supplied values are overwritten.
+	req.CallerIdentity = acl.EncodeIdentity(rec.Pubkey)
+	req.ReceivedAt = time.Now().UnixMilli()
+	stampedPayload, _ := proto.Marshal(&req)
+
+	if !targetSw.enqueue(pb.FrameType_FRAME_TYPE_REQUEST, stampedPayload) {
 		s.calls.Remove(req.CorrelationId)
-		s.sendError(lc, "DELIVERY_FAILED", "could not forward request to target")
+		s.sendError(sw, "DELIVERY_FAILED", "target data channel full")
 	}
 }
 
-func (s *Server) handleResponse(lc *lockedConn, rec *session.Record, payload []byte) {
+func (s *Server) handleResponse(sw *sessionWriter, rec *session.Record, payload []byte) {
 	var resp pb.Response
 	if err := proto.Unmarshal(payload, &resp); err != nil {
-		s.sendError(lc, "INVALID_PAYLOAD", "cannot unmarshal RESPONSE")
+		s.sendError(sw, "INVALID_PAYLOAD", "cannot unmarshal RESPONSE")
 		return
 	}
 
-	pending := s.calls.Remove(resp.CorrelationId)
+	// Verify the responder is the intended target before removing the call (Decision #6).
+	// Peek leaves the call intact so the legitimate target can still respond if this
+	// is a spoofed RESPONSE from a third party.
+	pending := s.calls.Peek(resp.CorrelationId)
 	if pending == nil {
-		s.sendError(lc, "NOT_FOUND", "unknown or expired correlation_id")
+		s.sendError(sw, "NOT_FOUND", "unknown or expired correlation_id")
 		return
+	}
+	if pending.TargetSessionID != rec.ID {
+		s.sendError(sw, "NOT_AUTHORIZED", "response from unexpected entity")
+		return
+	}
+
+	// Target verified — remove and forward.
+	pending = s.calls.Remove(resp.CorrelationId)
+	if pending == nil {
+		return // expired between Peek and Remove; silently drop
 	}
 
 	v, ok := s.conns.Load(pending.RequesterSessionID)
 	if !ok {
 		return // requester disconnected; silently drop
 	}
-	_ = v.(*lockedConn).writeFrame(pb.FrameType_FRAME_TYPE_RESPONSE, payload)
+	_ = v.(*sessionWriter).enqueue(pb.FrameType_FRAME_TYPE_RESPONSE, payload)
 }
 
 // ─── Call timeout checker ─────────────────────────────────────────────────────
@@ -352,8 +429,14 @@ func (s *Server) runCallTimeoutChecker() {
 		case <-ticker.C:
 			for _, exp := range s.calls.Expired(time.Now()) {
 				if v, ok := s.conns.Load(exp.RequesterSessionID); ok {
-					payload, _ := proto.Marshal(&pb.Error{Code: "TIMEOUT", Message: "call timed out"})
-					_ = v.(*lockedConn).writeFrame(pb.FrameType_FRAME_TYPE_ERROR, payload)
+					// Echo correlation_id as ref_id so the requester can match the error
+					// to the originating call (Decision #5).
+					payload, _ := proto.Marshal(&pb.Error{
+						Code:    "TIMEOUT",
+						Message: "call timed out",
+						RefId:   exp.CorrelationID,
+					})
+					_ = v.(*sessionWriter).enqueueControl(pb.FrameType_FRAME_TYPE_ERROR, payload)
 				}
 			}
 		case <-s.done:
@@ -371,13 +454,27 @@ func (s *Server) publishSystemEvent(subject string, payload []byte) {
 	if len(sids) == 0 {
 		return
 	}
-	deliverPayload, err := proto.Marshal(&pb.Deliver{Subject: subject, Payload: payload})
+	deliverPayload, err := proto.Marshal(&pb.Deliver{
+		Id:                s.seq.Next(subject),
+		Subject:           subject,
+		Payload:           payload,
+		PublisherIdentity: acl.EncodeIdentity(s.serverPub),
+		PublishedAt:       time.Now().UnixMilli(),
+		SchemaVersion:     s.schema.Version(subject), // 0 for system subjects
+	})
 	if err != nil {
 		return
 	}
 	for _, sid := range sids {
+		rec := s.sessions.ByID(sid)
+		if rec == nil {
+			continue // session already cleaned up
+		}
+		if !s.acl.AllowConcrete(rec.Pubkey, acl.ActionSubscribe, subject) {
+			continue // delivery-time ACL check: subscriber is denied this concrete subject
+		}
 		if v, ok := s.conns.Load(sid); ok {
-			_ = v.(*lockedConn).writeFrame(pb.FrameType_FRAME_TYPE_DELIVER, deliverPayload)
+			_ = v.(*sessionWriter).enqueue(pb.FrameType_FRAME_TYPE_DELIVER, deliverPayload)
 		}
 	}
 }
@@ -432,8 +529,8 @@ func (s *Server) runHeartbeatChecker() {
 // markOffline handles the offline path for an entity that missed heartbeats.
 // It performs cleanup in the correct order and publishes entity.offline.
 func (s *Server) markOffline(ent *registry.EntityRecord) {
-	// Remove from registry first. If nil, another goroutine already handled it.
-	if removed := s.registry.Remove(ent.Pubkey); removed == nil {
+	// Remove from registry first (CAS). If nil, another goroutine already handled it.
+	if removed := s.registry.Remove(ent.Pubkey, ent.SessionID); removed == nil {
 		return
 	}
 	s.log.Info("entity offline (missed heartbeats)",
@@ -443,39 +540,121 @@ func (s *Server) markOffline(ent *registry.EntityRecord) {
 	// Remove subscriptions and connection map entry before publishing,
 	// so the offline entity cannot receive its own offline event.
 	s.bus.RemoveSession(ent.SessionID)
-	var lc *lockedConn
+	var sw *sessionWriter
 	if v, ok := s.conns.LoadAndDelete(ent.SessionID); ok {
-		lc = v.(*lockedConn)
+		sw = v.(*sessionWriter)
 	}
 	s.sessions.Remove(ent.SessionID)
 	// Publish while other subscribers' connections are still in conns.
 	s.publishEntityOffline(ent)
-	// Close connection so handleConn's read loop exits.
-	if lc != nil {
-		lc.conn.Close()
+	// Close connection so HandleConn's read loop exits. The writer goroutine
+	// will detect the closed conn on the next write and exit via onWriteError
+	// (which will be a no-op since the entity is already removed).
+	if sw != nil {
+		sw.conn.Close()
 	}
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-// fanout delivers payload to all subscribers of subject.
-func (s *Server) fanout(subject string, innerPayload []byte) {
+// fanout delivers payload to all subscribers of subject with a full provenance envelope.
+func (s *Server) fanout(subject string, innerPayload []byte, publisherPubkey []byte) {
 	sids := s.bus.Fanout(subject)
 	if len(sids) == 0 {
 		return
 	}
-	deliverPayload, err := proto.Marshal(&pb.Deliver{Subject: subject, Payload: innerPayload})
+	deliverPayload, err := proto.Marshal(&pb.Deliver{
+		Id:                s.seq.Next(subject),
+		Subject:           subject,
+		Payload:           innerPayload,
+		PublisherIdentity: acl.EncodeIdentity(publisherPubkey),
+		PublishedAt:       time.Now().UnixMilli(),
+		SchemaVersion:     s.schema.Version(subject),
+	})
 	if err != nil {
 		return
 	}
 	for _, sid := range sids {
+		rec := s.sessions.ByID(sid)
+		if rec == nil {
+			continue // session already cleaned up
+		}
+		if !s.acl.AllowConcrete(rec.Pubkey, acl.ActionSubscribe, subject) {
+			continue // delivery-time ACL check: subscriber is denied this concrete subject
+		}
 		if v, ok := s.conns.Load(sid); ok {
-			_ = v.(*lockedConn).writeFrame(pb.FrameType_FRAME_TYPE_DELIVER, deliverPayload)
+			_ = v.(*sessionWriter).enqueue(pb.FrameType_FRAME_TYPE_DELIVER, deliverPayload)
 		}
 	}
 }
 
-func (s *Server) sendError(lc *lockedConn, code, message string) {
-	payload, _ := proto.Marshal(&pb.Error{Code: code, Message: message})
-	_ = lc.writeFrame(pb.FrameType_FRAME_TYPE_ERROR, payload)
+// sendError sends an ERROR frame. An optional refID (e.g. Publish.message_id) is
+// echoed in Error.ref_id for client-side correlation (Decision #5).
+func (s *Server) sendError(sw *sessionWriter, code, message string, refID ...string) {
+	e := &pb.Error{Code: code, Message: message}
+	if len(refID) > 0 && refID[0] != "" {
+		e.RefId = refID[0]
+	}
+	payload, _ := proto.Marshal(e)
+	_ = sw.enqueueControl(pb.FrameType_FRAME_TYPE_ERROR, payload)
+}
+
+// teardownSession performs the cleanup for a graceful disconnect (DISCONNECT frame or
+// connection EOF). The CAS Remove ensures only the first caller does real work.
+// Subscription patterns are saved to the token store so the entity can resume later
+// (Decision #2).
+func (s *Server) teardownSession(rec *session.Record) {
+	if s.registry.Remove(rec.Pubkey, rec.ID) == nil {
+		return // eviction, heartbeat checker, or Shutdown already cleaned up
+	}
+	// Snapshot subscriptions and save under rec.Token BEFORE RemoveSession wipes them.
+	patterns := s.bus.GetPatterns(rec.ID)
+	s.tokens.Save(rec.Token, rec.Pubkey, patterns)
+	s.bus.RemoveSession(rec.ID)
+	s.conns.Delete(rec.ID)
+	s.sessions.Remove(rec.ID)
+	s.publishEntityLeft(rec)
+}
+
+// durableReplayHook is called after a successful token-based session resume.
+// In v0.1.1 this is a no-op stub; durable message replay is not yet implemented.
+func (s *Server) durableReplayHook(_ *session.Record) {}
+
+// evictCapturedSession cleans up an old session whose registry entry has already
+// been atomically replaced by RegisterAndEvict. Because the registry is already
+// updated, this skips the CAS Remove and proceeds directly to cleanup.
+// No entity.left is published — the reconnection supersedes the old session.
+// Pending calls targeting the old session are cancelled (Decision #6 amendment).
+func (s *Server) evictCapturedSession(old *registry.EntityRecord) {
+	for _, exp := range s.calls.InvalidateTarget(old.SessionID) {
+		if v, ok := s.conns.Load(exp.RequesterSessionID); ok {
+			payload, _ := proto.Marshal(&pb.Error{
+				Code:    "TARGET_DISCONNECTED",
+				Message: "target entity reconnected with a new session",
+			})
+			_ = v.(*sessionWriter).enqueueControl(pb.FrameType_FRAME_TYPE_ERROR, payload)
+		}
+	}
+	s.bus.RemoveSession(old.SessionID)
+	if v, ok := s.conns.LoadAndDelete(old.SessionID); ok {
+		v.(*sessionWriter).conn.Close() // unblocks the old HandleConn read loop
+	}
+	s.sessions.Remove(old.SessionID)
+	// No entity.left: the reconnect supersedes the old session.
+}
+
+// runTokenExpirer ticks every minute and sweeps expired resume tokens from the
+// token store (M-2: prevents unbounded growth of the token map).
+func (s *Server) runTokenExpirer() {
+	defer s.wg.Done()
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			s.tokens.ExpireTokens()
+		case <-s.done:
+			return
+		}
+	}
 }

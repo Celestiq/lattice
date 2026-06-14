@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -20,7 +21,7 @@ import (
 )
 
 // testServer starts an in-process TLS server. For each accepted connection it
-// calls doHandshake, then runs handleFrames in the same goroutine.
+// calls DoServer, then runs handleFrames in the same goroutine.
 // Both callbacks receive the *tls.Conn; handleFrames may be nil (connection
 // closed after handshake).
 func testServer(
@@ -44,6 +45,8 @@ func testServer(
 		t.Fatal(err)
 	}
 
+	tokens := session.NewTokenStore(5 * time.Minute)
+
 	go func() {
 		for {
 			conn, err := ln.Accept()
@@ -53,7 +56,7 @@ func testServer(
 			go func(c net.Conn) {
 				tlsConn := c.(*tls.Conn)
 				defer tlsConn.Close()
-				rec, err := handshake.DoServer(tlsConn, serverPriv, sessions, heartbeatInterval)
+				rec, _, err := handshake.DoServer(tlsConn, serverPriv, sessions, tokens, heartbeatInterval)
 				if err != nil {
 					return
 				}
@@ -111,7 +114,31 @@ func dialTLS(t *testing.T, addr string) *tls.Conn {
 	return conn
 }
 
-// ─── Tests ────────────────────────────────────────────────────────────────────
+// sendHello performs a raw HELLO with the given fields, bypassing DoClient.
+// Useful for testing server-side validation without going through the full client path.
+func sendHello(t *testing.T, conn *tls.Conn, clientPriv ed25519.PrivateKey, pubkey ed25519.PublicKey, version uint32) {
+	t.Helper()
+	if err := conn.Handshake(); err != nil {
+		t.Fatal(err)
+	}
+	cs := conn.ConnectionState()
+	nonce, err := cs.ExportKeyingMaterial("lattice-hello-v1", nil, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sig := ed25519.Sign(clientPriv, nonce)
+	hello := &pb.Hello{
+		Pubkey:          pubkey,
+		Signature:       sig,
+		ProtocolVersion: version,
+	}
+	payload, _ := proto.Marshal(hello)
+	if err := wire.Write(conn, pb.FrameType_FRAME_TYPE_HELLO, payload); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// ─── Regression tests (updated for new DoClient signature) ───────────────────
 
 // TestValidHELLO: valid HELLO → HELLO_ACK with non-empty session ID.
 func TestValidHELLO(t *testing.T) {
@@ -124,7 +151,7 @@ func TestValidHELLO(t *testing.T) {
 	conn := dialTLS(t, addr)
 	defer conn.Close()
 
-	cs, err := handshake.DoClient(conn, clientPriv)
+	cs, err := handshake.DoClient(conn, clientPriv, nil, nil)
 	if err != nil {
 		t.Fatalf("DoClient: %v", err)
 	}
@@ -158,7 +185,11 @@ func TestCorruptedSignature(t *testing.T) {
 
 	// Sign garbage instead of the real nonce.
 	badSig := ed25519.Sign(clientPriv, []byte("not the real nonce"))
-	hello := &pb.Hello{Pubkey: clientPub, Signature: badSig}
+	hello := &pb.Hello{
+		Pubkey:          clientPub,
+		Signature:       badSig,
+		ProtocolVersion: handshake.ProtocolVersion,
+	}
 	payload, _ := proto.Marshal(hello)
 	if err := wire.Write(conn, pb.FrameType_FRAME_TYPE_HELLO, payload); err != nil {
 		t.Fatal(err)
@@ -178,8 +209,7 @@ func TestCorruptedSignature(t *testing.T) {
 		t.Fatal("expected connection to be closed after ERROR")
 	}
 	if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
-		// any net error is acceptable — connection is gone
-		_ = err
+		_ = err // any net error is acceptable — connection is gone
 	}
 }
 
@@ -208,7 +238,11 @@ func TestMismatchedPubkey(t *testing.T) {
 
 	// Sign the real nonce but claim a different pubkey.
 	sig := ed25519.Sign(signerPriv, nonce)
-	hello := &pb.Hello{Pubkey: claimedPub, Signature: sig}
+	hello := &pb.Hello{
+		Pubkey:          claimedPub,
+		Signature:       sig,
+		ProtocolVersion: handshake.ProtocolVersion,
+	}
 	payload, _ := proto.Marshal(hello)
 	if err := wire.Write(conn, pb.FrameType_FRAME_TYPE_HELLO, payload); err != nil {
 		t.Fatal(err)
@@ -235,7 +269,7 @@ func TestTwoClientsIndependentSessions(t *testing.T) {
 		mu         sync.Mutex
 		sessionIDs []string
 	)
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -243,7 +277,7 @@ func TestTwoClientsIndependentSessions(t *testing.T) {
 			conn := dialTLS(t, addr)
 			defer conn.Close()
 
-			cs, err := handshake.DoClient(conn, clientPriv)
+			cs, err := handshake.DoClient(conn, clientPriv, nil, nil)
 			if err != nil {
 				t.Errorf("DoClient: %v", err)
 				return
@@ -274,11 +308,10 @@ func TestHeartbeatAck(t *testing.T) {
 	conn := dialTLS(t, addr)
 	defer conn.Close()
 
-	if _, err := handshake.DoClient(conn, clientPriv); err != nil {
+	if _, err := handshake.DoClient(conn, clientPriv, nil, nil); err != nil {
 		t.Fatalf("DoClient: %v", err)
 	}
 
-	// Send HEARTBEAT and measure round-trip.
 	start := time.Now()
 	if err := wire.Write(conn, pb.FrameType_FRAME_TYPE_HEARTBEAT, nil); err != nil {
 		t.Fatalf("write heartbeat: %v", err)
@@ -309,17 +342,193 @@ func TestClientStoresSessionToken(t *testing.T) {
 	conn := dialTLS(t, addr)
 	defer conn.Close()
 
-	cs, err := handshake.DoClient(conn, clientPriv)
+	cs, err := handshake.DoClient(conn, clientPriv, nil, nil)
 	if err != nil {
 		t.Fatalf("DoClient: %v", err)
 	}
 
-	// The server's session record for the same ID must have the same token.
 	rec := sessions.ByID(cs.SessionID)
 	if rec == nil {
 		t.Fatal("session not found in server table")
 	}
 	if string(rec.Token) != string(cs.SessionToken) {
 		t.Fatal("session token mismatch between client and server")
+	}
+}
+
+// ─── Session 1 new tests ─────────────────────────────────────────────────────
+
+// TestServerSignatureVerifySuccess: DoClient verifies the server signature when
+// the server signs correctly. (Implicitly tested by TestValidHELLO but explicit
+// here for clarity.)
+func TestServerSignatureVerifySuccess(t *testing.T) {
+	serverPub, serverPriv := newServerKey(t)
+	sessions := session.NewTable()
+	addr, stop := testServer(t, serverPriv, sessions, 30, nil)
+	defer stop()
+
+	_, clientPriv := newClientKey(t)
+	conn := dialTLS(t, addr)
+	defer conn.Close()
+
+	// Pass the server's pubkey as the pin — this exercises both signature
+	// verification and pin matching on the first connection.
+	cs, err := handshake.DoClient(conn, clientPriv, serverPub, nil)
+	if err != nil {
+		t.Fatalf("DoClient with correct pin: %v", err)
+	}
+	if len(cs.ServerPubkey) != ed25519.PublicKeySize {
+		t.Fatalf("server pubkey length: got %d", len(cs.ServerPubkey))
+	}
+}
+
+// TestForgedServerSignature: a server that sends zeroed server_signature is rejected.
+func TestForgedServerSignature(t *testing.T) {
+	_, serverPriv := newServerKey(t)
+
+	// Start a raw server that sends a HELLO_ACK with a zeroed server_signature.
+	cert, err := wire.GenerateSelfSignedCert()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS13,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	serverPub := serverPriv.Public().(ed25519.PublicKey)
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		tlsConn := conn.(*tls.Conn)
+		if err := tlsConn.Handshake(); err != nil {
+			return
+		}
+		frame, err := wire.Read(tlsConn)
+		if err != nil || frame.Type != pb.FrameType_FRAME_TYPE_HELLO {
+			return
+		}
+		// Send HELLO_ACK with all-zero server_signature (forged).
+		ack := &pb.HelloAck{
+			SessionId:         "fake-session",
+			SessionToken:      make([]byte, 32),
+			ServerPubkey:      serverPub,
+			HeartbeatInterval: 30,
+			ServerSignature:   make([]byte, 64), // zeros — invalid signature
+		}
+		payload, _ := proto.Marshal(ack)
+		_ = wire.Write(tlsConn, pb.FrameType_FRAME_TYPE_HELLO_ACK, payload)
+	}()
+
+	_, clientPriv := newClientKey(t)
+	conn := dialTLS(t, ln.Addr().String())
+	defer conn.Close()
+
+	_, err = handshake.DoClient(conn, clientPriv, nil, nil)
+	if err == nil {
+		t.Fatal("expected error for forged server signature, got nil")
+	}
+	if !strings.Contains(err.Error(), "server signature") {
+		t.Fatalf("expected server signature error, got: %v", err)
+	}
+}
+
+// TestPinMismatch: valid server signature but wrong pinned pubkey → error.
+func TestPinMismatch(t *testing.T) {
+	_, serverPriv := newServerKey(t)
+	sessions := session.NewTable()
+	addr, stop := testServer(t, serverPriv, sessions, 30, nil)
+	defer stop()
+
+	_, clientPriv := newClientKey(t)
+	wrongPin, _, _ := ed25519.GenerateKey(rand.Reader) // different key than the server's
+
+	conn := dialTLS(t, addr)
+	defer conn.Close()
+
+	_, err := handshake.DoClient(conn, clientPriv, wrongPin, nil)
+	if err == nil {
+		t.Fatal("expected pin mismatch error, got nil")
+	}
+	if !strings.Contains(err.Error(), "pin mismatch") {
+		t.Fatalf("expected pin mismatch error, got: %v", err)
+	}
+}
+
+// TestUnsupportedProtocolVersion: Hello with wrong protocol_version → ERROR UNSUPPORTED_VERSION.
+func TestUnsupportedProtocolVersion(t *testing.T) {
+	_, serverPriv := newServerKey(t)
+	sessions := session.NewTable()
+	addr, stop := testServer(t, serverPriv, sessions, 30, nil)
+	defer stop()
+
+	_, clientPriv := newClientKey(t)
+	clientPub := clientPriv.Public().(ed25519.PublicKey)
+
+	conn := dialTLS(t, addr)
+	defer conn.Close()
+
+	// Send Hello with a version the server does not accept.
+	sendHello(t, conn, clientPriv, clientPub, 99)
+
+	frame, err := wire.Read(conn)
+	if err != nil {
+		t.Fatalf("expected ERROR frame: %v", err)
+	}
+	if frame.Type != pb.FrameType_FRAME_TYPE_ERROR {
+		t.Fatalf("expected ERROR, got %v", frame.Type)
+	}
+	var e pb.Error
+	proto.Unmarshal(frame.Payload, &e)
+	if e.Code != "UNSUPPORTED_VERSION" {
+		t.Fatalf("expected UNSUPPORTED_VERSION, got %q", e.Code)
+	}
+}
+
+// TestTypedCapabilitiesRoundTrip: Capability fields survive Hello → session.Record.
+func TestTypedCapabilitiesRoundTrip(t *testing.T) {
+	_, serverPriv := newServerKey(t)
+	sessions := session.NewTable()
+
+	// Capture the session record from DoServer via handleFrames callback.
+	var (
+		mu      sync.Mutex
+		gotCaps []*pb.Capability
+	)
+	addr, stop := testServer(t, serverPriv, sessions, 30, func(_ *tls.Conn, rec *session.Record) {
+		mu.Lock()
+		gotCaps = rec.Capabilities
+		mu.Unlock()
+	})
+	defer stop()
+
+	_, clientPriv := newClientKey(t)
+	caps := []*pb.Capability{{Name: "sensor"}, {Name: "actuator"}}
+
+	conn := dialTLS(t, addr)
+	defer conn.Close()
+
+	if _, err := handshake.DoClient(conn, clientPriv, nil, caps); err != nil {
+		t.Fatalf("DoClient: %v", err)
+	}
+
+	// Give the server goroutine time to execute the handleFrames callback.
+	time.Sleep(20 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(gotCaps) != 2 {
+		t.Fatalf("expected 2 capabilities, got %d", len(gotCaps))
+	}
+	if gotCaps[0].Name != "sensor" || gotCaps[1].Name != "actuator" {
+		t.Fatalf("capability names mismatch: got %v", gotCaps)
 	}
 }

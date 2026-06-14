@@ -9,6 +9,7 @@ import (
 // PendingCall tracks a forwarded REQUEST waiting for its RESPONSE.
 type PendingCall struct {
 	RequesterSessionID string
+	TargetSessionID    string // session that must send the RESPONSE (Decision #6)
 	Deadline           time.Time
 }
 
@@ -31,13 +32,40 @@ func New() *Registry {
 
 // Add registers a pending call. An existing entry with the same correlation ID
 // is overwritten.
-func (r *Registry) Add(correlationID, requesterSessionID string, deadline time.Time) {
+func (r *Registry) Add(correlationID, requesterSessionID, targetSessionID string, deadline time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.pending[correlationID] = &PendingCall{
 		RequesterSessionID: requesterSessionID,
+		TargetSessionID:    targetSessionID,
 		Deadline:           deadline,
 	}
+}
+
+// Peek returns the pending call without removing it. Returns nil if not found.
+// The returned pointer is valid until the next mutation of the Registry.
+func (r *Registry) Peek(correlationID string) *PendingCall {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.pending[correlationID]
+}
+
+// InvalidateTarget removes and returns all pending calls whose target session
+// matches targetSessionID. Used when a target entity is evicted (Decision #12).
+func (r *Registry) InvalidateTarget(targetSessionID string) []ExpiredCall {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []ExpiredCall
+	for id, pc := range r.pending {
+		if pc.TargetSessionID == targetSessionID {
+			out = append(out, ExpiredCall{
+				CorrelationID:      id,
+				RequesterSessionID: pc.RequesterSessionID,
+			})
+			delete(r.pending, id)
+		}
+	}
+	return out
 }
 
 // Remove deletes and returns the pending call for correlationID.

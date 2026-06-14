@@ -5,12 +5,14 @@ import (
 	"encoding/hex"
 	"sync"
 	"time"
+
+	pb "lattice/proto"
 )
 
 // EntityRecord holds runtime state for a connected entity.
 type EntityRecord struct {
 	Pubkey          []byte
-	Capabilities    []string
+	Capabilities    []*pb.Capability
 	SessionID       string
 	ConnectedAt     time.Time
 	LastHeartbeatAt time.Time
@@ -28,7 +30,7 @@ func New() *Registry {
 
 // Register adds a new entity. If an entity with the same pubkey already exists
 // it is overwritten.
-func (r *Registry) Register(sessionID string, pubkey []byte, capabilities []string) *EntityRecord {
+func (r *Registry) Register(sessionID string, pubkey []byte, capabilities []*pb.Capability) *EntityRecord {
 	now := time.Now()
 	rec := &EntityRecord{
 		Pubkey:          append([]byte(nil), pubkey...),
@@ -43,6 +45,28 @@ func (r *Registry) Register(sessionID string, pubkey []byte, capabilities []stri
 	return rec
 }
 
+// RegisterAndEvict atomically replaces any existing session for pubkey with the
+// new session and returns the old EntityRecord (nil if none existed). The caller
+// is responsible for cleaning up the old session (bus, conns, calls, sessions).
+// This single operation prevents a race window between reading the old entry and
+// writing the new one when two connections with the same pubkey arrive concurrently.
+func (r *Registry) RegisterAndEvict(sessionID string, pubkey []byte, capabilities []*pb.Capability) *EntityRecord {
+	now := time.Now()
+	newRec := &EntityRecord{
+		Pubkey:          append([]byte(nil), pubkey...),
+		Capabilities:    capabilities,
+		SessionID:       sessionID,
+		ConnectedAt:     now,
+		LastHeartbeatAt: now,
+	}
+	key := hex.EncodeToString(pubkey)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	old := r.entities[key] // nil if no prior session
+	r.entities[key] = newRec
+	return old
+}
+
 // UpdateHeartbeat refreshes the liveness timestamp for pubkey. No-op if not found.
 func (r *Registry) UpdateHeartbeat(pubkey []byte) {
 	r.mu.Lock()
@@ -52,15 +76,19 @@ func (r *Registry) UpdateHeartbeat(pubkey []byte) {
 	}
 }
 
-// Remove deletes the entity for pubkey and returns the record.
-// Returns nil if not found.
-func (r *Registry) Remove(pubkey []byte) *EntityRecord {
+// Remove deletes the entity for pubkey only if its current SessionID matches
+// sessionID (compare-and-swap). Returns the removed record, or nil if not
+// found or if a newer session has already been registered under this pubkey.
+func (r *Registry) Remove(pubkey []byte, sessionID string) *EntityRecord {
 	key := hex.EncodeToString(pubkey)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	rec, ok := r.entities[key]
 	if !ok {
 		return nil
+	}
+	if rec.SessionID != sessionID {
+		return nil // a newer session is already registered under this pubkey
 	}
 	delete(r.entities, key)
 	return rec

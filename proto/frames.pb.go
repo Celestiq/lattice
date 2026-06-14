@@ -39,8 +39,8 @@ const (
 	FrameType_FRAME_TYPE_REQUEST       FrameType = 10
 	FrameType_FRAME_TYPE_RESPONSE      FrameType = 11
 	FrameType_FRAME_TYPE_DISCONNECT    FrameType = 12
-	FrameType_FRAME_TYPE_PING          FrameType = 13
-	FrameType_FRAME_TYPE_PONG          FrameType = 14
+	FrameType_FRAME_TYPE_PING          FrameType = 13 // Reserved — no handler; do not build client code against this
+	FrameType_FRAME_TYPE_PONG          FrameType = 14 // Reserved — no handler; do not build client code against this
 )
 
 // Enum value maps for FrameType.
@@ -108,27 +108,27 @@ func (FrameType) EnumDescriptor() ([]byte, []int) {
 	return file_proto_frames_proto_rawDescGZIP(), []int{0}
 }
 
-type RawFrame struct {
+type Capability struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	Payload       []byte                 `protobuf:"bytes,1,opt,name=payload,proto3" json:"payload,omitempty"`
+	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"` // capability identifier e.g. "sensor", "actuator"
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *RawFrame) Reset() {
-	*x = RawFrame{}
+func (x *Capability) Reset() {
+	*x = Capability{}
 	mi := &file_proto_frames_proto_msgTypes[0]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *RawFrame) String() string {
+func (x *Capability) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*RawFrame) ProtoMessage() {}
+func (*Capability) ProtoMessage() {}
 
-func (x *RawFrame) ProtoReflect() protoreflect.Message {
+func (x *Capability) ProtoReflect() protoreflect.Message {
 	mi := &file_proto_frames_proto_msgTypes[0]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
@@ -140,25 +140,27 @@ func (x *RawFrame) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use RawFrame.ProtoReflect.Descriptor instead.
-func (*RawFrame) Descriptor() ([]byte, []int) {
+// Deprecated: Use Capability.ProtoReflect.Descriptor instead.
+func (*Capability) Descriptor() ([]byte, []int) {
 	return file_proto_frames_proto_rawDescGZIP(), []int{0}
 }
 
-func (x *RawFrame) GetPayload() []byte {
+func (x *Capability) GetName() string {
 	if x != nil {
-		return x.Payload
+		return x.Name
 	}
-	return nil
+	return ""
 }
 
 type Hello struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Pubkey        []byte                 `protobuf:"bytes,1,opt,name=pubkey,proto3" json:"pubkey,omitempty"`       // Ed25519 public key (32 bytes)
-	Signature     []byte                 `protobuf:"bytes,2,opt,name=signature,proto3" json:"signature,omitempty"` // Ed25519 signature over TLS-exporter nonce (64 bytes)
-	Capabilities  []string               `protobuf:"bytes,3,rep,name=capabilities,proto3" json:"capabilities,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	Pubkey          []byte                 `protobuf:"bytes,1,opt,name=pubkey,proto3" json:"pubkey,omitempty"`       // Ed25519 public key (32 bytes)
+	Signature       []byte                 `protobuf:"bytes,2,opt,name=signature,proto3" json:"signature,omitempty"` // Ed25519 signature over client TLS-exporter nonce (64 bytes)
+	Capabilities    []*Capability          `protobuf:"bytes,3,rep,name=capabilities,proto3" json:"capabilities,omitempty"`
+	ProtocolVersion uint32                 `protobuf:"varint,4,opt,name=protocol_version,json=protocolVersion,proto3" json:"protocol_version,omitempty"` // must equal ProtocolVersion=1; server rejects mismatches
+	ResumeToken     []byte                 `protobuf:"bytes,5,opt,name=resume_token,json=resumeToken,proto3" json:"resume_token,omitempty"`              // optional; 32-byte token from a prior HELLO_ACK (Decision #2)
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *Hello) Reset() {
@@ -205,9 +207,23 @@ func (x *Hello) GetSignature() []byte {
 	return nil
 }
 
-func (x *Hello) GetCapabilities() []string {
+func (x *Hello) GetCapabilities() []*Capability {
 	if x != nil {
 		return x.Capabilities
+	}
+	return nil
+}
+
+func (x *Hello) GetProtocolVersion() uint32 {
+	if x != nil {
+		return x.ProtocolVersion
+	}
+	return 0
+}
+
+func (x *Hello) GetResumeToken() []byte {
+	if x != nil {
+		return x.ResumeToken
 	}
 	return nil
 }
@@ -218,6 +234,7 @@ type HelloAck struct {
 	SessionToken      []byte                 `protobuf:"bytes,2,opt,name=session_token,json=sessionToken,proto3" json:"session_token,omitempty"`                 // 32 random bytes
 	ServerPubkey      []byte                 `protobuf:"bytes,3,opt,name=server_pubkey,json=serverPubkey,proto3" json:"server_pubkey,omitempty"`                 // Ed25519 public key (32 bytes)
 	HeartbeatInterval uint32                 `protobuf:"varint,4,opt,name=heartbeat_interval,json=heartbeatInterval,proto3" json:"heartbeat_interval,omitempty"` // seconds
+	ServerSignature   []byte                 `protobuf:"bytes,5,opt,name=server_signature,json=serverSignature,proto3" json:"server_signature,omitempty"`        // Ed25519 signature over server TLS-exporter nonce (64 bytes)
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
@@ -278,6 +295,13 @@ func (x *HelloAck) GetHeartbeatInterval() uint32 {
 		return x.HeartbeatInterval
 	}
 	return 0
+}
+
+func (x *HelloAck) GetServerSignature() []byte {
+	if x != nil {
+		return x.ServerSignature
+	}
+	return nil
 }
 
 type Heartbeat struct {
@@ -444,6 +468,7 @@ type Publish struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Subject       string                 `protobuf:"bytes,1,opt,name=subject,proto3" json:"subject,omitempty"`
 	Payload       []byte                 `protobuf:"bytes,2,opt,name=payload,proto3" json:"payload,omitempty"`
+	MessageId     string                 `protobuf:"bytes,3,opt,name=message_id,json=messageId,proto3" json:"message_id,omitempty"` // client-assigned; echoed in Error.ref_id on failure (Decision #5)
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -492,12 +517,23 @@ func (x *Publish) GetPayload() []byte {
 	return nil
 }
 
+func (x *Publish) GetMessageId() string {
+	if x != nil {
+		return x.MessageId
+	}
+	return ""
+}
+
 type Deliver struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Subject       string                 `protobuf:"bytes,1,opt,name=subject,proto3" json:"subject,omitempty"`
-	Payload       []byte                 `protobuf:"bytes,2,opt,name=payload,proto3" json:"payload,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	Subject           string                 `protobuf:"bytes,1,opt,name=subject,proto3" json:"subject,omitempty"`
+	Payload           []byte                 `protobuf:"bytes,2,opt,name=payload,proto3" json:"payload,omitempty"`
+	Id                uint64                 `protobuf:"varint,3,opt,name=id,proto3" json:"id,omitempty"`                                                       // per-subject monotonic counter, server-assigned (Decision #4)
+	PublisherIdentity string                 `protobuf:"bytes,4,opt,name=publisher_identity,json=publisherIdentity,proto3" json:"publisher_identity,omitempty"` // base32 pubkey of publisher, server-stamped (Decision #4)
+	PublishedAt       int64                  `protobuf:"varint,5,opt,name=published_at,json=publishedAt,proto3" json:"published_at,omitempty"`                  // Unix milliseconds, server timestamp (Decision #4)
+	SchemaVersion     uint32                 `protobuf:"varint,6,opt,name=schema_version,json=schemaVersion,proto3" json:"schema_version,omitempty"`            // from schema registry; 0 if no registered schema (Decision #4)
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *Deliver) Reset() {
@@ -544,14 +580,44 @@ func (x *Deliver) GetPayload() []byte {
 	return nil
 }
 
+func (x *Deliver) GetId() uint64 {
+	if x != nil {
+		return x.Id
+	}
+	return 0
+}
+
+func (x *Deliver) GetPublisherIdentity() string {
+	if x != nil {
+		return x.PublisherIdentity
+	}
+	return ""
+}
+
+func (x *Deliver) GetPublishedAt() int64 {
+	if x != nil {
+		return x.PublishedAt
+	}
+	return 0
+}
+
+func (x *Deliver) GetSchemaVersion() uint32 {
+	if x != nil {
+		return x.SchemaVersion
+	}
+	return 0
+}
+
 type Request struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	CorrelationId string                 `protobuf:"bytes,1,opt,name=correlation_id,json=correlationId,proto3" json:"correlation_id,omitempty"`
-	TargetPubkey  []byte                 `protobuf:"bytes,2,opt,name=target_pubkey,json=targetPubkey,proto3" json:"target_pubkey,omitempty"` // Ed25519 public key of target entity (32 bytes)
-	Payload       []byte                 `protobuf:"bytes,3,opt,name=payload,proto3" json:"payload,omitempty"`
-	TimeoutMs     uint32                 `protobuf:"varint,4,opt,name=timeout_ms,json=timeoutMs,proto3" json:"timeout_ms,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	CorrelationId  string                 `protobuf:"bytes,1,opt,name=correlation_id,json=correlationId,proto3" json:"correlation_id,omitempty"`
+	TargetPubkey   []byte                 `protobuf:"bytes,2,opt,name=target_pubkey,json=targetPubkey,proto3" json:"target_pubkey,omitempty"` // Ed25519 public key of target entity (32 bytes)
+	Payload        []byte                 `protobuf:"bytes,3,opt,name=payload,proto3" json:"payload,omitempty"`
+	TimeoutMs      uint32                 `protobuf:"varint,4,opt,name=timeout_ms,json=timeoutMs,proto3" json:"timeout_ms,omitempty"`
+	CallerIdentity string                 `protobuf:"bytes,5,opt,name=caller_identity,json=callerIdentity,proto3" json:"caller_identity,omitempty"` // base32 pubkey of requester, server-stamped; client-supplied value is overwritten (Decision #18)
+	ReceivedAt     int64                  `protobuf:"varint,6,opt,name=received_at,json=receivedAt,proto3" json:"received_at,omitempty"`            // Unix milliseconds, server timestamp (Decision #18)
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *Request) Reset() {
@@ -612,6 +678,20 @@ func (x *Request) GetTimeoutMs() uint32 {
 	return 0
 }
 
+func (x *Request) GetCallerIdentity() string {
+	if x != nil {
+		return x.CallerIdentity
+	}
+	return ""
+}
+
+func (x *Request) GetReceivedAt() int64 {
+	if x != nil {
+		return x.ReceivedAt
+	}
+	return 0
+}
+
 type Response struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	CorrelationId string                 `protobuf:"bytes,1,opt,name=correlation_id,json=correlationId,proto3" json:"correlation_id,omitempty"`
@@ -668,6 +748,7 @@ type Error struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Code          string                 `protobuf:"bytes,1,opt,name=code,proto3" json:"code,omitempty"`
 	Message       string                 `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"`
+	RefId         string                 `protobuf:"bytes,3,opt,name=ref_id,json=refId,proto3" json:"ref_id,omitempty"` // echoes Publish.message_id on publish errors, or correlation_id on call timeout (Decision #5)
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -712,6 +793,13 @@ func (x *Error) GetCode() string {
 func (x *Error) GetMessage() string {
 	if x != nil {
 		return x.Message
+	}
+	return ""
+}
+
+func (x *Error) GetRefId() string {
+	if x != nil {
+		return x.RefId
 	}
 	return ""
 }
@@ -852,43 +940,57 @@ var File_proto_frames_proto protoreflect.FileDescriptor
 
 const file_proto_frames_proto_rawDesc = "" +
 	"\n" +
-	"\x12proto/frames.proto\x12\alattice\"$\n" +
-	"\bRawFrame\x12\x18\n" +
-	"\apayload\x18\x01 \x01(\fR\apayload\"a\n" +
+	"\x12proto/frames.proto\x12\alattice\" \n" +
+	"\n" +
+	"Capability\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\"\xc4\x01\n" +
 	"\x05Hello\x12\x16\n" +
 	"\x06pubkey\x18\x01 \x01(\fR\x06pubkey\x12\x1c\n" +
-	"\tsignature\x18\x02 \x01(\fR\tsignature\x12\"\n" +
-	"\fcapabilities\x18\x03 \x03(\tR\fcapabilities\"\xa2\x01\n" +
+	"\tsignature\x18\x02 \x01(\fR\tsignature\x127\n" +
+	"\fcapabilities\x18\x03 \x03(\v2\x13.lattice.CapabilityR\fcapabilities\x12)\n" +
+	"\x10protocol_version\x18\x04 \x01(\rR\x0fprotocolVersion\x12!\n" +
+	"\fresume_token\x18\x05 \x01(\fR\vresumeToken\"\xcd\x01\n" +
 	"\bHelloAck\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x01 \x01(\tR\tsessionId\x12#\n" +
 	"\rsession_token\x18\x02 \x01(\fR\fsessionToken\x12#\n" +
 	"\rserver_pubkey\x18\x03 \x01(\fR\fserverPubkey\x12-\n" +
-	"\x12heartbeat_interval\x18\x04 \x01(\rR\x11heartbeatInterval\"\v\n" +
+	"\x12heartbeat_interval\x18\x04 \x01(\rR\x11heartbeatInterval\x12)\n" +
+	"\x10server_signature\x18\x05 \x01(\fR\x0fserverSignature\"\v\n" +
 	"\tHeartbeat\"\x0e\n" +
 	"\fHeartbeatAck\"%\n" +
 	"\tSubscribe\x12\x18\n" +
 	"\asubject\x18\x01 \x01(\tR\asubject\"'\n" +
 	"\vUnsubscribe\x12\x18\n" +
-	"\asubject\x18\x01 \x01(\tR\asubject\"=\n" +
+	"\asubject\x18\x01 \x01(\tR\asubject\"\\\n" +
 	"\aPublish\x12\x18\n" +
 	"\asubject\x18\x01 \x01(\tR\asubject\x12\x18\n" +
-	"\apayload\x18\x02 \x01(\fR\apayload\"=\n" +
+	"\apayload\x18\x02 \x01(\fR\apayload\x12\x1d\n" +
+	"\n" +
+	"message_id\x18\x03 \x01(\tR\tmessageId\"\xc6\x01\n" +
 	"\aDeliver\x12\x18\n" +
 	"\asubject\x18\x01 \x01(\tR\asubject\x12\x18\n" +
-	"\apayload\x18\x02 \x01(\fR\apayload\"\x8e\x01\n" +
+	"\apayload\x18\x02 \x01(\fR\apayload\x12\x0e\n" +
+	"\x02id\x18\x03 \x01(\x04R\x02id\x12-\n" +
+	"\x12publisher_identity\x18\x04 \x01(\tR\x11publisherIdentity\x12!\n" +
+	"\fpublished_at\x18\x05 \x01(\x03R\vpublishedAt\x12%\n" +
+	"\x0eschema_version\x18\x06 \x01(\rR\rschemaVersion\"\xd8\x01\n" +
 	"\aRequest\x12%\n" +
 	"\x0ecorrelation_id\x18\x01 \x01(\tR\rcorrelationId\x12#\n" +
 	"\rtarget_pubkey\x18\x02 \x01(\fR\ftargetPubkey\x12\x18\n" +
 	"\apayload\x18\x03 \x01(\fR\apayload\x12\x1d\n" +
 	"\n" +
-	"timeout_ms\x18\x04 \x01(\rR\ttimeoutMs\"K\n" +
+	"timeout_ms\x18\x04 \x01(\rR\ttimeoutMs\x12'\n" +
+	"\x0fcaller_identity\x18\x05 \x01(\tR\x0ecallerIdentity\x12\x1f\n" +
+	"\vreceived_at\x18\x06 \x01(\x03R\n" +
+	"receivedAt\"K\n" +
 	"\bResponse\x12%\n" +
 	"\x0ecorrelation_id\x18\x01 \x01(\tR\rcorrelationId\x12\x18\n" +
-	"\apayload\x18\x02 \x01(\fR\apayload\"5\n" +
+	"\apayload\x18\x02 \x01(\fR\apayload\"L\n" +
 	"\x05Error\x12\x12\n" +
 	"\x04code\x18\x01 \x01(\tR\x04code\x12\x18\n" +
-	"\amessage\x18\x02 \x01(\tR\amessage\"$\n" +
+	"\amessage\x18\x02 \x01(\tR\amessage\x12\x15\n" +
+	"\x06ref_id\x18\x03 \x01(\tR\x05refId\"$\n" +
 	"\n" +
 	"Disconnect\x12\x16\n" +
 	"\x06reason\x18\x01 \x01(\tR\x06reason\"\x1c\n" +
@@ -930,7 +1032,7 @@ var file_proto_frames_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
 var file_proto_frames_proto_msgTypes = make([]protoimpl.MessageInfo, 15)
 var file_proto_frames_proto_goTypes = []any{
 	(FrameType)(0),       // 0: lattice.FrameType
-	(*RawFrame)(nil),     // 1: lattice.RawFrame
+	(*Capability)(nil),   // 1: lattice.Capability
 	(*Hello)(nil),        // 2: lattice.Hello
 	(*HelloAck)(nil),     // 3: lattice.HelloAck
 	(*Heartbeat)(nil),    // 4: lattice.Heartbeat
@@ -947,11 +1049,12 @@ var file_proto_frames_proto_goTypes = []any{
 	(*Pong)(nil),         // 15: lattice.Pong
 }
 var file_proto_frames_proto_depIdxs = []int32{
-	0, // [0:0] is the sub-list for method output_type
-	0, // [0:0] is the sub-list for method input_type
-	0, // [0:0] is the sub-list for extension type_name
-	0, // [0:0] is the sub-list for extension extendee
-	0, // [0:0] is the sub-list for field type_name
+	1, // 0: lattice.Hello.capabilities:type_name -> lattice.Capability
+	1, // [1:1] is the sub-list for method output_type
+	1, // [1:1] is the sub-list for method input_type
+	1, // [1:1] is the sub-list for extension type_name
+	1, // [1:1] is the sub-list for extension extendee
+	0, // [0:1] is the sub-list for field type_name
 }
 
 func init() { file_proto_frames_proto_init() }

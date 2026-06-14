@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package lattice;
+
+option go_package = "lattice/proto";
+
+import "google/protobuf/descriptor.proto";
+
+// RangeOptions constrains the numeric or enum value of a field.
+message RangeOptions {
+  float min = 1;
+  float max = 2;
+}
+
+extend google.protobuf.FieldOptions {
+  // lattice.range constrains the min/max value of a numeric or enum field.
+  RangeOptions range = 50001;
+  // lattice.max_length constrains the maximum byte length of a string field.
+  uint32 max_length = 50002;
+  // lattice.required marks a field as required (must be present in every payload).
+  // IMPORTANT: The field MUST be declared `optional` in proto3 so that presence
+  // is tracked explicitly. Without `optional`, Has() cannot distinguish a missing
+  // field from one set to its zero value (0, false, ""), causing valid zero payloads
+  // to be incorrectly rejected at validation time.
+  bool required = 50003;
+}

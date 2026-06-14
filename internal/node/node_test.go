@@ -1,20 +1,28 @@
 package node_test
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/tls"
+	"encoding/base64"
+	"encoding/json"
 	"log/slog"
 	"net"
+	"net/http"
 	"sync"
 	"testing"
 	"time"
 
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protodesc"
+	"google.golang.org/protobuf/types/descriptorpb"
 
 	"lattice/internal/acl"
+	"lattice/internal/admin"
 	"lattice/internal/handshake"
 	"lattice/internal/node"
+	"lattice/internal/schema"
 	"lattice/internal/wire"
 	pb "lattice/proto"
 )
@@ -23,13 +31,14 @@ import (
 
 // newServer starts an in-process TLS server and returns the address, the live
 // *node.Server (for adding ACL rules), and a stop function.
-func newServer(t *testing.T, heartbeatInterval uint32) (addr string, srv *node.Server, stop func()) {
+// tokenTTL overrides the default 5-minute resume-token TTL (useful in tests).
+func newServer(t *testing.T, heartbeatInterval uint32, tokenTTL ...time.Duration) (addr string, srv *node.Server, stop func()) {
 	t.Helper()
 	_, serverPriv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv = node.New(slog.New(slog.NewTextHandler(nil, &slog.HandlerOptions{Level: slog.LevelError})), serverPriv, heartbeatInterval)
+	srv = node.New(slog.New(slog.NewTextHandler(nil, &slog.HandlerOptions{Level: slog.LevelError})), serverPriv, heartbeatInterval, tokenTTL...)
 
 	cert, err := wire.GenerateSelfSignedCert()
 	if err != nil {
@@ -72,7 +81,7 @@ func connect(t *testing.T, addr string) *testClient {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := handshake.DoClient(conn, priv); err != nil {
+	if _, err := handshake.DoClient(conn, priv, nil, nil); err != nil {
 		conn.Close()
 		t.Fatalf("handshake: %v", err)
 	}
@@ -763,7 +772,7 @@ func TestCallTwoSimultaneous(t *testing.T) {
 
 	// B receives both forwarded REQUESTs (collect by correlation ID).
 	reqs := make(map[string]bool)
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		frame := b.recv(t, 2*time.Second)
 		if frame.Type != pb.FrameType_FRAME_TYPE_REQUEST {
 			t.Fatalf("B: expected REQUEST, got %v", frame.Type)
@@ -782,7 +791,7 @@ func TestCallTwoSimultaneous(t *testing.T) {
 
 	// A receives both responses; check payloads by correlation ID.
 	resps := make(map[string]string)
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		frame := a.recv(t, 2*time.Second)
 		if frame.Type != pb.FrameType_FRAME_TYPE_RESPONSE {
 			t.Fatalf("A: expected RESPONSE, got %v", frame.Type)
@@ -864,6 +873,86 @@ func TestCallACLDenied(t *testing.T) {
 	}
 }
 
+// ─── Session 1 new tests ──────────────────────────────────────────────────────
+
+// TestHandshakeDeadlineReapsStuckClient: a client that completes TLS but never
+// sends HELLO is reaped within ~10 seconds (Decision #17).
+func TestHandshakeDeadlineReapsStuckClient(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping deadline test in -short mode (~10s)")
+	}
+	addr, _, stop := newServer(t, 30)
+	defer stop()
+
+	conn, err := tls.Dial("tcp", addr, &tls.Config{
+		InsecureSkipVerify: true,
+		MinVersion:         tls.VersionTLS13,
+	})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	// Complete TLS handshake but never send HELLO.
+	if err := conn.Handshake(); err != nil {
+		t.Fatalf("tls handshake: %v", err)
+	}
+
+	// Server should close the connection (deadline) within ~10s.
+	// We allow 12s to absorb scheduling jitter.
+	conn.SetReadDeadline(time.Now().Add(12 * time.Second))
+	_, err = wire.Read(conn)
+	conn.SetReadDeadline(time.Time{})
+	if err == nil {
+		t.Fatal("expected connection to be closed by server deadline")
+	}
+}
+
+// TestTypedCapabilitiesNodeRoundTrip: capabilities declared in HELLO survive
+// through DoServer → entity registry → EntityJoined system event (Decision #7).
+func TestTypedCapabilitiesNodeRoundTrip(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	// watcher subscribes to system events before the capable client joins.
+	watcher := connect(t, addr)
+	defer watcher.close()
+	srv.AddRule(acl.Rule{
+		IdentityPattern: acl.EncodeIdentity(watcher.pub),
+		Action:          acl.ActionSubscribe,
+		SubjectPattern:  "lattice.system.>",
+		Effect:          acl.Allow,
+		Priority:        10,
+	})
+	watcher.subscribe(t, "lattice.system.>")
+
+	// Connect a client that declares typed capabilities.
+	_, joinerPriv, _ := ed25519.GenerateKey(rand.Reader)
+	tlsConn, err := tls.Dial("tcp", addr, &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer tlsConn.Close()
+
+	caps := []*pb.Capability{{Name: "sensor"}, {Name: "actuator"}}
+	if _, err := handshake.DoClient(tlsConn, joinerPriv, nil, caps); err != nil {
+		t.Fatalf("handshake: %v", err)
+	}
+
+	// Watcher receives EntityJoined with typed capabilities.
+	payload := watcher.expectDeliver(t, "lattice.system.entity.joined")
+	var evt pb.EntityJoined
+	if err := proto.Unmarshal(payload, &evt); err != nil {
+		t.Fatalf("unmarshal EntityJoined: %v", err)
+	}
+	if len(evt.Capabilities) != 2 {
+		t.Fatalf("expected 2 capabilities in EntityJoined, got %d", len(evt.Capabilities))
+	}
+	if evt.Capabilities[0].Name != "sensor" || evt.Capabilities[1].Name != "actuator" {
+		t.Fatalf("capability names mismatch: %v", evt.Capabilities)
+	}
+}
+
 // Two entities join simultaneously → two separate joined events.
 func TestTwoEntitiesJoinSimultaneously(t *testing.T) {
 	addr, srv, stop := newServer(t, 30)
@@ -881,7 +970,7 @@ func TestTwoEntitiesJoinSimultaneously(t *testing.T) {
 	watcher.subscribe(t, "lattice.system.>")
 
 	var wg sync.WaitGroup
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -908,5 +997,1199 @@ func TestTwoEntitiesJoinSimultaneously(t *testing.T) {
 	}
 	if joined < 2 {
 		t.Fatalf("expected 2 joined events, got %d", joined)
+	}
+}
+
+// ─── Session 3: delivery-time ACL (Decision #11) ─────────────────────────────
+
+// TestDeliveryTimeACLBlocksWildcardSubscriber is the core Session 3 regression:
+// subscribe-time Allow passes for a broad wildcard pattern, but a higher-priority
+// deny on the concrete published subject must silently drop the DELIVER frame.
+func TestDeliveryTimeACLBlocksWildcardSubscriber(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	publisher := connect(t, addr)
+	defer publisher.close()
+	subscriber := connect(t, addr)
+	defer subscriber.close()
+
+	pubID := acl.EncodeIdentity(publisher.pub)
+	subID := acl.EncodeIdentity(subscriber.pub)
+
+	srv.AddRule(acl.Rule{IdentityPattern: pubID, Action: acl.ActionPublish, SubjectPattern: "home.sensor.temperature", Effect: acl.Allow, Priority: 10})
+	// Broad subscribe allow at p10 — subscribe-time check for "home.>" passes.
+	srv.AddRule(acl.Rule{IdentityPattern: subID, Action: acl.ActionSubscribe, SubjectPattern: "home.>", Effect: acl.Allow, Priority: 10})
+	// High-priority deny for the specific concrete subject — fires at delivery time.
+	srv.AddRule(acl.Rule{IdentityPattern: subID, Action: acl.ActionSubscribe, SubjectPattern: "home.sensor.temperature", Effect: acl.Deny, Priority: 100})
+
+	subscriber.subscribe(t, "home.>") // subscribe-time check passes — deny does not match "home.>"
+
+	publisher.publish(t, "home.sensor.temperature", tempReading(22.5))
+
+	// Delivery-time deny must silently drop the frame; no DELIVER arrives.
+	subscriber.expectNoDeliver(t, 200*time.Millisecond)
+}
+
+// TestSystemEventDeliveryDeny verifies that a high-priority deny on a specific
+// system-event subject prevents delivery even when the broader subscription to
+// "lattice.system.>" was granted at subscribe time.
+func TestSystemEventDeliveryDeny(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	watcher := connect(t, addr)
+	defer watcher.close()
+
+	watcherID := acl.EncodeIdentity(watcher.pub)
+	// Broad allow at p10 — subscribe-time check for "lattice.system.>" passes.
+	srv.AddRule(acl.Rule{IdentityPattern: watcherID, Action: acl.ActionSubscribe, SubjectPattern: "lattice.system.>", Effect: acl.Allow, Priority: 10})
+	// High-priority deny for entity.joined only — fires at delivery time.
+	srv.AddRule(acl.Rule{IdentityPattern: watcherID, Action: acl.ActionSubscribe, SubjectPattern: "lattice.system.entity.joined", Effect: acl.Deny, Priority: 100})
+
+	watcher.subscribe(t, "lattice.system.>") // subscribe-time check passes
+
+	// New connection triggers entity.joined — watcher must not receive it.
+	joiner := connect(t, addr)
+	defer joiner.close()
+
+	watcher.expectNoDeliver(t, 300*time.Millisecond)
+}
+
+// ─── Session 4: session lifecycle correctness (Decisions #12, #6, #8) ─────────
+
+// connectWithKey connects and authenticates using the supplied keypair instead
+// of generating a fresh one. Used to simulate same-identity reconnects.
+func connectWithKey(t *testing.T, addr string, pub ed25519.PublicKey, priv ed25519.PrivateKey) *testClient {
+	t.Helper()
+	conn, err := tls.Dial("tcp", addr, &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := handshake.DoClient(conn, priv, nil, nil); err != nil {
+		conn.Close()
+		t.Fatalf("connectWithKey handshake: %v", err)
+	}
+	return &testClient{conn: conn, pub: pub, priv: priv}
+}
+
+// TestReconnectEvictsOldSession verifies that when the same pubkey reconnects,
+// the server closes the old connection and the new session remains fully live.
+func TestReconnectEvictsOldSession(t *testing.T) {
+	addr, _, stop := newServer(t, 30)
+	defer stop()
+
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+
+	c1 := connectWithKey(t, addr, pub, priv)
+
+	// c2 connecting with the same key must evict c1.
+	c2 := connectWithKey(t, addr, pub, priv)
+	defer c2.close()
+
+	// Give the server time to close c1's connection.
+	time.Sleep(50 * time.Millisecond)
+
+	// c2 must still be alive.
+	c2.send(pb.FrameType_FRAME_TYPE_HEARTBEAT, nil)
+	f := c2.recv(t, time.Second)
+	if f.Type != pb.FrameType_FRAME_TYPE_HEARTBEAT_ACK {
+		t.Fatalf("c2: expected HEARTBEAT_ACK after reconnect, got %v", f.Type)
+	}
+
+	// c1's server-side connection must have been closed by the eviction.
+	c1.conn.(*tls.Conn).SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	_, err := wire.Read(c1.conn)
+	if err == nil {
+		t.Fatal("c1: expected connection closed by server after eviction, but read succeeded")
+	}
+	c1.conn.Close()
+}
+
+// TestAtLeastOnceJoinOnReconnect verifies that reconnecting the same pubkey
+// produces two entity.joined events and zero entity.left events — the eviction
+// does not publish a spurious left, and the new session announces itself.
+func TestAtLeastOnceJoinOnReconnect(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	watcher := connect(t, addr)
+	defer watcher.close()
+	srv.AddRule(acl.Rule{
+		IdentityPattern: acl.EncodeIdentity(watcher.pub),
+		Action:          acl.ActionSubscribe,
+		SubjectPattern:  "lattice.system.>",
+		Effect:          acl.Allow,
+		Priority:        10,
+	})
+	watcher.subscribe(t, "lattice.system.>")
+
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	c1 := connectWithKey(t, addr, pub, priv)
+	c2 := connectWithKey(t, addr, pub, priv)
+	defer c2.close()
+	c1.conn.Close()
+
+	// Collect all system events delivered within 1 second.
+	joined, left := 0, 0
+	watcher.conn.(*tls.Conn).SetReadDeadline(time.Now().Add(time.Second))
+	for {
+		frame, err := wire.Read(watcher.conn)
+		if err != nil {
+			break
+		}
+		if frame.Type != pb.FrameType_FRAME_TYPE_DELIVER {
+			continue
+		}
+		var d pb.Deliver
+		proto.Unmarshal(frame.Payload, &d)
+		switch d.Subject {
+		case "lattice.system.entity.joined":
+			joined++
+		case "lattice.system.entity.left":
+			left++
+		}
+	}
+
+	if joined < 2 {
+		t.Fatalf("expected ≥ 2 entity.joined (c1 + c2 reconnect), got %d", joined)
+	}
+	if left != 0 {
+		t.Fatalf("expected 0 entity.left (eviction suppresses it), got %d", left)
+	}
+}
+
+// TestResponderVerification verifies that a RESPONSE from an entity that is not
+// the intended target is rejected with NOT_AUTHORIZED (Decision #6), and that
+// the pending call remains valid so the legitimate target can still respond.
+func TestResponderVerification(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	a := connect(t, addr)
+	defer a.close()
+	b := connect(t, addr)
+	defer b.close()
+	c := connect(t, addr)
+	defer c.close()
+
+	allowCall(t, srv, a.pub, b.pub)
+
+	corrID := "responder-verify"
+	a.send(pb.FrameType_FRAME_TYPE_REQUEST, &pb.Request{
+		CorrelationId: corrID,
+		TargetPubkey:  b.pub,
+		Payload:       []byte("ping"),
+		TimeoutMs:     5000,
+	})
+
+	// B receives the forwarded REQUEST.
+	b.expectFrame(t, pb.FrameType_FRAME_TYPE_REQUEST)
+
+	// C (imposter) sends RESPONSE with A's correlation ID — must be rejected.
+	c.send(pb.FrameType_FRAME_TYPE_RESPONSE, &pb.Response{
+		CorrelationId: corrID,
+		Payload:       []byte("spoofed"),
+	})
+	e := c.expectError(t)
+	if e.Code != "NOT_AUTHORIZED" {
+		t.Fatalf("expected NOT_AUTHORIZED from imposter, got %q", e.Code)
+	}
+
+	// The call must still be pending — B responds legitimately.
+	b.send(pb.FrameType_FRAME_TYPE_RESPONSE, &pb.Response{
+		CorrelationId: corrID,
+		Payload:       []byte("real-pong"),
+	})
+	frame := a.recv(t, 2*time.Second)
+	if frame.Type != pb.FrameType_FRAME_TYPE_RESPONSE {
+		t.Fatalf("a: expected RESPONSE from B, got %v", frame.Type)
+	}
+	var resp pb.Response
+	proto.Unmarshal(frame.Payload, &resp)
+	if string(resp.Payload) != "real-pong" {
+		t.Fatalf("a: response payload: got %q, want %q", resp.Payload, "real-pong")
+	}
+}
+
+// TestEvictionInvalidatesCalls verifies that pending calls targeting an evicted
+// session are cancelled with TARGET_DISCONNECTED (Decision #6 ↔ #12 coupling).
+func TestEvictionInvalidatesCalls(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	a := connect(t, addr)
+	defer a.close()
+
+	bPub, bPriv, _ := ed25519.GenerateKey(rand.Reader)
+	b1 := connectWithKey(t, addr, bPub, bPriv)
+
+	allowCall(t, srv, a.pub, bPub)
+
+	corrID := "evict-invalidate"
+	a.send(pb.FrameType_FRAME_TYPE_REQUEST, &pb.Request{
+		CorrelationId: corrID,
+		TargetPubkey:  bPub,
+		Payload:       []byte("ping"),
+		TimeoutMs:     30000, // long — must not expire before eviction fires
+	})
+
+	// Drain b1's REQUEST to confirm the call is registered before eviction.
+	b1.expectFrame(t, pb.FrameType_FRAME_TYPE_REQUEST)
+
+	// B reconnects with the same key — evicts b1 and invalidates the pending call.
+	b2 := connectWithKey(t, addr, bPub, bPriv)
+	defer b2.close()
+	b1.conn.Close()
+
+	// A must receive TARGET_DISCONNECTED.
+	e := a.expectError(t)
+	if e.Code != "TARGET_DISCONNECTED" {
+		t.Fatalf("expected TARGET_DISCONNECTED, got %q", e.Code)
+	}
+}
+
+// TestDisconnectTeardown verifies that a DISCONNECT frame triggers an immediate
+// entity.left event, rather than waiting up to 3× heartbeat_interval (Decision #8).
+func TestDisconnectTeardown(t *testing.T) {
+	addr, srv, stop := newServer(t, 30) // 30-second interval — left would take ~90s without fix
+	defer stop()
+
+	watcher := connect(t, addr)
+	defer watcher.close()
+	srv.AddRule(acl.Rule{
+		IdentityPattern: acl.EncodeIdentity(watcher.pub),
+		Action:          acl.ActionSubscribe,
+		SubjectPattern:  "lattice.system.>",
+		Effect:          acl.Allow,
+		Priority:        10,
+	})
+	watcher.subscribe(t, "lattice.system.>")
+
+	c := connect(t, addr)
+	defer c.close()
+
+	// Drain entity.joined for c before testing the disconnect path.
+	watcher.recv(t, 2*time.Second)
+
+	// c signals graceful shutdown.
+	c.send(pb.FrameType_FRAME_TYPE_DISCONNECT, nil)
+
+	// entity.left must arrive well within the 30-second heartbeat interval.
+	frame := watcher.recv(t, 2*time.Second)
+	if frame.Type != pb.FrameType_FRAME_TYPE_DELIVER {
+		t.Fatalf("expected DELIVER after DISCONNECT, got %v", frame.Type)
+	}
+	var d pb.Deliver
+	proto.Unmarshal(frame.Payload, &d)
+	if d.Subject != "lattice.system.entity.left" {
+		t.Fatalf("expected entity.left after DISCONNECT, got %q", d.Subject)
+	}
+}
+
+// ─── Session 5: message provenance & correlation (Decisions #4, #18, #5) ──────
+
+// expectFullDeliver receives a DELIVER frame and returns the full decoded Deliver
+// message including provenance fields (id, publisher_identity, published_at, schema_version).
+func (c *testClient) expectFullDeliver(t *testing.T, wantSubject string) *pb.Deliver {
+	t.Helper()
+	frame := c.recv(t, 2*time.Second)
+	if frame.Type != pb.FrameType_FRAME_TYPE_DELIVER {
+		t.Fatalf("expected DELIVER, got %v", frame.Type)
+	}
+	var d pb.Deliver
+	if err := proto.Unmarshal(frame.Payload, &d); err != nil {
+		t.Fatalf("unmarshal DELIVER: %v", err)
+	}
+	if d.Subject != wantSubject {
+		t.Fatalf("DELIVER subject: got %q, want %q", d.Subject, wantSubject)
+	}
+	return &d
+}
+
+// TestMonotonicDeliverID verifies that sequential publishes on the same subject
+// produce monotonically increasing IDs starting at 1.
+func TestMonotonicDeliverID(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	sub := connect(t, addr)
+	defer sub.close()
+	pub := connect(t, addr)
+	defer pub.close()
+	allowAll(t, srv, sub.pub)
+	allowAll(t, srv, pub.pub)
+
+	sub.subscribe(t, "home.sensor.temperature")
+
+	for i := range 3 {
+		pub.publish(t, "home.sensor.temperature", tempReading(float32(20+i)))
+		d := sub.expectFullDeliver(t, "home.sensor.temperature")
+		want := uint64(i + 1)
+		if d.Id != want {
+			t.Fatalf("publish %d: DELIVER.id = %d, want %d", i+1, d.Id, want)
+		}
+	}
+}
+
+// TestPerSubjectIsolation verifies that per-subject counters are independent:
+// home.sensor.temperature and home.light.command each start at 1.
+func TestPerSubjectIsolation(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	sub := connect(t, addr)
+	defer sub.close()
+	pub := connect(t, addr)
+	defer pub.close()
+	id := acl.EncodeIdentity(pub.pub)
+	subID := acl.EncodeIdentity(sub.pub)
+	srv.AddRule(acl.Rule{IdentityPattern: id, Action: acl.ActionPublish, SubjectPattern: "home.>", Effect: acl.Allow, Priority: 10})
+	srv.AddRule(acl.Rule{IdentityPattern: subID, Action: acl.ActionSubscribe, SubjectPattern: "home.>", Effect: acl.Allow, Priority: 10})
+
+	sub.subscribe(t, "home.>")
+
+	pub.publish(t, "home.sensor.temperature", tempReading(20))
+	d1 := sub.expectFullDeliver(t, "home.sensor.temperature")
+
+	pub.publish(t, "home.light.command", lightCmd(pb.LightAction_LIGHT_ACTION_ON))
+	d2 := sub.expectFullDeliver(t, "home.light.command")
+
+	if d1.Id != 1 {
+		t.Fatalf("temperature: DELIVER.id = %d, want 1", d1.Id)
+	}
+	if d2.Id != 1 {
+		t.Fatalf("light.command: DELIVER.id = %d, want 1", d2.Id)
+	}
+}
+
+// TestPublisherIdentityStamped verifies that Deliver.publisher_identity is
+// server-stamped with the actual publisher's base32 pubkey.
+func TestPublisherIdentityStamped(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	sub := connect(t, addr)
+	defer sub.close()
+	pub := connect(t, addr)
+	defer pub.close()
+	allowAll(t, srv, sub.pub)
+	allowAll(t, srv, pub.pub)
+
+	sub.subscribe(t, "home.sensor.temperature")
+	pub.publish(t, "home.sensor.temperature", tempReading(22))
+
+	d := sub.expectFullDeliver(t, "home.sensor.temperature")
+	want := acl.EncodeIdentity(pub.pub)
+	if d.PublisherIdentity != want {
+		t.Fatalf("publisher_identity: got %q, want %q", d.PublisherIdentity, want)
+	}
+}
+
+// TestTimestampPopulated verifies that Deliver.published_at is a non-zero Unix
+// millisecond timestamp within the observed send window.
+func TestTimestampPopulated(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	sub := connect(t, addr)
+	defer sub.close()
+	pub := connect(t, addr)
+	defer pub.close()
+	allowAll(t, srv, sub.pub)
+	allowAll(t, srv, pub.pub)
+
+	before := time.Now().UnixMilli()
+	sub.subscribe(t, "home.sensor.temperature")
+	pub.publish(t, "home.sensor.temperature", tempReading(22))
+	d := sub.expectFullDeliver(t, "home.sensor.temperature")
+	after := time.Now().UnixMilli()
+
+	if d.PublishedAt < before || d.PublishedAt > after {
+		t.Fatalf("published_at %d not in range [%d, %d]", d.PublishedAt, before, after)
+	}
+}
+
+// TestRequestCallerIdentity verifies that the target receives caller_identity
+// and received_at server-stamped onto the forwarded REQUEST (Decision #18).
+func TestRequestCallerIdentity(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	a := connect(t, addr)
+	defer a.close()
+	b := connect(t, addr)
+	defer b.close()
+
+	allowCall(t, srv, a.pub, b.pub)
+
+	a.send(pb.FrameType_FRAME_TYPE_REQUEST, &pb.Request{
+		CorrelationId: "caller-identity-test",
+		TargetPubkey:  b.pub,
+		Payload:       []byte("ping"),
+		TimeoutMs:     5000,
+	})
+
+	frame := b.expectFrame(t, pb.FrameType_FRAME_TYPE_REQUEST)
+	var req pb.Request
+	proto.Unmarshal(frame.Payload, &req)
+
+	want := acl.EncodeIdentity(a.pub)
+	if req.CallerIdentity != want {
+		t.Fatalf("caller_identity: got %q, want %q", req.CallerIdentity, want)
+	}
+	if req.ReceivedAt == 0 {
+		t.Fatal("received_at is zero")
+	}
+}
+
+// TestCallerIdentityNotSpoofable verifies that a client-supplied caller_identity
+// is overwritten by the server before forwarding (Decision #18).
+func TestCallerIdentityNotSpoofable(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	a := connect(t, addr)
+	defer a.close()
+	b := connect(t, addr)
+	defer b.close()
+
+	allowCall(t, srv, a.pub, b.pub)
+
+	// A supplies a fake caller_identity — server must overwrite it.
+	a.send(pb.FrameType_FRAME_TYPE_REQUEST, &pb.Request{
+		CorrelationId:  "spoof-caller",
+		TargetPubkey:   b.pub,
+		Payload:        []byte("ping"),
+		TimeoutMs:      5000,
+		CallerIdentity: "FAKEFAKEFAKEFAKE",
+	})
+
+	frame := b.expectFrame(t, pb.FrameType_FRAME_TYPE_REQUEST)
+	var req pb.Request
+	proto.Unmarshal(frame.Payload, &req)
+
+	want := acl.EncodeIdentity(a.pub)
+	if req.CallerIdentity != want {
+		t.Fatalf("caller_identity not overwritten: got %q, want %q", req.CallerIdentity, want)
+	}
+}
+
+// TestErrorRefID verifies that Error.ref_id echoes the Publish.message_id when
+// a publish fails (Decision #5).
+func TestErrorRefID(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	pub := connect(t, addr)
+	defer pub.close()
+	allowAll(t, srv, pub.pub)
+
+	msgID := "my-message-123"
+	bad, _ := proto.Marshal(&pb.TemperatureReading{Value: func() *float32 { v := float32(999); return &v }()})
+	pub.send(pb.FrameType_FRAME_TYPE_PUBLISH, &pb.Publish{
+		Subject:   "home.sensor.temperature",
+		Payload:   bad,
+		MessageId: msgID,
+	})
+
+	e := pub.expectError(t)
+	if e.Code != "SCHEMA_ERROR" {
+		t.Fatalf("expected SCHEMA_ERROR, got %q", e.Code)
+	}
+	if e.RefId != msgID {
+		t.Fatalf("Error.ref_id: got %q, want %q", e.RefId, msgID)
+	}
+}
+
+// TestTimeoutErrorRefID verifies that Error.ref_id echoes the correlation_id
+// when a call times out (Decision #5).
+func TestTimeoutErrorRefID(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	a := connect(t, addr)
+	defer a.close()
+	b := connect(t, addr)
+	defer b.close()
+
+	allowCall(t, srv, a.pub, b.pub)
+
+	corrID := "timeout-ref-test"
+	a.send(pb.FrameType_FRAME_TYPE_REQUEST, &pb.Request{
+		CorrelationId: corrID,
+		TargetPubkey:  b.pub,
+		Payload:       []byte("hello"),
+		TimeoutMs:     100,
+	})
+
+	// B does not respond — wait for timeout ERROR.
+	a.conn.(*tls.Conn).SetReadDeadline(time.Now().Add(3 * time.Second))
+	frame, err := wire.Read(a.conn)
+	if err != nil {
+		t.Fatalf("waiting for timeout ERROR: %v", err)
+	}
+	a.conn.(*tls.Conn).SetReadDeadline(time.Time{})
+
+	if frame.Type != pb.FrameType_FRAME_TYPE_ERROR {
+		t.Fatalf("expected ERROR, got %v", frame.Type)
+	}
+	var e pb.Error
+	proto.Unmarshal(frame.Payload, &e)
+	if e.Code != "TIMEOUT" {
+		t.Fatalf("expected TIMEOUT, got %q", e.Code)
+	}
+	if e.RefId != corrID {
+		t.Fatalf("Error.ref_id: got %q, want %q", e.RefId, corrID)
+	}
+}
+
+// ─── Session 6: token-based session resume (Decision #2) ─────────────────────
+
+// connectResume dials addr with a specific keypair and optional resume token.
+// It returns the testClient and the ClientSession (which carries the new token).
+func connectResume(t *testing.T, addr string, pub ed25519.PublicKey, priv ed25519.PrivateKey, token []byte) (*testClient, *handshake.ClientSession) {
+	t.Helper()
+	conn, err := tls.Dial("tcp", addr, &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cs, err := handshake.DoClient(conn, priv, nil, nil, token)
+	if err != nil {
+		conn.Close()
+		t.Fatalf("connectResume: %v", err)
+	}
+	return &testClient{conn: conn, pub: pub, priv: priv}, cs
+}
+
+// dialAndSendCraftedHello dials addr, completes TLS, sends hello directly (bypassing
+// DoClient), and returns the first frame the server sends back. Used to test
+// bad-signature paths without going through the full client handshake.
+func dialAndSendCraftedHello(t *testing.T, addr string, hello *pb.Hello) *wire.Frame {
+	t.Helper()
+	conn, err := tls.Dial("tcp", addr, &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	payload, _ := proto.Marshal(hello)
+	if err := wire.Write(conn, pb.FrameType_FRAME_TYPE_HELLO, payload); err != nil {
+		t.Fatalf("dialAndSendCraftedHello write: %v", err)
+	}
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	frame, err := wire.Read(conn)
+	if err != nil {
+		t.Fatalf("dialAndSendCraftedHello read: %v", err)
+	}
+	return frame
+}
+
+// TestResumeRestoresSubscriptions verifies that a token-based resume restores
+// subscriptions without firing entity.joined (Decision #2).
+func TestResumeRestoresSubscriptions(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	watcher := connect(t, addr)
+	defer watcher.close()
+	allowAll(t, srv, watcher.pub)
+	watcher.subscribe(t, "lattice.system.>")
+
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	allowAll(t, srv, pub)
+
+	// E connects, subscribes, then disconnects cleanly.
+	e1, cs1 := connectResume(t, addr, pub, priv, nil)
+	watcher.expectDeliver(t, "lattice.system.entity.joined")
+	e1.subscribe(t, "home.sensor.temperature")
+	token := cs1.SessionToken
+	e1.close()
+	watcher.expectDeliver(t, "lattice.system.entity.left")
+	time.Sleep(50 * time.Millisecond) // ensure teardownSession saved the token
+
+	// E resumes — no entity.joined should fire.
+	e2, _ := connectResume(t, addr, pub, priv, token)
+	defer e2.close()
+	watcher.expectNoDeliver(t, 300*time.Millisecond)
+
+	// Subscription was restored: a publisher's message reaches E2.
+	publisher := connect(t, addr)
+	defer publisher.close()
+	allowAll(t, srv, publisher.pub)
+	publisher.publish(t, "home.sensor.temperature", tempReading(21.0))
+	e2.expectDeliver(t, "home.sensor.temperature")
+}
+
+// TestTokenRotationPreventsReuse verifies that a consumed token cannot be
+// used a second time (Decision #2).
+func TestTokenRotationPreventsReuse(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	watcher := connect(t, addr)
+	defer watcher.close()
+	allowAll(t, srv, watcher.pub)
+	watcher.subscribe(t, "lattice.system.>")
+
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	allowAll(t, srv, pub)
+
+	// First connect → get T1.
+	e1, cs1 := connectResume(t, addr, pub, priv, nil)
+	watcher.expectDeliver(t, "lattice.system.entity.joined")
+	t1 := cs1.SessionToken
+	e1.close()
+	watcher.expectDeliver(t, "lattice.system.entity.left")
+	time.Sleep(50 * time.Millisecond)
+
+	// Second connect with T1 → resume (T1 consumed, T2 issued).
+	e2, _ := connectResume(t, addr, pub, priv, t1)
+	watcher.expectNoDeliver(t, 200*time.Millisecond) // resume: no entity.joined
+	e2.close()
+	watcher.expectDeliver(t, "lattice.system.entity.left")
+	time.Sleep(50 * time.Millisecond)
+
+	// Third connect with T1 again (already consumed) → full registration.
+	e3, _ := connectResume(t, addr, pub, priv, t1)
+	defer e3.close()
+	watcher.expectDeliver(t, "lattice.system.entity.joined")
+}
+
+// TestResumeRequiresCorrectSignature verifies that a zero/invalid signature is
+// rejected before the token is looked up, so the token remains unconsumed
+// (Decision #2).
+func TestResumeRequiresCorrectSignature(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	watcher := connect(t, addr)
+	defer watcher.close()
+	allowAll(t, srv, watcher.pub)
+	watcher.subscribe(t, "lattice.system.>")
+
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	allowAll(t, srv, pub)
+
+	e1, cs1 := connectResume(t, addr, pub, priv, nil)
+	watcher.expectDeliver(t, "lattice.system.entity.joined")
+	token := cs1.SessionToken
+	e1.close()
+	watcher.expectDeliver(t, "lattice.system.entity.left")
+	time.Sleep(50 * time.Millisecond)
+
+	// Zero signature + valid token → INVALID_SIGNATURE; token NOT consumed.
+	frame := dialAndSendCraftedHello(t, addr, &pb.Hello{
+		Pubkey:          pub,
+		Signature:       make([]byte, 64), // zeroed — invalid
+		ProtocolVersion: handshake.ProtocolVersion,
+		ResumeToken:     token,
+	})
+	if frame.Type != pb.FrameType_FRAME_TYPE_ERROR {
+		t.Fatalf("expected ERROR, got %v", frame.Type)
+	}
+	var sigErr pb.Error
+	proto.Unmarshal(frame.Payload, &sigErr)
+	if sigErr.Code != "INVALID_SIGNATURE" {
+		t.Fatalf("expected INVALID_SIGNATURE, got %q", sigErr.Code)
+	}
+
+	// Token is still valid — correct reconnect must succeed as a resume.
+	e2, _ := connectResume(t, addr, pub, priv, token)
+	defer e2.close()
+	watcher.expectNoDeliver(t, 200*time.Millisecond) // resume: no entity.joined
+}
+
+// TestResumeTokenPubkeyMismatch verifies that a token issued for key A cannot
+// be used to resume as key B (Decision #2).
+func TestResumeTokenPubkeyMismatch(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	watcher := connect(t, addr)
+	defer watcher.close()
+	allowAll(t, srv, watcher.pub)
+	watcher.subscribe(t, "lattice.system.>")
+
+	pubA, privA, _ := ed25519.GenerateKey(rand.Reader)
+	pubB, privB, _ := ed25519.GenerateKey(rand.Reader)
+	allowAll(t, srv, pubA)
+	allowAll(t, srv, pubB)
+
+	// A connects, gets T_A, disconnects.
+	eA, csA := connectResume(t, addr, pubA, privA, nil)
+	watcher.expectDeliver(t, "lattice.system.entity.joined")
+	tokenA := csA.SessionToken
+	eA.close()
+	watcher.expectDeliver(t, "lattice.system.entity.left")
+	time.Sleep(50 * time.Millisecond)
+
+	// B presents T_A → pubkey mismatch → full registration as B.
+	eB, _ := connectResume(t, addr, pubB, privB, tokenA)
+	defer eB.close()
+	payload := watcher.expectDeliver(t, "lattice.system.entity.joined")
+	var joined pb.EntityJoined
+	proto.Unmarshal(payload, &joined)
+	if acl.EncodeIdentity(joined.Pubkey) != acl.EncodeIdentity(pubB) {
+		t.Fatalf("entity.joined is not for B — pubkey mismatch should have triggered full registration")
+	}
+}
+
+// TestExpiredTokenFallsBack verifies that a token past its TTL causes a full
+// registration rather than a resume (Decision #2).
+func TestExpiredTokenFallsBack(t *testing.T) {
+	addr, srv, stop := newServer(t, 30, 10*time.Millisecond) // very short TTL
+	defer stop()
+
+	watcher := connect(t, addr)
+	defer watcher.close()
+	allowAll(t, srv, watcher.pub)
+	watcher.subscribe(t, "lattice.system.>")
+
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	allowAll(t, srv, pub)
+
+	e1, cs1 := connectResume(t, addr, pub, priv, nil)
+	watcher.expectDeliver(t, "lattice.system.entity.joined")
+	token := cs1.SessionToken
+	e1.close()
+	watcher.expectDeliver(t, "lattice.system.entity.left")
+
+	// Wait for the token to expire.
+	time.Sleep(50 * time.Millisecond)
+
+	// Expired token → full registration.
+	e2, _ := connectResume(t, addr, pub, priv, token)
+	defer e2.close()
+	watcher.expectDeliver(t, "lattice.system.entity.joined")
+}
+
+// TestFreshConnectWithoutTokenUnchanged verifies that the existing full-registration
+// path is not affected by the resume feature (regression).
+func TestFreshConnectWithoutTokenUnchanged(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	watcher := connect(t, addr)
+	defer watcher.close()
+	allowAll(t, srv, watcher.pub)
+	watcher.subscribe(t, "lattice.system.>")
+
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	allowAll(t, srv, pub)
+
+	// Fresh connect without any token → normal registration.
+	e, _ := connectResume(t, addr, pub, priv, nil)
+	defer e.close()
+	watcher.expectDeliver(t, "lattice.system.entity.joined")
+
+	// Subscribe and receive normally.
+	e.subscribe(t, "home.sensor.temperature")
+	publisher := connect(t, addr)
+	defer publisher.close()
+	allowAll(t, srv, publisher.pub)
+	watcher.expectDeliver(t, "lattice.system.entity.joined") // publisher joined
+	publisher.publish(t, "home.sensor.temperature", tempReading(20.0))
+	e.expectDeliver(t, "home.sensor.temperature")
+}
+
+// TestDurableReplayHookNoOp verifies that the durable-replay stub is invoked
+// during a resume and leaves the connection fully functional (Decision #2,
+// v0.1.1 stub).
+func TestDurableReplayHookNoOp(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	allowAll(t, srv, pub)
+
+	e1, cs1 := connectResume(t, addr, pub, priv, nil)
+	e1.subscribe(t, "home.sensor.temperature")
+	token := cs1.SessionToken
+	e1.close()
+	time.Sleep(50 * time.Millisecond)
+
+	// Resume — durableReplayHook runs as a no-op; connection must still work.
+	e2, _ := connectResume(t, addr, pub, priv, token)
+	defer e2.close()
+
+	publisher := connect(t, addr)
+	defer publisher.close()
+	allowAll(t, srv, publisher.pub)
+	publisher.publish(t, "home.sensor.temperature", tempReading(19.0))
+	e2.expectDeliver(t, "home.sensor.temperature")
+}
+
+// TestResumeDropsWhollyDeniedPattern verifies that resume does not restore a
+// subscription pattern that has become wholly-denied by an ACL change during
+// the disconnect window (M-5, v0.1.1 hardening).
+func TestResumeDropsWhollyDeniedPattern(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	allowAll(t, srv, pub)
+
+	// Connect, subscribe to home.>, disconnect cleanly.
+	e1, cs1 := connectResume(t, addr, pub, priv, nil)
+	e1.subscribe(t, "home.sensor.temperature")
+	token := cs1.SessionToken
+	e1.close()
+	time.Sleep(50 * time.Millisecond)
+
+	// While disconnected, add a high-priority deny rule covering home.>.
+	pubID := acl.EncodeIdentity(pub)
+	srv.AddRule(acl.Rule{
+		IdentityPattern: pubID,
+		Action:          acl.ActionSubscribe,
+		SubjectPattern:  "home.>",
+		Effect:          acl.Deny,
+		Priority:        100,
+	})
+
+	// Resume — pattern should be dropped (deny covers the full subscription space).
+	e2, _ := connectResume(t, addr, pub, priv, token)
+	defer e2.close()
+
+	// Publish a message; if the pattern were restored the client would receive it.
+	publisher := connect(t, addr)
+	defer publisher.close()
+	allowAll(t, srv, publisher.pub)
+	publisher.publish(t, "home.sensor.temperature", tempReading(22.0))
+	e2.expectNoDeliver(t, 300*time.Millisecond)
+}
+
+// ─── Session 7: dynamic schema registry + admin API (Decisions #14, #15, #16) ─
+
+// buildFDBytes marshals the FileDescriptorProto for the given compiled proto message's file.
+func buildFDBytes(m proto.Message) []byte {
+	fdp := protodesc.ToFileDescriptorProto(m.ProtoReflect().Descriptor().ParentFile())
+	b, _ := proto.Marshal(fdp)
+	return b
+}
+
+// buildSimpleFD constructs a minimal FileDescriptorProto with one or two float fields.
+func buildSimpleFD(name string, fields []*descriptorpb.FieldDescriptorProto) []byte {
+	fdp := &descriptorpb.FileDescriptorProto{
+		Name:    proto.String(name),
+		Syntax:  proto.String("proto3"),
+		Package: proto.String("test"),
+		MessageType: []*descriptorpb.DescriptorProto{{
+			Name:  proto.String("TestMsg"),
+			Field: fields,
+		}},
+	}
+	b, _ := proto.Marshal(fdp)
+	return b
+}
+
+func floatField(name string, number int32) *descriptorpb.FieldDescriptorProto {
+	return &descriptorpb.FieldDescriptorProto{
+		Name:   proto.String(name),
+		Number: proto.Int32(number),
+		Type:   descriptorpb.FieldDescriptorProto_TYPE_FLOAT.Enum(),
+		Label:  descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum(),
+	}
+}
+
+// startAdminServer creates an admin server and starts it on a random loopback port.
+// Returns the server's base URL and a stop function.
+func startAdminServer(t *testing.T, r *schema.Registry) (baseURL string, stop func()) {
+	t.Helper()
+	a := admin.New(r)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go a.Serve(ln) //nolint:errcheck
+	return "http://" + ln.Addr().String(), func() { ln.Close() }
+}
+
+// TestRuntimeSchemaRegistration verifies that a schema registered at runtime via
+// srv.SchemaRegistry().Register is used for subsequent PUBLISH validation.
+func TestRuntimeSchemaRegistration(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	sub := connect(t, addr)
+	defer sub.close()
+	pub := connect(t, addr)
+	defer pub.close()
+	id := acl.EncodeIdentity(pub.pub)
+	subID := acl.EncodeIdentity(sub.pub)
+	srv.AddRule(acl.Rule{IdentityPattern: id, Action: acl.ActionPublish, SubjectPattern: "home.>", Effect: acl.Allow, Priority: 10})
+	srv.AddRule(acl.Rule{IdentityPattern: subID, Action: acl.ActionSubscribe, SubjectPattern: "home.>", Effect: acl.Allow, Priority: 10})
+
+	// Register a new subject using TemperatureReading as the schema.
+	fdBytes := buildFDBytes(&pb.TemperatureReading{})
+	if err := srv.SchemaRegistry().Register("home.sensor.humidity", "TemperatureReading", fdBytes); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	sub.subscribe(t, "home.sensor.humidity")
+
+	// Valid publish to the newly registered subject.
+	pub.publish(t, "home.sensor.humidity", tempReading(55.0))
+	sub.expectDeliver(t, "home.sensor.humidity")
+}
+
+// TestCustomRangeEnforced verifies that a dynamically registered schema with a
+// range constraint rejects values outside the range.
+func TestCustomRangeEnforced(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	pub := connect(t, addr)
+	defer pub.close()
+	allowAll(t, srv, pub.pub)
+
+	// Register TemperatureReading for home.sensor.humidity (inherits its range constraints).
+	fdBytes := buildFDBytes(&pb.TemperatureReading{})
+	if err := srv.SchemaRegistry().Register("home.sensor.humidity", "TemperatureReading", fdBytes); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	// value=999 exceeds max 150 — schema error.
+	bad, _ := proto.Marshal(&pb.TemperatureReading{Value: func() *float32 { v := float32(999); return &v }()})
+	pub.publish(t, "home.sensor.humidity", bad)
+	e := pub.expectError(t)
+	if e.Code != "SCHEMA_ERROR" {
+		t.Fatalf("expected SCHEMA_ERROR, got %q", e.Code)
+	}
+}
+
+// TestCustomMaxLengthEnforced verifies that the max_length constraint from a
+// dynamically registered schema is enforced at publish time.
+func TestCustomMaxLengthEnforced(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	pub := connect(t, addr)
+	defer pub.close()
+	allowAll(t, srv, pub.pub)
+
+	// Register TemperatureReading for a new subject; unit max_length=10 applies.
+	fdBytes := buildFDBytes(&pb.TemperatureReading{})
+	if err := srv.SchemaRegistry().Register("home.sensor.pressure", "TemperatureReading", fdBytes); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	unit := "12345678901" // 11 chars > max 10
+	val := float32(1.0)
+	bad, _ := proto.Marshal(&pb.TemperatureReading{Value: &val, Unit: &unit})
+	pub.publish(t, "home.sensor.pressure", bad)
+	e := pub.expectError(t)
+	if e.Code != "SCHEMA_ERROR" {
+		t.Fatalf("expected SCHEMA_ERROR, got %q", e.Code)
+	}
+}
+
+// TestAdditiveVersionBump verifies that registering an updated schema with an
+// additional field increments the version number (Decision #16).
+func TestAdditiveVersionBump(t *testing.T) {
+	reg := schema.DefaultRegistry()
+
+	fdv1 := buildSimpleFD("v1.proto", []*descriptorpb.FieldDescriptorProto{
+		floatField("value", 1),
+	})
+	if err := reg.Register("test.additive", "TestMsg", fdv1); err != nil {
+		t.Fatalf("Register v1: %v", err)
+	}
+	if v := reg.Version("test.additive"); v != 1 {
+		t.Fatalf("expected version 1 after initial registration, got %d", v)
+	}
+
+	// v2 adds a new optional field — additive change.
+	fdv2 := buildSimpleFD("v1.proto", []*descriptorpb.FieldDescriptorProto{
+		floatField("value", 1),
+		floatField("extra", 2),
+	})
+	if err := reg.Register("test.additive", "TestMsg", fdv2); err != nil {
+		t.Fatalf("Register v2: %v", err)
+	}
+	if v := reg.Version("test.additive"); v != 2 {
+		t.Fatalf("expected version 2 after additive bump, got %d", v)
+	}
+}
+
+// TestBreakingChangeRejected verifies that removing a field is rejected with an
+// error and the schema version is not bumped (Decision #16).
+func TestBreakingChangeRejected(t *testing.T) {
+	reg := schema.DefaultRegistry()
+
+	// v1 has two fields.
+	fdv1 := buildSimpleFD("break.proto", []*descriptorpb.FieldDescriptorProto{
+		floatField("value", 1),
+		floatField("extra", 2),
+	})
+	if err := reg.Register("test.breaking", "TestMsg", fdv1); err != nil {
+		t.Fatalf("Register v1: %v", err)
+	}
+
+	// v2 removes "extra" (field 2) — breaking change.
+	fdv2 := buildSimpleFD("break.proto", []*descriptorpb.FieldDescriptorProto{
+		floatField("value", 1),
+	})
+	err := reg.Register("test.breaking", "TestMsg", fdv2)
+	if err == nil {
+		t.Fatal("expected error for breaking change, got nil")
+	}
+	// Version must remain at 1.
+	if v := reg.Version("test.breaking"); v != 1 {
+		t.Fatalf("expected version 1 after rejected bump, got %d", v)
+	}
+}
+
+// TestCardinalityChangeRejected verifies that changing a field's label from
+// optional to repeated is rejected as a breaking change (Decision #16 / M-4).
+func TestCardinalityChangeRejected(t *testing.T) {
+	reg := schema.DefaultRegistry()
+
+	fdv1 := buildSimpleFD("card.proto", []*descriptorpb.FieldDescriptorProto{
+		floatField("value", 1),
+	})
+	if err := reg.Register("test.cardinality", "TestMsg", fdv1); err != nil {
+		t.Fatalf("Register v1: %v", err)
+	}
+
+	// v2 changes "value" from LABEL_OPTIONAL to LABEL_REPEATED — breaking change.
+	fdv2 := buildSimpleFD("card.proto", []*descriptorpb.FieldDescriptorProto{{
+		Name:   proto.String("value"),
+		Number: proto.Int32(1),
+		Type:   descriptorpb.FieldDescriptorProto_TYPE_FLOAT.Enum(),
+		Label:  descriptorpb.FieldDescriptorProto_LABEL_REPEATED.Enum(),
+	}})
+	if err := reg.Register("test.cardinality", "TestMsg", fdv2); err == nil {
+		t.Fatal("expected error for cardinality change (optional→repeated), got nil")
+	}
+	if v := reg.Version("test.cardinality"); v != 1 {
+		t.Fatalf("expected version 1 after rejected bump, got %d", v)
+	}
+}
+
+// requiredFloatField builds a FieldDescriptorProto with lattice.required=true set.
+func requiredFloatField(name string, number int32) *descriptorpb.FieldDescriptorProto {
+	opts := &descriptorpb.FieldOptions{}
+	proto.SetExtension(opts, pb.E_Required, true)
+	return &descriptorpb.FieldDescriptorProto{
+		Name:    proto.String(name),
+		Number:  proto.Int32(number),
+		Type:    descriptorpb.FieldDescriptorProto_TYPE_FLOAT.Enum(),
+		Label:   descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum(),
+		Options: opts,
+	}
+}
+
+// buildFDWithOptions builds a FileDescriptorProto that imports proto/lattice_options.proto,
+// enabling lattice.required and other custom options on its fields.
+func buildFDWithOptions(name string, fields []*descriptorpb.FieldDescriptorProto) []byte {
+	fdp := &descriptorpb.FileDescriptorProto{
+		Name:       proto.String(name),
+		Syntax:     proto.String("proto3"),
+		Package:    proto.String("test"),
+		Dependency: []string{"proto/lattice_options.proto"},
+		MessageType: []*descriptorpb.DescriptorProto{{
+			Name:  proto.String("TestMsg"),
+			Field: fields,
+		}},
+	}
+	b, _ := proto.Marshal(fdp)
+	return b
+}
+
+// TestNewRequiredFieldRejected verifies that adding a lattice.required field in
+// a schema upgrade is rejected as a breaking change (Decision #16 / M-4).
+// Existing publishers that don't supply the new field would fail validation.
+func TestNewRequiredFieldRejected(t *testing.T) {
+	reg := schema.DefaultRegistry()
+
+	fdv1 := buildSimpleFD("req.proto", []*descriptorpb.FieldDescriptorProto{
+		floatField("value", 1),
+	})
+	if err := reg.Register("test.newrequired", "TestMsg", fdv1); err != nil {
+		t.Fatalf("Register v1: %v", err)
+	}
+
+	// v2 adds a new required field — existing publishers will fail validation.
+	fdv2 := buildFDWithOptions("req.proto", []*descriptorpb.FieldDescriptorProto{
+		floatField("value", 1),
+		requiredFloatField("mandatory", 2),
+	})
+	if err := reg.Register("test.newrequired", "TestMsg", fdv2); err == nil {
+		t.Fatal("expected error for new required field, got nil")
+	}
+	if v := reg.Version("test.newrequired"); v != 1 {
+		t.Fatalf("expected version 1 after rejected bump, got %d", v)
+	}
+}
+
+// TestAdminLocalhostOnly verifies that ListenAndServe rejects non-loopback addresses.
+func TestAdminLocalhostOnly(t *testing.T) {
+	a := admin.New(schema.DefaultRegistry())
+	err := a.ListenAndServe("0.0.0.0:0")
+	if err == nil {
+		t.Fatal("expected error for non-loopback bind, got nil")
+	}
+}
+
+// TestAdminGetSchema verifies that GET /schema returns a JSON list of registered subjects.
+func TestAdminGetSchema(t *testing.T) {
+	r := schema.DefaultRegistry()
+	baseURL, stop := startAdminServer(t, r)
+	defer stop()
+
+	resp, err := http.Get(baseURL + "/schema")
+	if err != nil {
+		t.Fatalf("GET /schema: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	var list []schema.SubjectInfo
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	subjects := make(map[string]bool)
+	for _, s := range list {
+		subjects[s.Subject] = true
+	}
+	if !subjects["home.sensor.temperature"] || !subjects["home.light.command"] {
+		t.Fatalf("expected built-in subjects in list, got %v", list)
+	}
+}
+
+// TestAdminRegisterSchema verifies that POST /schema registers a new subject that
+// the server then validates against.
+func TestAdminRegisterSchema(t *testing.T) {
+	r := schema.DefaultRegistry()
+	baseURL, stop := startAdminServer(t, r)
+	defer stop()
+
+	fdBytes := buildFDBytes(&pb.TemperatureReading{})
+	body, _ := json.Marshal(map[string]string{
+		"subject":      "home.sensor.co2",
+		"message_name": "TemperatureReading",
+		"descriptor":   base64.StdEncoding.EncodeToString(fdBytes),
+	})
+	resp, err := http.Post(baseURL+"/schema", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /schema: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d", resp.StatusCode)
+	}
+
+	// Subject is now registered — schema validates correctly.
+	if err := r.Validate("home.sensor.co2", tempReading(42.0)); err != nil {
+		t.Fatalf("Validate after registration: %v", err)
+	}
+	// Unknown value (out of range) is rejected.
+	bad, _ := proto.Marshal(&pb.TemperatureReading{Value: func() *float32 { v := float32(9999); return &v }()})
+	if err := r.Validate("home.sensor.co2", bad); err == nil {
+		t.Fatal("expected validation error for out-of-range value")
 	}
 }
