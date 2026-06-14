@@ -17,6 +17,10 @@ extend google.protobuf.FieldOptions {
   RangeOptions range = 50001;
   // lattice.max_length constrains the maximum byte length of a string field.
   uint32 max_length = 50002;
-  // lattice.required marks a field as required (must be present).
+  // lattice.required marks a field as required (must be present in every payload).
+  // IMPORTANT: The field MUST be declared `optional` in proto3 so that presence
+  // is tracked explicitly. Without `optional`, Has() cannot distinguish a missing
+  // field from one set to its zero value (0, false, ""), causing valid zero payloads
+  // to be incorrectly rejected at validation time.
   bool required = 50003;
 }

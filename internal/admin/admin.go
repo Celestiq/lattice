@@ -4,9 +4,11 @@ package admin
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"time"
 
 	"lattice/internal/schema"
 )
@@ -26,6 +28,7 @@ func New(registry *schema.Registry) *Server {
 }
 
 // ListenAndServe binds to addr and serves. addr must resolve to a loopback interface.
+// The server uses explicit timeouts to prevent local Slowloris and idle-connection exhaustion.
 func (s *Server) ListenAndServe(addr string) error {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -35,10 +38,21 @@ func (s *Server) ListenAndServe(addr string) error {
 	if ip == nil || !ip.IsLoopback() {
 		return fmt.Errorf("admin: addr %q must bind to a loopback address", addr)
 	}
-	return http.ListenAndServe(addr, s.mux)
+	srv := &http.Server{
+		Addr:           addr,
+		Handler:        s.mux,
+		ReadTimeout:    10 * time.Second,
+		WriteTimeout:   10 * time.Second,
+		IdleTimeout:    60 * time.Second,
+		MaxHeaderBytes: 1 << 16, // 64 KiB
+	}
+	return srv.ListenAndServe()
 }
 
-// Serve accepts connections from an existing listener. Intended for tests.
+// Serve runs the admin API on the provided listener WITHOUT the loopback-address
+// restriction enforced by ListenAndServe. It exists only so tests can bind a
+// random-port listener. Production code MUST use ListenAndServe; serving this mux
+// on a non-loopback listener exposes unauthenticated schema registration.
 func (s *Server) Serve(ln net.Listener) error {
 	return http.Serve(ln, s.mux)
 }
@@ -51,8 +65,14 @@ type registerSchemaRequest struct {
 }
 
 func (s *Server) handleRegisterSchema(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 512<<10) // 512 KiB cap
 	var req registerSchemaRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
 		return
 	}

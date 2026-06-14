@@ -45,6 +45,28 @@ func (r *Registry) Register(sessionID string, pubkey []byte, capabilities []*pb.
 	return rec
 }
 
+// RegisterAndEvict atomically replaces any existing session for pubkey with the
+// new session and returns the old EntityRecord (nil if none existed). The caller
+// is responsible for cleaning up the old session (bus, conns, calls, sessions).
+// This single operation prevents a race window between reading the old entry and
+// writing the new one when two connections with the same pubkey arrive concurrently.
+func (r *Registry) RegisterAndEvict(sessionID string, pubkey []byte, capabilities []*pb.Capability) *EntityRecord {
+	now := time.Now()
+	newRec := &EntityRecord{
+		Pubkey:          append([]byte(nil), pubkey...),
+		Capabilities:    capabilities,
+		SessionID:       sessionID,
+		ConnectedAt:     now,
+		LastHeartbeatAt: now,
+	}
+	key := hex.EncodeToString(pubkey)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	old := r.entities[key] // nil if no prior session
+	r.entities[key] = newRec
+	return old
+}
+
 // UpdateHeartbeat refreshes the liveness timestamp for pubkey. No-op if not found.
 func (r *Registry) UpdateHeartbeat(pubkey []byte) {
 	r.mu.Lock()

@@ -240,6 +240,65 @@ func TestACLCacheInvalidation(t *testing.T) {
 	}
 }
 
+// ─── AllowPattern (subscribe-time wholly-denied check) ───────────────────────
+
+// TestAllowPatternWhollyDeniedRejected: a subscription pattern for which no
+// concrete subject is permitted must be rejected. The only rule is a Deny, so
+// there is no Allow intersecting the pattern — wholly-denied by default.
+func TestAllowPatternWhollyDeniedRejected(t *testing.T) {
+	e := acl.New()
+	pub, _ := genKey(t)
+	e.AddRule(acl.Rule{
+		IdentityPattern: acl.EncodeIdentity(pub),
+		Action:          acl.ActionSubscribe,
+		SubjectPattern:  "home.private.>",
+		Effect:          acl.Deny,
+		Priority:        100,
+	})
+	if e.AllowPattern(pub, acl.ActionSubscribe, "home.private.>") {
+		t.Fatal("AllowPattern must reject a wholly-denied subscription pattern")
+	}
+	// Corollary: empty engine is also wholly-denied.
+	e2 := acl.New()
+	if e2.AllowPattern(pub, acl.ActionSubscribe, "home.>") {
+		t.Fatal("AllowPattern on empty engine must deny by default")
+	}
+}
+
+// TestAllowPatternBroadAcceptedDespiteNarrowDeny: subscribing to a broad pattern
+// that includes both permitted and denied subjects must be accepted because some
+// concrete subjects remain reachable via the Allow rule.
+//
+// Rule set: deny home.private.> p100, allow home.> p50
+// - home.> is NOT wholly-denied: home.sensor.temperature is allowed.
+// - home.private.> IS wholly-denied: every subject under it hits the p100 deny.
+func TestAllowPatternBroadAcceptedDespiteNarrowDeny(t *testing.T) {
+	e := acl.New()
+	pub, _ := genKey(t)
+	e.AddRule(acl.Rule{
+		IdentityPattern: acl.EncodeIdentity(pub),
+		Action:          acl.ActionSubscribe,
+		SubjectPattern:  "home.private.>",
+		Effect:          acl.Deny,
+		Priority:        100,
+	})
+	e.AddRule(acl.Rule{
+		IdentityPattern: acl.EncodeIdentity(pub),
+		Action:          acl.ActionSubscribe,
+		SubjectPattern:  "home.>",
+		Effect:          acl.Allow,
+		Priority:        50,
+	})
+	// Broad subscription must be accepted — subjects outside home.private.> are allowed.
+	if !e.AllowPattern(pub, acl.ActionSubscribe, "home.>") {
+		t.Fatal("AllowPattern must accept broad pattern when some subjects are permitted")
+	}
+	// Narrow subscription fully covered by the deny must be rejected.
+	if e.AllowPattern(pub, acl.ActionSubscribe, "home.private.>") {
+		t.Fatal("AllowPattern must reject home.private.> which is fully subsumed by the deny rule")
+	}
+}
+
 // EncodeIdentity is deterministic and round-trips through base32.
 func TestEncodeIdentityDeterministic(t *testing.T) {
 	pub, _ := genKey(t)

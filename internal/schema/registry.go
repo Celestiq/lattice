@@ -69,7 +69,10 @@ func (r *Registry) registerBuiltin(subject string, m proto.Message) {
 // Register dynamically adds or upgrades a schema for subject.
 // fdBytes is a marshalled FileDescriptorProto; messageName selects which message
 // in that file to use as the schema.
-// Upgrades are additive-only (Decision #16): field removal and type changes are rejected.
+// Upgrades are additive-only (Decision #16): field removal, type changes, cardinality
+// changes, and new fields marked lattice.required are rejected.
+// Note: any field carrying lattice.required MUST be declared `optional` in proto3
+// so that presence tracking (Has) works correctly for zero values.
 func (r *Registry) Register(subject, messageName string, fdBytes []byte) error {
 	var fdProto descriptorpb.FileDescriptorProto
 	if err := proto.Unmarshal(fdBytes, &fdProto); err != nil {
@@ -253,9 +256,12 @@ func extractConstraints(msgDesc protoreflect.MessageDescriptor) map[protoreflect
 	return out
 }
 
-// checkAdditive verifies that newDesc is additive-only relative to oldDesc:
-// no fields removed and no field type changes. New fields are allowed.
+// checkAdditive verifies that newDesc is additive-only relative to oldDesc.
+// Rejects: field removal, type (Kind) changes, cardinality changes (e.g.
+// optional→repeated), and new fields marked lattice.required (which would
+// break existing publishers that don't supply the new field).
 func checkAdditive(oldDesc, newDesc protoreflect.MessageDescriptor) error {
+	// Verify every existing field is still present and unchanged.
 	oldFields := oldDesc.Fields()
 	for i := 0; i < oldFields.Len(); i++ {
 		oldFd := oldFields.Get(i)
@@ -266,8 +272,36 @@ func checkAdditive(oldDesc, newDesc protoreflect.MessageDescriptor) error {
 		if oldFd.Kind() != newFd.Kind() {
 			return fmt.Errorf("field %s type changed from %v to %v", oldFd.Name(), oldFd.Kind(), newFd.Kind())
 		}
+		if oldFd.Cardinality() != newFd.Cardinality() {
+			return fmt.Errorf("field %s cardinality changed from %v to %v", oldFd.Name(), oldFd.Cardinality(), newFd.Cardinality())
+		}
+	}
+	// New fields are allowed only if they are not required; a new required field
+	// causes existing publishers (who don't know about it) to fail validation.
+	newFields := newDesc.Fields()
+	for i := 0; i < newFields.Len(); i++ {
+		newFd := newFields.Get(i)
+		if oldDesc.Fields().ByNumber(newFd.Number()) != nil {
+			continue // existing field — already verified above
+		}
+		if fieldIsRequired(newFd) {
+			return fmt.Errorf("new required field %s (number %d) breaks existing publishers", newFd.Name(), newFd.Number())
+		}
 	}
 	return nil
+}
+
+// fieldIsRequired reports whether the lattice.required extension is true for fd.
+func fieldIsRequired(fd protoreflect.FieldDescriptor) bool {
+	opts := fd.Options()
+	if opts == nil {
+		return false
+	}
+	fopts, ok := opts.(*descriptorpb.FieldOptions)
+	if !ok {
+		return false
+	}
+	return proto.HasExtension(fopts, pb.E_Required) && proto.GetExtension(fopts, pb.E_Required).(bool)
 }
 
 // findMessage searches the top-level messages in fd for messageName.

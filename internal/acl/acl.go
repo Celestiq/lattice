@@ -117,6 +117,52 @@ func (e *Engine) Allow(pubkey []byte, action Action, subject string) bool {
 	return false // deny by default
 }
 
+// AllowPattern returns true if the subscription pattern is not wholly-denied —
+// i.e., at least one concrete subject matching pattern would be permitted.
+// Used at subscribe time when the entity provides a wildcard subscription pattern.
+// Uses the identity-indexed rule cache for efficiency.
+//
+// A pattern is wholly-denied when every Allow rule that intersects it is fully
+// subsumed by a higher-priority Deny rule (meaning no concrete subject under the
+// pattern is actually reachable via an Allow).
+func (e *Engine) AllowPattern(pubkey []byte, action Action, pattern string) bool {
+	key := cacheKey{identity: EncodeIdentity(pubkey), action: action}
+	rules := e.rulesFor(key)
+	// Rules are sorted by descending priority. For each Allow rule that intersects
+	// the subscription pattern, check whether any higher-priority (earlier-index)
+	// Deny rule fully subsumes the Allow rule's pattern. If a subsumption exists,
+	// every subject covered by the Allow is blocked by the Deny. If not, at least
+	// one subject under the pattern is permitted, so the subscription is not
+	// wholly-denied.
+	for i, r := range rules {
+		if r.Effect != Allow {
+			continue
+		}
+		if !bus.PatternsIntersect(r.SubjectPattern, pattern) {
+			continue
+		}
+		// r covers some subjects within the subscription pattern.
+		// Check whether any higher-priority Deny subsumes the entire subscription
+		// pattern — if so, every subject in the pattern is denied by that rule,
+		// making this Allow unreachable regardless of what it covers.
+		// rules[:i] are all strictly higher priority than r.
+		fullyBlocked := false
+		for _, deny := range rules[:i] {
+			if deny.Effect != Deny {
+				continue
+			}
+			if bus.PatternSubsumedBy(pattern, deny.SubjectPattern) {
+				fullyBlocked = true
+				break
+			}
+		}
+		if !fullyBlocked {
+			return true // found at least one reachable Allow
+		}
+	}
+	return false // deny by default — no reachable Allow found
+}
+
 // AllowConcrete is the delivery-time variant of Allow. It checks whether pubkey
 // can perform action on a concrete (non-wildcard) subject using the identity-indexed
 // rule cache to avoid scanning the full rule list on every fanout delivery.

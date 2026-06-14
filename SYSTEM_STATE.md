@@ -111,13 +111,16 @@ HELLO exchange  (internal/handshake)  — 10-second deadline enforced
     │
     ▼
 Post-handshake setup  (internal/node)
-  evictOldSession(existing)  ← if same pubkey already in registry (Decision #12)
-    registry.Remove(pubkey, oldSessionID) CAS → bus.RemoveSession → conns.LoadAndDelete → sessions.Remove
-    calls.InvalidateTarget(oldSessionID) → ERROR TARGET_DISCONNECTED to each requester (Decision #6)
-    sw.conn.Close() → old HandleConn read loop exits; its defer CAS-Remove returns nil → no entity.left
-  registry.Register(sessionID, pubkey, capabilities)
+  registry.RegisterAndEvict(sessionID, pubkey, capabilities) → atomically replaces any old session (Decision #12 / M-1)
+    if old != nil: evictCapturedSession(old)  ← registry already updated; no CAS needed
+      calls.InvalidateTarget(old.SessionID) → ERROR TARGET_DISCONNECTED to each requester (Decision #6)
+      bus.RemoveSession(old.SessionID) → conns.LoadAndDelete → sw.conn.Close()
+      sessions.Remove(old.SessionID)
+      old HandleConn read loop exits (conn closed); its defer teardownSession CAS-Remove returns nil → no entity.left
   if resume.Resumed:                          ← Decision #2
-    bus.Subscribe(sessionID, p) for each saved pattern   ← subscription restored without ACL recheck
+    for each saved pattern:
+      acl.AllowPattern(pubkey, subscribe, pattern)  ← re-check; wholly-denied patterns dropped (M-5)
+      bus.Subscribe(sessionID, pattern)
     durableReplayHook(rec)  ← no-op stub in v0.1.1
     NO entity.joined published
   else:
@@ -126,7 +129,7 @@ Post-handshake setup  (internal/node)
     ▼
 Frame dispatch loop  (internal/node)
   HEARTBEAT      → registry.UpdateHeartbeat → HEARTBEAT_ACK (ctrl-priority lane)
-  SUBSCRIBE      → acl.Allow(subscribe) → bus.Subscribe
+  SUBSCRIBE      → acl.AllowPattern(subscribe, pattern) → bus.Subscribe  ← wholly-denied check (Decision #11)
   UNSUBSCRIBE    → bus.Unsubscribe
   PUBLISH        → ValidateSubject → acl.Allow(publish) → s.schema.Validate → bus.Fanout → for each subscriber: acl.AllowConcrete(subscribe, subject) → DELIVER
   REQUEST        → acl.Allow(call) → registry.Get(target) → calls.Add(corrID, requesterSID, targetSID) → forward REQUEST to target
@@ -264,7 +267,9 @@ type Bus struct {
 - `>` matches one or more segments, terminal only: `home.>` matches `home.sensor.temperature` and `home.sensor`
 - `>` in non-terminal position is rejected at subscribe time
 
-`PatternsIntersect(a, b string) bool` — in `internal/bus/subject.go`. Reports whether any concrete subject exists that matches both patterns. Used by the ACL engine for delivery-time correctness reasoning. Algorithm: walk segment pairs; `>` matches any remaining suffix of length ≥ 1 (returns true immediately if the other side still has segments), `*` matches any one segment, literals must be equal, length mismatch returns false.
+`PatternsIntersect(a, b string) bool` — in `internal/bus/subject.go`. Reports whether any concrete subject exists that matches both patterns. Used by the ACL engine for subscribe-time and delivery-time correctness reasoning. Algorithm: walk segment pairs; `>` matches any remaining suffix of length ≥ 1 (returns true immediately if the other side still has segments), `*` matches any one segment, literals must be equal, length mismatch returns false.
+
+`PatternSubsumedBy(inner, outer string) bool` — in `internal/bus/subject.go`. Reports whether every concrete subject matching `inner` also matches `outer` — i.e., `outer`'s subject set is a superset of `inner`'s. Used by `AllowPattern` to determine whether a higher-priority Deny rule fully blocks a subscription pattern. Algorithm: segment-by-segment; `outer`'s `>` subsumes any remaining inner segments (returns true if inner is non-empty); `inner`'s `>` is only subsumed by `outer`'s `>`; `outer`'s `*` accepts any single inner segment; literals must match exactly.
 
 ---
 
@@ -289,11 +294,13 @@ type Rule struct {
     Priority        int     // higher = evaluated first
 }
 ```
-Deny-by-default. Two methods check ACL:
+Deny-by-default. Three methods check ACL:
 
-- **`Allow(pubkey, action, subject)`** — subscribe/publish/call gate. Walks the full rule list under RLock; no caching. The `subject` argument may be a wildcard pattern (e.g., the subscription pattern `home.>`). Used in `handleSubscribe`, `handlePublish`, `handleRequest`.
+- **`AllowPattern(pubkey, action, pattern)`** — subscribe-time gate (Decision #11). Checks whether the subscription pattern is *not wholly-denied* — i.e., at least one concrete subject under the pattern would be permitted. Uses the identity-indexed rule cache (`rulesFor`). Algorithm: for each Allow rule that intersects the pattern (`PatternsIntersect`), check if any higher-priority Deny rule subsumes the entire subscription pattern (`PatternSubsumedBy(pattern, deny.SubjectPattern)`). If a non-blocked Allow exists, return true. Used in `handleSubscribe`. Replaces the old `Allow` call which incorrectly treated the subscription pattern as a concrete subject.
 
-- **`AllowConcrete(pubkey, action, subject)`** — delivery-time gate. Same logic as `Allow` but uses an identity-indexed cache (`cacheKey{identity, action}` → `[]Rule`) to avoid scanning all rules on every DELIVER. Cache is built lazily on first call and invalidated (replaced with a fresh map) on every `AddRule`. Uses double-checked locking: read under RLock, write under WLock on miss. The `subject` argument must be a concrete (non-wildcard) string. Used in `fanout` and `publishSystemEvent`.
+- **`Allow(pubkey, action, subject)`** — publish/call gate. Walks the full rule list under RLock; no caching. The `subject` argument is a concrete subject for publish, or `base32(targetPubkey)` for call. Used in `handlePublish`, `handleRequest`.
+
+- **`AllowConcrete(pubkey, action, subject)`** — delivery-time gate. Same first-match-wins logic but uses an identity-indexed cache (`cacheKey{identity, action}` → `[]Rule`) to avoid scanning all rules on every DELIVER. Cache is built lazily on first call and invalidated (replaced with a fresh map) on every `AddRule`. Uses double-checked locking: read under RLock, write under WLock on miss. The `subject` argument must be a concrete (non-wildcard) string. Used in `fanout` and `publishSystemEvent`.
 
 `EncodeIdentity(pubkey []byte) string` converts a raw Ed25519 public key to the canonical base32 (no-padding) string used in identity patterns.
 
@@ -324,7 +331,9 @@ type Registry struct {
     entities map[string]*EntityRecord // hex(pubkey) → record
 }
 ```
-`Remove(pubkey, sessionID)` is a **compare-and-swap**: only removes the entry if `record.SessionID == sessionID`, returns the removed record or nil. This is the sentinel that prevents all four disconnect paths from racing — and crucially, prevents a reconnecting entity's old-session defer from wiping the new session's registry entry.
+`Remove(pubkey, sessionID)` is a **compare-and-swap**: only removes the entry if `record.SessionID == sessionID`, returns the removed record or nil. This is the sentinel that prevents all four disconnect paths from racing.
+
+`RegisterAndEvict(sessionID, pubkey, capabilities) *EntityRecord` — atomically replaces any existing session for `pubkey` with the new session in a single lock acquisition, returning the old `EntityRecord` (nil if none). Eliminates the TOCTOU race window between reading the old session and registering the new one when two connections with the same pubkey arrive concurrently (M-1 fix). The caller must clean up the returned old session directly — `registry.Remove` is NOT called for the old session, since it is already replaced.
 
 `Get(pubkey)` returns the record without removing it — used by `handleRequest` for target lookup.
 
@@ -405,7 +414,7 @@ type Server struct {
     done              chan struct{}
 }
 ```
-Created once; `HandleConn` is called in a goroutine per accepted connection. The `wg` tracks all HandleConn goroutines and the two background goroutines (heartbeat checker, call timeout checker). `done` is closed by `Shutdown()` to signal them. `stopOnce` prevents double-close panics.
+Created once; `HandleConn` is called in a goroutine per accepted connection. The `wg` tracks all HandleConn goroutines and the three background goroutines (heartbeat checker, call timeout checker, token expirer). `done` is closed by `Shutdown()` to signal them. `stopOnce` prevents double-close panics.
 
 `New(log, serverPriv, heartbeatInterval, tokenTTL ...time.Duration)` — the optional `tokenTTL` overrides the default 5-minute resume-token TTL.
 
@@ -556,6 +565,12 @@ The offline entity's own subscriptions are removed *before* its offline event is
 
 ---
 
+## Token Expirer
+
+`runTokenExpirer` ticks every minute and calls `s.tokens.ExpireTokens()`, which sweeps the token store for entries whose TTL has elapsed (default 5 minutes). Without this goroutine the map would grow without bound as disconnected entities accumulate tokens that are never consumed (M-2 fix).
+
+---
+
 ## Call Timeout Checker
 
 `runCallTimeoutChecker` ticks every 1 second. Calls `calls.Expired(now)` to retrieve and atomically remove all pending calls past their deadline. For each expired call, sends `ERROR { code: "TIMEOUT" }` to the requester via `enqueueControl` (silently drops if requester already disconnected — `conns.Load` miss).
@@ -614,7 +629,13 @@ type Registry struct {
 - **`Version(subject string) uint32`** — returns current version (0 if not registered).
 - **`List() []SubjectInfo`** — returns all subjects with versions; used by the admin GET endpoint.
 
-**Additive-only versioning (Decision #16):** `checkAdditive` walks all fields in the old descriptor and verifies each is present in the new one with the same kind. Field removal or type change returns an error — the `Register` call is rejected and the version is not bumped.
+**Additive-only versioning (Decision #16):** `checkAdditive` enforces four constraints (M-4 fix):
+1. **No field removal** — every field in the old descriptor must exist in the new one.
+2. **No type (Kind) change** — e.g., float → int is rejected.
+3. **No cardinality change** — e.g., `optional` → `repeated` is rejected.
+4. **No new required fields** — a newly added field with `lattice.required=true` would break existing publishers who don't set it; rejected via `fieldIsRequired` helper.
+
+Field removal, type change, cardinality change, or a new required field returns an error — the `Register` call is rejected and the version is not bumped.
 
 Proto3 `optional` is used for all built-in message fields so the `Has(field)` presence check distinguishes "not set" from "set to zero value".
 
@@ -622,12 +643,14 @@ Proto3 `optional` is used for all built-in message fields so the `Has(field)` pr
 
 A lightweight stdlib `net/http` server. Accessible via `cmd/lattice-node --admin-addr` (default `127.0.0.1:4223`). `ListenAndServe` validates that the bind address resolves to a loopback IP before binding.
 
+**Timeouts and body limits (L-1):** `ListenAndServe` uses an `http.Server` with `ReadTimeout(10s)`, `WriteTimeout(10s)`, `IdleTimeout(60s)`, and `MaxHeaderBytes(64 KiB)`. `handleRegisterSchema` caps the request body at 512 KiB via `http.MaxBytesReader`; oversized requests return `413 Request Entity Too Large` before any parsing occurs.
+
 | Method | Path | Body | Response |
 |--------|------|------|----------|
-| `POST` | `/schema` | `{"subject": "...", "message_name": "...", "descriptor": "<base64 FileDescriptorProto>"}` | `204 No Content` or `422` |
+| `POST` | `/schema` | `{"subject": "...", "message_name": "...", "descriptor": "<base64 FileDescriptorProto>"}` | `204 No Content`, `400 Bad Request`, `413 Too Large`, or `422 Unprocessable Entity` |
 | `GET` | `/schema` | — | `200 JSON [{"subject":"...","schema_version":N}]` |
 
-`admin.Server` also exposes `Serve(net.Listener)` for tests (skips the loopback address check).
+`admin.Server` also exposes `Serve(net.Listener)` for tests only — it bypasses the loopback address check. **Production code must use `ListenAndServe`**; serving the admin mux on a non-loopback listener exposes unauthenticated schema registration. (`internal/admin` is module-internal, so no external caller can reach it regardless.)
 
 The server binary exposes `srv.SchemaRegistry() *schema.Registry` to pass to `admin.New`.
 
@@ -656,9 +679,13 @@ go test ./...
 | `internal/handshake` | 11 | Valid HELLO, corrupted signature, mismatched pubkey, concurrent sessions, HEARTBEAT round-trip, session token, server signature verify/forge, pin mismatch, unsupported protocol version, typed capabilities, handshake deadline (10s, skipped in short mode) |
 | `internal/bus` | 26 | Wildcard matching (`*`, `>`), pattern/subject validation, subscribe/unsubscribe/fanout, deduplication, session cleanup; 9 `PatternsIntersect` cases (identical, gt-vs-exact, gt-vs-gt, broader-gt, star-vs-exact, different-prefix, private-vs-broader, disjoint-lengths, star-length-mismatch) |
 | `internal/schema` | 13 | Both schemas: valid payloads, out-of-range values, missing fields, invalid enum, string length, unknown subject (all validated via dynamic registry + custom options) |
-| `internal/acl` | 11 | Deny by default, exact allow, wildcard identity, priority ordering, deny overrides lower-priority allow; `AllowConcrete` empty-deny, allow, delivery-time deny (wildcard bypass fix), cache invalidation after `AddRule` |
-| `internal/node` | 61 | 54 black-box integration tests (pub/sub, wildcards, schema rejection, ACL, entity events, offline detection, call round-trip/timeout/ACL, graceful shutdown, typed capabilities, delivery-time wildcard deny, system-event delivery deny, reconnect eviction, join-on-reconnect, responder verification, eviction invalidates calls, DISCONNECT teardown, monotonic DELIVER id, per-subject isolation, publisher identity stamped, timestamp populated, request caller identity, caller identity not spoofable, error ref_id, timeout error ref_id, resume restores subscriptions, token rotation prevents reuse, resume requires correct signature, resume token pubkey mismatch, expired token falls back, fresh connect unchanged, durable-replay hook no-op, runtime schema registration, custom range enforced, custom max_length enforced, additive version bump, breaking change rejected, admin localhost-only, admin GET schema, admin register schema); 7 white-box writer unit tests |
-| **Total** | **129** | |
+| `internal/acl` | 13 | Deny by default, exact allow, wildcard identity, priority ordering, deny overrides lower-priority allow; `AllowConcrete` empty-deny, allow, delivery-time deny (wildcard bypass fix), cache invalidation after `AddRule`; `AllowPattern` wholly-denied rejection, broad-pattern accepted despite narrow deny |
+| `internal/registry` | 9 | Register+Get, RegisterAndEvict no-prior/with-prior (M-1 atomic path), Remove CAS matching/stale session, Stale threshold, UpdateHeartbeat refreshes/no-op for unknown |
+| `internal/session` | 6 | Consume happy path + single-use, wrong pubkey, expired token, ExpireTokens sweeps expired/preserves live (M-2 sweeper), Delete |
+| `internal/call` | 5 | Add/Peek/Remove round-trip, Peek non-destructive, Peek/Remove unknown, Expired removes only past-deadline, InvalidateTarget bulk-removes by target |
+| `internal/admin` | 6 | ListenAndServe rejects non-loopback, GET /schema returns built-ins, POST /schema registers subject, invalid base64, invalid JSON, body too large (413) |
+| `internal/node` | 64 | 57 black-box integration tests (pub/sub, wildcards, schema rejection, ACL, entity events, offline detection, call round-trip/timeout/ACL, graceful shutdown, typed capabilities, delivery-time wildcard deny, system-event delivery deny, reconnect eviction, join-on-reconnect, responder verification, eviction invalidates calls, DISCONNECT teardown, monotonic DELIVER id, per-subject isolation, publisher identity stamped, timestamp populated, request caller identity, caller identity not spoofable, error ref_id, timeout error ref_id, resume restores subscriptions, token rotation prevents reuse, resume requires correct signature, resume token pubkey mismatch, expired token falls back, fresh connect unchanged, durable-replay hook no-op, **resume drops wholly-denied pattern** (M-5), runtime schema registration, custom range enforced, custom max_length enforced, additive version bump, breaking change rejected, cardinality change rejected, new required field rejected, admin localhost-only, admin GET schema, admin register schema); 7 white-box writer unit tests |
+| **Total** | **160** | |
 
 The `TestIntegrationSequence` test covers all 10 steps of the full integration scenario in a single sequential test with per-step log output.
 

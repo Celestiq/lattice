@@ -92,6 +92,43 @@ func intersectSegs(a, b []string, i, j int) bool {
 	return false // literal mismatch — no common subject possible
 }
 
+// PatternSubsumedBy reports whether every concrete subject matching inner also
+// matches outer — i.e., outer's subject set is a superset of inner's.
+// Both must be valid Lattice patterns.
+// Used by the ACL engine to determine whether a higher-priority deny fully
+// blocks the subjects covered by a lower-priority allow rule.
+func PatternSubsumedBy(inner, outer string) bool {
+	return subsumedBySegs(strings.Split(inner, "."), strings.Split(outer, "."))
+}
+
+func subsumedBySegs(inner, outer []string) bool {
+	for {
+		switch {
+		case len(outer) == 0 && len(inner) == 0:
+			return true
+		case len(outer) == 0:
+			return false // outer exhausted but inner has remaining segments
+		case outer[0] == ">":
+			// outer's > matches any suffix of length ≥ 1; inner must have segments left.
+			return len(inner) > 0
+		case len(inner) == 0:
+			return false // inner exhausted but outer requires more
+		case inner[0] == ">":
+			// inner's > generates 1+ segments; only outer's > can cover all of them.
+			return outer[0] == ">"
+		case outer[0] == "*":
+			// outer's * matches any single segment; consume one from each.
+			outer, inner = outer[1:], inner[1:]
+		default:
+			// outer[0] is a literal; inner must be the same literal.
+			if inner[0] != outer[0] {
+				return false
+			}
+			outer, inner = outer[1:], inner[1:]
+		}
+	}
+}
+
 // Match reports whether concrete subject matches pattern.
 // * matches exactly one segment. > matches one or more segments and must be terminal.
 func Match(pattern, subject string) bool {

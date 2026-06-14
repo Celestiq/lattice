@@ -85,9 +85,10 @@ func New(log *slog.Logger, serverPriv ed25519.PrivateKey, heartbeatInterval uint
 		heartbeatInterval: heartbeatInterval,
 		done:              make(chan struct{}),
 	}
-	s.wg.Add(2)
+	s.wg.Add(3)
 	go s.runHeartbeatChecker()
 	go s.runCallTimeoutChecker()
+	go s.runTokenExpirer()
 	return s
 }
 
@@ -185,20 +186,26 @@ func (s *Server) HandleConn(conn net.Conn) {
 	sw := newSessionWriter(conn, rec.ID, s.log, onWriteError)
 	s.conns.Store(rec.ID, sw)
 
-	// Evict any existing session for this pubkey before registering the new one
-	// (Decision #12: same-identity reconnect). No entity.left is published —
-	// the new connection supersedes the old one.
-	if oldEnt := s.registry.Get(rec.Pubkey); oldEnt != nil {
-		s.evictOldSession(oldEnt)
+	// Atomically register the new session and capture any previous session for
+	// this pubkey (Decision #12: same-identity reconnect). RegisterAndEvict holds
+	// the registry lock for the entire read+write, eliminating the race window
+	// between concurrent reconnects from the same identity.
+	if old := s.registry.RegisterAndEvict(rec.ID, rec.Pubkey, rec.Capabilities); old != nil {
+		s.evictCapturedSession(old)
 	}
 
-	// Register entity.
-	s.registry.Register(rec.ID, rec.Pubkey, rec.Capabilities)
-
 	// On resume: restore subscriptions silently and call the durable-replay hook.
+	// Patterns that are now wholly-denied (ACL changed during disconnect window)
+	// are silently dropped — delivery-time AllowConcrete would block them anyway,
+	// but an explicit drop here keeps the bus clean (M-5 fix).
 	// On fresh connect: announce entity.joined so watchers know the entity arrived.
 	if resume.Resumed {
 		for _, pattern := range resume.Patterns {
+			if !s.acl.AllowPattern(rec.Pubkey, acl.ActionSubscribe, pattern) {
+				s.log.Debug("resume: dropping wholly-denied pattern",
+					"session_id", rec.ID, "pattern", pattern)
+				continue
+			}
 			_ = s.bus.Subscribe(rec.ID, pattern)
 		}
 		s.durableReplayHook(rec)
@@ -268,8 +275,11 @@ func (s *Server) handleSubscribe(sw *sessionWriter, rec *session.Record, payload
 		s.sendError(sw, "INVALID_PAYLOAD", "cannot unmarshal SUBSCRIBE")
 		return
 	}
-	// ACL check before touching the registry.
-	if !s.acl.Allow(rec.Pubkey, acl.ActionSubscribe, msg.Subject) {
+	// Wholly-denied check: reject the subscription only when no concrete subject
+	// under the pattern would be permitted (Decision #11). Subscriptions where at
+	// least one permitted subject exists are accepted; delivery-time AllowConcrete
+	// filters individual frames that hit narrower deny rules.
+	if !s.acl.AllowPattern(rec.Pubkey, acl.ActionSubscribe, msg.Subject) {
 		s.sendError(sw, "PERMISSION_DENIED", "subscribe denied by ACL")
 		return
 	}
@@ -610,14 +620,12 @@ func (s *Server) teardownSession(rec *session.Record) {
 // In v0.1.1 this is a no-op stub; durable message replay is not yet implemented.
 func (s *Server) durableReplayHook(_ *session.Record) {}
 
-// evictOldSession forcibly removes an existing session when the same pubkey
-// reconnects (Decision #12). No entity.left is published — the reconnection
-// supersedes the old session. Pending calls targeting the old session are
-// cancelled with TARGET_DISCONNECTED (Decision #6 amendment).
-func (s *Server) evictOldSession(old *registry.EntityRecord) {
-	if s.registry.Remove(old.Pubkey, old.SessionID) == nil {
-		return // already gone (concurrent cleanup beat us here)
-	}
+// evictCapturedSession cleans up an old session whose registry entry has already
+// been atomically replaced by RegisterAndEvict. Because the registry is already
+// updated, this skips the CAS Remove and proceeds directly to cleanup.
+// No entity.left is published — the reconnection supersedes the old session.
+// Pending calls targeting the old session are cancelled (Decision #6 amendment).
+func (s *Server) evictCapturedSession(old *registry.EntityRecord) {
 	for _, exp := range s.calls.InvalidateTarget(old.SessionID) {
 		if v, ok := s.conns.Load(exp.RequesterSessionID); ok {
 			payload, _ := proto.Marshal(&pb.Error{
@@ -633,4 +641,20 @@ func (s *Server) evictOldSession(old *registry.EntityRecord) {
 	}
 	s.sessions.Remove(old.SessionID)
 	// No entity.left: the reconnect supersedes the old session.
+}
+
+// runTokenExpirer ticks every minute and sweeps expired resume tokens from the
+// token store (M-2: prevents unbounded growth of the token map).
+func (s *Server) runTokenExpirer() {
+	defer s.wg.Done()
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			s.tokens.ExpireTokens()
+		case <-s.done:
+			return
+		}
+	}
 }

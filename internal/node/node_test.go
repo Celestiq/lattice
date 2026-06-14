@@ -1819,6 +1819,45 @@ func TestDurableReplayHookNoOp(t *testing.T) {
 	e2.expectDeliver(t, "home.sensor.temperature")
 }
 
+// TestResumeDropsWhollyDeniedPattern verifies that resume does not restore a
+// subscription pattern that has become wholly-denied by an ACL change during
+// the disconnect window (M-5, v0.1.1 hardening).
+func TestResumeDropsWhollyDeniedPattern(t *testing.T) {
+	addr, srv, stop := newServer(t, 30)
+	defer stop()
+
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	allowAll(t, srv, pub)
+
+	// Connect, subscribe to home.>, disconnect cleanly.
+	e1, cs1 := connectResume(t, addr, pub, priv, nil)
+	e1.subscribe(t, "home.sensor.temperature")
+	token := cs1.SessionToken
+	e1.close()
+	time.Sleep(50 * time.Millisecond)
+
+	// While disconnected, add a high-priority deny rule covering home.>.
+	pubID := acl.EncodeIdentity(pub)
+	srv.AddRule(acl.Rule{
+		IdentityPattern: pubID,
+		Action:          acl.ActionSubscribe,
+		SubjectPattern:  "home.>",
+		Effect:          acl.Deny,
+		Priority:        100,
+	})
+
+	// Resume — pattern should be dropped (deny covers the full subscription space).
+	e2, _ := connectResume(t, addr, pub, priv, token)
+	defer e2.close()
+
+	// Publish a message; if the pattern were restored the client would receive it.
+	publisher := connect(t, addr)
+	defer publisher.close()
+	allowAll(t, srv, publisher.pub)
+	publisher.publish(t, "home.sensor.temperature", tempReading(22.0))
+	e2.expectNoDeliver(t, 300*time.Millisecond)
+}
+
 // ─── Session 7: dynamic schema registry + admin API (Decisions #14, #15, #16) ─
 
 // buildFDBytes marshals the FileDescriptorProto for the given compiled proto message's file.
@@ -1996,6 +2035,89 @@ func TestBreakingChangeRejected(t *testing.T) {
 	}
 	// Version must remain at 1.
 	if v := reg.Version("test.breaking"); v != 1 {
+		t.Fatalf("expected version 1 after rejected bump, got %d", v)
+	}
+}
+
+// TestCardinalityChangeRejected verifies that changing a field's label from
+// optional to repeated is rejected as a breaking change (Decision #16 / M-4).
+func TestCardinalityChangeRejected(t *testing.T) {
+	reg := schema.DefaultRegistry()
+
+	fdv1 := buildSimpleFD("card.proto", []*descriptorpb.FieldDescriptorProto{
+		floatField("value", 1),
+	})
+	if err := reg.Register("test.cardinality", "TestMsg", fdv1); err != nil {
+		t.Fatalf("Register v1: %v", err)
+	}
+
+	// v2 changes "value" from LABEL_OPTIONAL to LABEL_REPEATED — breaking change.
+	fdv2 := buildSimpleFD("card.proto", []*descriptorpb.FieldDescriptorProto{{
+		Name:   proto.String("value"),
+		Number: proto.Int32(1),
+		Type:   descriptorpb.FieldDescriptorProto_TYPE_FLOAT.Enum(),
+		Label:  descriptorpb.FieldDescriptorProto_LABEL_REPEATED.Enum(),
+	}})
+	if err := reg.Register("test.cardinality", "TestMsg", fdv2); err == nil {
+		t.Fatal("expected error for cardinality change (optional→repeated), got nil")
+	}
+	if v := reg.Version("test.cardinality"); v != 1 {
+		t.Fatalf("expected version 1 after rejected bump, got %d", v)
+	}
+}
+
+// requiredFloatField builds a FieldDescriptorProto with lattice.required=true set.
+func requiredFloatField(name string, number int32) *descriptorpb.FieldDescriptorProto {
+	opts := &descriptorpb.FieldOptions{}
+	proto.SetExtension(opts, pb.E_Required, true)
+	return &descriptorpb.FieldDescriptorProto{
+		Name:    proto.String(name),
+		Number:  proto.Int32(number),
+		Type:    descriptorpb.FieldDescriptorProto_TYPE_FLOAT.Enum(),
+		Label:   descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum(),
+		Options: opts,
+	}
+}
+
+// buildFDWithOptions builds a FileDescriptorProto that imports proto/lattice_options.proto,
+// enabling lattice.required and other custom options on its fields.
+func buildFDWithOptions(name string, fields []*descriptorpb.FieldDescriptorProto) []byte {
+	fdp := &descriptorpb.FileDescriptorProto{
+		Name:       proto.String(name),
+		Syntax:     proto.String("proto3"),
+		Package:    proto.String("test"),
+		Dependency: []string{"proto/lattice_options.proto"},
+		MessageType: []*descriptorpb.DescriptorProto{{
+			Name:  proto.String("TestMsg"),
+			Field: fields,
+		}},
+	}
+	b, _ := proto.Marshal(fdp)
+	return b
+}
+
+// TestNewRequiredFieldRejected verifies that adding a lattice.required field in
+// a schema upgrade is rejected as a breaking change (Decision #16 / M-4).
+// Existing publishers that don't supply the new field would fail validation.
+func TestNewRequiredFieldRejected(t *testing.T) {
+	reg := schema.DefaultRegistry()
+
+	fdv1 := buildSimpleFD("req.proto", []*descriptorpb.FieldDescriptorProto{
+		floatField("value", 1),
+	})
+	if err := reg.Register("test.newrequired", "TestMsg", fdv1); err != nil {
+		t.Fatalf("Register v1: %v", err)
+	}
+
+	// v2 adds a new required field — existing publishers will fail validation.
+	fdv2 := buildFDWithOptions("req.proto", []*descriptorpb.FieldDescriptorProto{
+		floatField("value", 1),
+		requiredFloatField("mandatory", 2),
+	})
+	if err := reg.Register("test.newrequired", "TestMsg", fdv2); err == nil {
+		t.Fatal("expected error for new required field, got nil")
+	}
+	if v := reg.Version("test.newrequired"); v != 1 {
 		t.Fatalf("expected version 1 after rejected bump, got %d", v)
 	}
 }

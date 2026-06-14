@@ -27,6 +27,9 @@ type writerMsg struct {
 // Priority: ctrl frames (HEARTBEAT_ACK, ERROR) are always dequeued before data
 // frames (DELIVER, REQUEST, RESPONSE). The fast-check at the top of run() ensures
 // a pending ctrl frame is never skipped because a data frame also became ready.
+// Trade-off: sustained ctrl traffic could in principle starve the data channel,
+// but ctrl volume is bounded by the heartbeat interval and per-frame errors,
+// so this is not reachable in practice.
 //
 // Every wire.Write call sets a per-write deadline of writeTimeout. On deadline
 // exceeded the conn is closed, onWriteError is called (if non-nil), and the
