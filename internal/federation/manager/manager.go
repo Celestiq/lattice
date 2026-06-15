@@ -20,6 +20,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/descriptorpb"
 
+	fedcalls "lattice/internal/federation/calls"
 	fedhandshake "lattice/internal/federation/handshake"
 	"lattice/internal/federation/peer"
 	fedpolicy "lattice/internal/federation/policy"
@@ -36,9 +37,17 @@ import (
 type NodeHooks interface {
 	FederatedPublish(subject string, payload []byte, publisherPubkey []byte)
 	SchemaRegistry() *schema.Registry
+	// RouteLocalRequest forwards an inbound cross-federation REQUEST to the
+	// local target entity (S5). timeoutMs is forwarded from FedRequest so the
+	// local call deadline matches the original caller's timeout.
 	RouteLocalRequest(corrID string, targetPubkey []byte, payload []byte,
-		callerIdentity string, receivedAt int64, sourcePeerPubkey []byte)
-	RouteLocalResponse(corrID string, payload []byte, sourcePeerPubkey []byte)
+		callerIdentity string, receivedAt int64, timeoutMs uint32, sourcePeerPubkey []byte)
+	// RouteLocalResponse delivers a cross-federation RESPONSE to the local
+	// session identified by requesterSessionID (S5).
+	RouteLocalResponse(corrID string, payload []byte, requesterSessionID string)
+	// SendLocalError delivers an ERROR frame to the local session (S5). Used
+	// to send TIMEOUT errors for expired cross-federation outbound calls.
+	SendLocalError(sessionID, code, message, refID string)
 }
 
 // ConnectionInfo is the per-peer summary returned by GetConnections.
@@ -74,6 +83,14 @@ type Manager struct {
 	// S4: schema propagation tracker. Key: peerHex+":"+subject; value: struct{}.
 	// LoadOrStore ensures SchemaDescriptor is sent at most once per peer per subject.
 	schemaTracker sync.Map
+
+	// S5: in-memory routing table. key: entityHex → peerHex.
+	// Populated from SQLite at Start() and updated on inbound FedPolicy frames.
+	remoteEntities sync.Map
+	// S5: outbound cross-federation call registry.
+	fedCalls *fedcalls.Registry
+
+	stopOnce sync.Once
 }
 
 // New creates a Manager. Call Start() to begin accepting and dialing.
@@ -91,6 +108,7 @@ func New(localPriv ed25519.PrivateKey, store *fedstore.Store, dialer transport.D
 		done:      make(chan struct{}),
 		ctx:       ctx,
 		cancel:    cancel,
+		fedCalls:  fedcalls.New(),
 	}
 }
 
@@ -105,8 +123,20 @@ func (m *Manager) Start() error {
 		return fmt.Errorf("manager: read all peers: %w", err)
 	}
 
+	// S5: hydrate the in-memory routing table from SQLite so cross-federation
+	// call routing survives node restarts.
+	entMap, err := m.store.GetRemoteEntityMap()
+	if err != nil {
+		return fmt.Errorf("manager: read remote entity map: %w", err)
+	}
+	for entityHex, peerHex := range entMap {
+		m.remoteEntities.Store(entityHex, peerHex)
+	}
+
 	m.wg.Add(1)
 	go m.runAcceptLoop()
+	m.wg.Add(1)
+	go m.runFedCallTimeoutChecker()
 
 	for _, rec := range active {
 		r := rec
@@ -125,19 +155,21 @@ func (m *Manager) Start() error {
 }
 
 // Stop shuts down the manager: revokes all peer streams, closes the listener,
-// waits for all goroutines to exit, then closes the store.
+// waits for all goroutines to exit, then closes the store. Safe to call multiple times.
 func (m *Manager) Stop() {
-	m.cancel()
-	close(m.done)
-	m.peers.Range(func(_, v any) bool {
-		v.(*peer.PeerConn).Revoke() //nolint:errcheck
-		return true
+	m.stopOnce.Do(func() {
+		m.cancel()
+		close(m.done)
+		m.peers.Range(func(_, v any) bool {
+			v.(*peer.PeerConn).Revoke() //nolint:errcheck
+			return true
+		})
+		if m.listener != nil {
+			m.listener.Close() //nolint:errcheck
+		}
+		m.wg.Wait()
+		m.store.Close() //nolint:errcheck
 	})
-	if m.listener != nil {
-		m.listener.Close() //nolint:errcheck
-	}
-	m.wg.Wait()
-	m.store.Close() //nolint:errcheck
 }
 
 // HandleIncoming handles a new inbound federation connection. It runs the
@@ -360,8 +392,8 @@ func (m *Manager) UpdatePolicy(peerHex string, outbound, inbound []fedstore.Poli
 	return nil
 }
 
-// UpdateExportList replaces the exported entity pubkeys for peerHex and
-// sends an updated FedPolicy if the peer is currently active.
+// UpdateExportList replaces the exported entity pubkeys for peerHex, refreshes
+// the in-memory routing table, and sends an updated FedPolicy to the peer.
 func (m *Manager) UpdateExportList(peerHex string, entityHexes []string) error {
 	m.consentMu.Lock()
 	defer m.consentMu.Unlock()
@@ -369,6 +401,17 @@ func (m *Manager) UpdateExportList(peerHex string, entityHexes []string) error {
 	if err := m.store.SetExportList(peerHex, entityHexes); err != nil {
 		return err
 	}
+	// Refresh in-memory routing table: remove old entries for this peer, add new ones.
+	m.remoteEntities.Range(func(k, v any) bool {
+		if v.(string) == peerHex {
+			m.remoteEntities.Delete(k)
+		}
+		return true
+	})
+	for _, entityHex := range entityHexes {
+		m.remoteEntities.Store(entityHex, peerHex)
+	}
+
 	m.loadPolicies(peerHex)
 	if v, ok := m.peers.Load(peerHex); ok {
 		pc := v.(*peer.PeerConn)
@@ -549,13 +592,30 @@ func (m *Manager) handleInboundFrame(pc *peer.PeerConn, peerHex string, f *wire.
 			m.store.UpdatePeerState(peerHex, "revoked") //nolint:errcheck
 			m.peers.Delete(peerHex)
 		}
+	case pb.FrameType_FRAME_TYPE_FED_POLICY:
+		var pol pb.FedPolicy
+		if err := proto.Unmarshal(f.Payload, &pol); err != nil {
+			return
+		}
+		m.handleInboundPolicy(pc, peerHex, &pol)
 	case pb.FrameType_FRAME_TYPE_FED_DELIVER:
 		var deliver pb.FedDeliver
 		if err := proto.Unmarshal(f.Payload, &deliver); err != nil {
 			return
 		}
 		m.handleInboundDeliver(pc, peerHex, &deliver)
-	// FED_REQUEST, FED_RESPONSE are handled in S5.
+	case pb.FrameType_FRAME_TYPE_FED_REQUEST:
+		var req pb.FedRequest
+		if err := proto.Unmarshal(f.Payload, &req); err != nil {
+			return
+		}
+		m.handleInboundRequest(pc, peerHex, &req)
+	case pb.FrameType_FRAME_TYPE_FED_RESPONSE:
+		var resp pb.FedResponse
+		if err := proto.Unmarshal(f.Payload, &resp); err != nil {
+			return
+		}
+		m.handleInboundResponse(peerHex, &resp)
 	}
 }
 
@@ -576,15 +636,19 @@ func (m *Manager) getOrCreatePeer(pubkey []byte, name, addr string) *peer.PeerCo
 	return existing
 }
 
-// sendFedPolicy loads rules from the store and enqueues a FED_POLICY frame on
-// the peer's ctrl channel. Non-blocking: returns an error only on store failure
-// or full ctrl channel (extremely rare).
+// sendFedPolicy loads rules and export list from the store and enqueues a
+// FED_POLICY frame on the peer's ctrl channel. Non-blocking: returns an error
+// only on store failure or full ctrl channel (extremely rare).
 func (m *Manager) sendFedPolicy(pc *peer.PeerConn, peerHex string) error {
 	out, err := m.store.GetOutboundPolicy(peerHex)
 	if err != nil {
 		return err
 	}
 	in, err := m.store.GetInboundPolicy(peerHex)
+	if err != nil {
+		return err
+	}
+	exported, err := m.store.GetExportList(peerHex)
 	if err != nil {
 		return err
 	}
@@ -600,6 +664,13 @@ func (m *Manager) sendFedPolicy(pc *peer.PeerConn, peerHex string) error {
 			SubjectPattern: r.SubjectPattern,
 			Effect:         r.Effect,
 		})
+	}
+	for _, entityHex := range exported {
+		entityBytes, err := hex.DecodeString(entityHex)
+		if err != nil {
+			continue
+		}
+		pol.ExportedPubkeys = append(pol.ExportedPubkeys, entityBytes)
 	}
 	b, err := proto.Marshal(pol)
 	if err != nil {
@@ -736,6 +807,163 @@ func (m *Manager) handleInboundDeliver(pc *peer.PeerConn, peerHex string, msg *p
 	}
 	if m.nodeHooks != nil {
 		m.nodeHooks.FederatedPublish(msg.Subject, msg.Payload, pc.PeerPubkey())
+	}
+}
+
+// ─── S5: Cross-federation call routing ────────────────────────────────────────
+
+// TryRouteRequest attempts to route a REQUEST to a remote peer via federation.
+// Returns true if the request was handed off to a peer (caller should not send
+// NOT_FOUND). Returns false if the target is not in the remote entity routing
+// table or the peer is not active.
+func (m *Manager) TryRouteRequest(req *pb.Request, requesterSID string) bool {
+	targetHex := hex.EncodeToString(req.TargetPubkey)
+	peerHexVal, ok := m.remoteEntities.Load(targetHex)
+	if !ok {
+		return false
+	}
+	peerHex := peerHexVal.(string)
+
+	v, ok := m.peers.Load(peerHex)
+	if !ok {
+		return false
+	}
+	pc := v.(*peer.PeerConn)
+	if pc.State() != peer.StateActive {
+		return false
+	}
+
+	timeoutMs := req.TimeoutMs
+	if timeoutMs == 0 {
+		timeoutMs = 5000
+	}
+	deadline := time.Now().Add(time.Duration(timeoutMs) * time.Millisecond)
+	m.fedCalls.AddOutbound(req.CorrelationId, requesterSID, pc.PeerPubkey(), deadline)
+
+	fedReq := &pb.FedRequest{
+		CorrelationId:    req.CorrelationId,
+		TargetPubkey:     req.TargetPubkey,
+		Payload:          req.Payload,
+		TimeoutMs:        req.TimeoutMs,
+		CallerIdentity:   req.CallerIdentity, // already stamped by handleRequest
+		ReceivedAt:       req.ReceivedAt,
+		RequesterNodePub: m.localPub,
+	}
+	b, err := proto.Marshal(fedReq)
+	if err != nil {
+		m.fedCalls.RemoveOutbound(req.CorrelationId)
+		return false
+	}
+	if !pc.SendData(pb.FrameType_FRAME_TYPE_FED_REQUEST, b) {
+		m.fedCalls.RemoveOutbound(req.CorrelationId)
+		m.log.Warn("fed: FedRequest dropped (data channel full)", "peer", peerHex,
+			"corrID", req.CorrelationId)
+		return false
+	}
+	return true
+}
+
+// handleInboundRequest processes a FED_REQUEST from a peer and routes it to
+// the local target entity via nodeHooks.RouteLocalRequest.
+func (m *Manager) handleInboundRequest(pc *peer.PeerConn, peerHex string, req *pb.FedRequest) {
+	if m.nodeHooks == nil {
+		return
+	}
+	m.nodeHooks.RouteLocalRequest(
+		req.CorrelationId,
+		req.TargetPubkey,
+		req.Payload,
+		req.CallerIdentity,
+		req.ReceivedAt,
+		req.TimeoutMs,
+		pc.PeerPubkey(),
+	)
+}
+
+// handleInboundResponse processes a FED_RESPONSE from a peer. Looks up the
+// outbound call by correlation ID and routes the response to the local
+// requester via nodeHooks.RouteLocalResponse.
+func (m *Manager) handleInboundResponse(peerHex string, resp *pb.FedResponse) {
+	oc := m.fedCalls.RemoveOutbound(resp.CorrelationId)
+	if oc == nil {
+		return // already expired or unknown
+	}
+	if m.nodeHooks != nil {
+		m.nodeHooks.RouteLocalResponse(resp.CorrelationId, resp.Payload, oc.RequesterLocalSID)
+	}
+}
+
+// ForwardResponse sends a FED_RESPONSE back to the peer node identified by
+// peerPubkey. Called from node.Server.handleResponse when the RESPONSE is for
+// a cross-federation inbound call (FedSourcePeerPubkey is set).
+func (m *Manager) ForwardResponse(corrID string, payload []byte, peerPubkey []byte) {
+	peerHex := hex.EncodeToString(peerPubkey)
+	v, ok := m.peers.Load(peerHex)
+	if !ok {
+		m.log.Warn("fed: ForwardResponse: peer not found", "peer", peerHex[:8], "corrID", corrID)
+		return
+	}
+	pc := v.(*peer.PeerConn)
+	if pc.State() != peer.StateActive {
+		m.log.Warn("fed: ForwardResponse: peer not active", "peer", peerHex[:8], "corrID", corrID)
+		return
+	}
+	resp := &pb.FedResponse{
+		CorrelationId: corrID,
+		Payload:       payload,
+	}
+	b, err := proto.Marshal(resp)
+	if err != nil {
+		return
+	}
+	if !pc.SendData(pb.FrameType_FRAME_TYPE_FED_RESPONSE, b) {
+		m.log.Warn("fed: FedResponse dropped (data channel full)", "peer", peerHex[:8], "corrID", corrID)
+	}
+}
+
+// handleInboundPolicy processes a FED_POLICY frame from a peer. Updates the
+// in-memory remote entity routing table with the peer's exported pubkeys and
+// persists them to SQLite for restart recovery.
+func (m *Manager) handleInboundPolicy(pc *peer.PeerConn, peerHex string, pol *pb.FedPolicy) {
+	// Remove old routing entries for this peer.
+	m.remoteEntities.Range(func(k, v any) bool {
+		if v.(string) == peerHex {
+			m.remoteEntities.Delete(k)
+		}
+		return true
+	})
+	// Insert new entries and collect for SQLite persistence.
+	entityHexes := make([]string, 0, len(pol.ExportedPubkeys))
+	for _, pk := range pol.ExportedPubkeys {
+		entityHex := hex.EncodeToString(pk)
+		m.remoteEntities.Store(entityHex, peerHex)
+		entityHexes = append(entityHexes, entityHex)
+	}
+	m.store.SetExportList(peerHex, entityHexes) //nolint:errcheck
+}
+
+// runFedCallTimeoutChecker ticks every second and sends errors to local
+// requesters whose cross-federation outbound calls have exceeded their deadline.
+func (m *Manager) runFedCallTimeoutChecker() {
+	defer m.wg.Done()
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			for _, exp := range m.fedCalls.ExpiredOutbound(time.Now()) {
+				if m.nodeHooks != nil {
+					m.nodeHooks.SendLocalError(
+						exp.RequesterLocalSID,
+						"TIMEOUT",
+						"cross-federation call timed out",
+						exp.CorrelationID,
+					)
+				}
+			}
+		case <-m.done:
+			return
+		}
 	}
 }
 

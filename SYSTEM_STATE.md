@@ -1,6 +1,6 @@
 # Lattice — System State
 
-**Scope:** Local orchestration + federation (in progress) · **Language:** Go 1.25 · **v0.1.1:** Sessions 0–7 complete · **v0.2 Federation S1–S4:** QUIC transport + FedHello handshake + SQLite persistence + Federation Manager + Bilateral Consent + Admin API + Forwarding Policy Engine + Schema Propagation · **Branch:** `dev/v0.2`
+**Scope:** Local orchestration + federation (in progress) · **Language:** Go 1.25 · **v0.1.1:** Sessions 0–7 complete · **v0.2 Federation S1–S5:** QUIC transport + FedHello handshake + SQLite persistence + Federation Manager + Bilateral Consent + Admin API + Forwarding Policy Engine + Schema Propagation + Cross-Federation Call Routing · **Branch:** `dev/v0.2`
 
 This document captures the complete state of the Lattice codebase: what exists, how the pieces fit together, and the design decisions behind them. Start here before reading any source file.
 
@@ -58,9 +58,12 @@ lattice/
 │       ├── store/         #   SQLite peer persistence (S2)
 │       │   ├── store.go   #     modernc.org/sqlite; 4 tables; CRUD + DeletePeer
 │       │   └── store_test.go # 5 tests
-│       └── manager/       #   federation lifecycle + consent + forwarding (S3/S4)
-│           ├── manager.go #     Manager, NodeHooks, ConnectionInfo; Start/Stop/HandleIncoming/consent ops; ForwardIfNeeded; handleInboundDeliver
-│           └── manager_test.go # 27 tests (topology / fault / consent lifecycle / race / e2e / S4 forwarding)
+│       ├── calls/         #   outbound cross-federation call registry (S5)
+│       │   ├── calls.go   #     Registry; OutboundCall; AddOutbound/RemoveOutbound/ExpiredOutbound
+│       │   └── calls_test.go # 6 tests
+│       └── manager/       #   federation lifecycle + consent + forwarding + call routing (S3/S4/S5)
+│           ├── manager.go #     Manager, NodeHooks, ConnectionInfo; Start/Stop/HandleIncoming/consent ops; ForwardIfNeeded; handleInboundDeliver; TryRouteRequest; ForwardResponse; handleInboundRequest/Response/Policy
+│           └── manager_test.go # 39 tests (topology / fault / consent lifecycle / race / e2e / S4 forwarding / S5 call routing)
 ├── proto/
 │   ├── frames.proto       # 23 frame types (0-14 client, 15-23 federation)
 │   ├── federation.proto   # v0.2: FedHello, FedPolicy, FedDeliver, FedRequest, ...
@@ -385,9 +388,10 @@ type Registry struct {
 ### `call.Registry` — `internal/call/call.go`
 ```go
 type PendingCall struct {
-    RequesterSessionID string
-    TargetSessionID    string // the session that must send the RESPONSE (Decision #6)
-    Deadline           time.Time
+    RequesterSessionID  string
+    TargetSessionID     string // the session that must send the RESPONSE (Decision #6)
+    Deadline            time.Time
+    FedSourcePeerPubkey []byte // nil for local calls; set for cross-federation inbound calls (S5)
 }
 
 type Registry struct {
@@ -396,6 +400,7 @@ type Registry struct {
 }
 ```
 - `Add(corrID, requesterSID, targetSID, deadline)` — registered before forwarding the REQUEST (race-prevention).
+- `AddFed(corrID, targetSID, sourcePeerPubkey, deadline)` — S5: registers an inbound cross-federation call. `RequesterSessionID` is empty (requester is on the source peer node); `FedSourcePeerPubkey` stores the source peer's pubkey so `handleResponse` routes the RESPONSE back via `ForwardResponse`.
 - `Peek(corrID)` — non-destructive lookup; used by `handleResponse` to verify the responder's session before committing a Remove.
 - `Remove(corrID)` — returns nil if not found (stale or expired).
 - `Expired(now)` — removes and returns all entries past their deadline atomically.
@@ -468,7 +473,9 @@ Created once; `HandleConn` is called in a goroutine per accepted connection. The
 
 `FederatedPublish(subject string, payload []byte, publisherPubkey []byte)` — implements `NodeHooks`; calls `s.fanout` directly (S3 stub, full routing in S4).
 
-`RouteLocalRequest` / `RouteLocalResponse` — `NodeHooks` stubs for federated call routing (implemented in S5).
+`RouteLocalRequest(corrID, targetPubkey, payload, callerIdentity, receivedAt, timeoutMs, sourcePeerPubkey)` — routes an inbound cross-federation REQUEST to the local target entity; calls `calls.AddFed` so the RESPONSE path can forward back to the source peer.
+`RouteLocalResponse(corrID, payload, requesterSID)` — delivers a cross-federation RESPONSE to the local session identified by `requesterSID`.
+`SendLocalError(sessionID, code, message, refID)` — sends an ERROR frame (via `enqueueControl`) to a local session; used for TIMEOUT errors on expired outbound federated calls.
 
 `durableReplayHook(*session.Record)` — called during resume after subscriptions are restored. No-op stub in v0.1.1; durable message replay is not yet implemented.
 
@@ -854,6 +861,7 @@ SQLite-backed persistence via `modernc.org/sqlite` (pure Go, no CGo). Four table
 | `SetInboundPolicy(hex, []PolicyRule)` | Replaces all inbound rules for peer in a transaction |
 | `GetOutboundPolicy(hex)` / `GetInboundPolicy(hex)` | Returns rules in position order |
 | `SetExportList(hex, []entityHex)` | Replaces all `remote_entities` rows for peer in a transaction |
+| `GetExportList(hex)` | Returns `[]entityHex` exported to this peer; used by `sendFedPolicy` to populate `FedPolicy.exported_pubkeys` |
 | `GetRemoteEntityMap()` | Returns `map[entityHex]peerHex`; hydrates the in-memory routing table at startup |
 | `Close()` | Closes the DB connection |
 
@@ -874,7 +882,8 @@ go test ./...
 | `internal/acl` | 13 | Deny by default, exact allow, wildcard identity, priority ordering, deny overrides lower-priority allow; `AllowConcrete` empty-deny, allow, delivery-time deny (wildcard bypass fix), cache invalidation after `AddRule`; `AllowPattern` wholly-denied rejection, broad-pattern accepted despite narrow deny |
 | `internal/registry` | 9 | Register+Get, RegisterAndEvict no-prior/with-prior (M-1 atomic path), Remove CAS matching/stale session, Stale threshold, UpdateHeartbeat refreshes/no-op for unknown |
 | `internal/session` | 6 | Consume happy path + single-use, wrong pubkey, expired token, ExpireTokens sweeps expired/preserves live (M-2 sweeper), Delete |
-| `internal/call` | 5 | Add/Peek/Remove round-trip, Peek non-destructive, Peek/Remove unknown, Expired removes only past-deadline, InvalidateTarget bulk-removes by target |
+| `internal/call` | 5 | Add/Peek/Remove round-trip, Peek non-destructive, Peek/Remove unknown, Expired removes only past-deadline, InvalidateTarget bulk-removes by target (AddFed path covered by S5 manager integration tests) |
+| `internal/federation/calls` | 6 | AddOutbound/RemoveOutbound round-trip, non-destructive peek, remove unknown, ExpiredOutbound removes expired entries, cleanup before remove, pubkey copy-on-add |
 | `internal/admin` | 6 | ListenAndServe rejects non-loopback, GET /schema returns built-ins, POST /schema registers subject, invalid base64, invalid JSON, body too large (413) |
 | `internal/node` | 64 | 57 black-box integration tests (pub/sub, wildcards, schema rejection, ACL, entity events, offline detection, call round-trip/timeout/ACL, graceful shutdown, typed capabilities, delivery-time wildcard deny, system-event delivery deny, reconnect eviction, join-on-reconnect, responder verification, eviction invalidates calls, DISCONNECT teardown, monotonic DELIVER id, per-subject isolation, publisher identity stamped, timestamp populated, request caller identity, caller identity not spoofable, error ref_id, timeout error ref_id, resume restores subscriptions, token rotation prevents reuse, resume requires correct signature, resume token pubkey mismatch, expired token falls back, fresh connect unchanged, durable-replay hook no-op, **resume drops wholly-denied pattern** (M-5), runtime schema registration, custom range enforced, custom max_length enforced, additive version bump, breaking change rejected, cardinality change rejected, new required field rejected, admin localhost-only, admin GET schema, admin register schema); 7 white-box writer unit tests |
 | `internal/transport/quic` | 15 | **Topology:** basic frame round-trip, bidirectional frames, ALPN isolation (wrong-ALPN client rejected), 5 concurrent dials. **Fault injection:** truncated mid-frame, cancelled-context dial, closed listener. **Race conditions:** keepalive round-trip, keepalive timeout, Stop+GotPong concurrent race, race with stream close. **E2E:** all 9 FED_* frame types round-trip, 256 KiB max payload, 256 KiB+1 overflow rejection, 20-frame sequencing, listener addr non-zero |
@@ -882,10 +891,166 @@ go test ./...
 | `internal/federation/peer` | 4 | All legal transitions (Pending→Active→Paused→Active→Revoked + stream.Close called), illegal transitions from Revoked return ErrIllegalTransition/ErrAlreadyRevoked, 20 goroutines concurrent Pause/Resume (race-detector clean), Revoke while writing (no panic, write returns error) |
 | `internal/federation/store` | 5 | Full round-trip (write peer + 3 outbound + 2 inbound rules + 5 export entities; close; reopen; verify all), bad path returns error, 10 concurrent UpsertPeer goroutines (no SQLITE_BUSY), persist+restart (2 active peers + entity maps survive close/reopen), revoked peer absent from AllActivePeers |
 | `internal/federation/policy` | 7 | DenyByDefault, FirstMatchForward, FirstMatchAccept, ExactMatch, GtWildcard, SetRules atomic replace, Rules snapshot immutability |
-| `internal/federation/manager` | 27 | **Topology (S3):** Start dials 2 active peers, HandleIncoming known-active sends FedPolicy, HandleIncoming known-paused skips FedPolicy, HandleIncoming unknown stores as pending, HandleIncoming revoked sends FedReject. **Admin lifecycle (S3):** pair→accept→pause→resume→revoke via HTTP (201/204/409). **Fault injection (S3):** dial unreachable, stream drop resets to pending, Stop() during dial. **Admin validation (S3):** invalid hex → 400, accept non-pending → 409. **Race/concurrency (S3):** concurrent AcceptPeer+RejectPeer, 3 concurrent HandleIncoming from same peer, 10 Pause/Resume rounds, Stop with 4 active peers. **E2E (S3):** GetConnections policy counts. **S4 forwarding (9 tests):** deny-by-default (no outbound rule), single forward rule delivers FedDeliver, non-matching subject not forwarded, inbound accept calls FederatedPublish, inbound deny drops frame, SchemaDescriptor on first forward only (tracker key), schema auto-registered on inbound FedDeliver, UpdatePolicy refreshes in-memory engine, concurrent ForwardIfNeeded schema tracker race |
-| **Total** | **223** | |
+| `internal/federation/manager` | 39 | **Topology (S3):** Start dials 2 active peers, HandleIncoming known-active sends FedPolicy, HandleIncoming known-paused skips FedPolicy, HandleIncoming unknown stores as pending, HandleIncoming revoked sends FedReject. **Admin lifecycle (S3):** pair→accept→pause→resume→revoke via HTTP (201/204/409). **Fault injection (S3):** dial unreachable, stream drop resets to pending, Stop() during dial. **Admin validation (S3):** invalid hex → 400, accept non-pending → 409. **Race/concurrency (S3):** concurrent AcceptPeer+RejectPeer, 3 concurrent HandleIncoming from same peer, 10 Pause/Resume rounds, Stop with 4 active peers. **E2E (S3):** GetConnections policy counts. **S4 forwarding (9 tests):** deny-by-default (no outbound rule), single forward rule delivers FedDeliver, non-matching subject not forwarded, inbound accept calls FederatedPublish, inbound deny drops frame, SchemaDescriptor on first forward only (tracker key), schema auto-registered on inbound FedDeliver, UpdatePolicy refreshes in-memory engine, concurrent ForwardIfNeeded schema tracker race. **S5 call routing (12 tests):** TryRouteRequest false for unknown target, TryRouteRequest sends FED_REQUEST to correct peer, UpdateExportList add wires routing, UpdateExportList remove stops routing, inbound FED_REQUEST dispatches to RouteLocalRequest hook, inbound FED_RESPONSE dispatches to RouteLocalResponse with correct requesterSID, ForwardResponse sends FED_RESPONSE to peer, ForwardResponse for unknown peer no-panic, expired outbound calls trigger SendLocalError(TIMEOUT), inbound FedPolicy updates routing table and SQLite, sendFedPolicy includes exported pubkeys, export list persisted and in-memory consistent, 10 concurrent TryRouteRequest goroutines (race-detector clean) |
+| **Total** | **245** | |
 
 The `TestIntegrationSequence` test covers all 10 steps of the full integration scenario in a single sequential test with per-step log output.
+
+---
+
+## v0.2 Cross-Federation Call Routing (Session 5)
+
+Session 5 makes point-to-point calls (REQUEST/RESPONSE) transparent across federation boundaries. From the calling entity's perspective, a cross-federation call is identical to a local call — same frame types, same timeout semantics.
+
+### High-level flow
+
+```
+Node A (requester entity X)          Node B (target entity Y)
+
+X sends REQUEST{target=Y.pub}
+    │
+    ▼ node.handleRequest (Node A)
+    ├─ CallerIdentity / ReceivedAt stamped BEFORE registry.Get
+    ├─ registry.Get(Y.pub) → nil (Y not local)
+    ├─ fedManager.TryRouteRequest(req, X.sessionID)
+    │       ├─ remoteEntities.Load(hex(Y.pub)) → peerHex = B
+    │       ├─ fedCalls.AddOutbound(corrID, X.sessionID, B.pubkey, deadline)
+    │       └─ pc.SendData(FED_REQUEST{corrID, target, payload, callerIdentity,
+    │                                   receivedAt, timeoutMs})
+    │
+    │  (QUIC stream A→B)
+    │
+    ▼ runPeerReadLoop → handleInboundFrame (Node B)
+    └─ handleInboundRequest
+           └─ nodeHooks.RouteLocalRequest(corrID, Y.pub, payload,
+                  callerIdentity, receivedAt, timeoutMs, A.pubkey)
+                   │
+                   ▼ node.Server.RouteLocalRequest (Node B)
+                   ├─ registry.Get(Y.pub) → Y's EntityRecord
+                   ├─ calls.AddFed(corrID, Y.sessionID, A.pubkey, deadline)
+                   └─ targetSw.enqueue(REQUEST, req)
+                           │
+                           ▼ Y receives REQUEST (same as local)
+
+Y sends RESPONSE{corrID, payload}
+    │
+    ▼ node.handleResponse (Node B)
+    ├─ calls.Peek / Verify / calls.Remove → PendingCall{FedSourcePeerPubkey=A.pubkey}
+    ├─ FedSourcePeerPubkey != nil → fedManager.ForwardResponse(corrID, payload, A.pubkey)
+    │       └─ pc.SendData(FED_RESPONSE{corrID, payload})
+    │
+    │  (QUIC stream B→A)
+    │
+    ▼ runPeerReadLoop → handleInboundFrame (Node A)
+    └─ handleInboundResponse
+           ├─ fedCalls.RemoveOutbound(corrID) → OutboundCall{RequesterLocalSID=X.sessionID}
+           └─ nodeHooks.RouteLocalResponse(corrID, payload, X.sessionID)
+                   └─ node.Server.RouteLocalResponse
+                           └─ requesterSw.enqueue(RESPONSE, payload)
+                                   │
+                                   ▼ X receives RESPONSE (same as local)
+```
+
+### `internal/federation/calls/calls.go` (new package)
+
+Tracks outbound cross-federation calls by correlation ID.
+
+```go
+type OutboundCall struct {
+    RequesterLocalSID string    // session ID of the local requester on this node
+    TargetPeerPubkey  []byte    // peer that the request was forwarded to
+    Deadline          time.Time
+}
+
+type Registry struct {
+    mu       sync.Mutex
+    outbound map[string]*OutboundCall
+}
+```
+
+- `AddOutbound(corrID, requesterSID, peerPubkey, deadline)` — registers an outbound call; copies peerPubkey defensively.
+- `RemoveOutbound(corrID)` — removes and returns the entry; nil if not found.
+- `ExpiredOutbound(now)` — removes and returns all entries past deadline; used by `runFedCallTimeoutChecker`.
+
+### S5 additions to `internal/federation/manager/manager.go`
+
+**New Manager fields:**
+- `remoteEntities sync.Map` — `entityHex → peerHex` routing table. Populated at `Start()` from SQLite via `store.GetRemoteEntityMap()` and updated on every `UpdateExportList` call and inbound `FED_POLICY` frame.
+- `fedCalls *fedcalls.Registry` — outbound call registry. Initialized in `New()`.
+- `stopOnce sync.Once` — makes `Stop()` idempotent (safe to call multiple times).
+
+**`TryRouteRequest(req *pb.Request, requesterSID string) bool`**
+1. Looks up `hex(req.TargetPubkey)` in `remoteEntities` → peerHex.
+2. Returns false immediately if not found (caller falls through to local `NOT_FOUND` error).
+3. Loads the active `*peer.PeerConn`; returns false if peer not active.
+4. Registers outbound call in `fedCalls`.
+5. Marshals `FedRequest{corrID, targetPubkey, payload, callerIdentity, receivedAt, timeoutMs, requesterNodePub}` and enqueues via `pc.SendData`. Returns true.
+
+**`handleInboundRequest(pc, peerHex, *pb.FedRequest)`**
+- Dispatches via `nodeHooks.RouteLocalRequest(corrID, targetPubkey, payload, callerIdentity, receivedAt, timeoutMs, pc.PeerPubkey())`.
+- The hook implementation in `node.Server` calls `calls.AddFed` (not `calls.Add`) so the RESPONSE path knows to call `ForwardResponse` rather than a local session write.
+
+**`handleInboundResponse(peerHex, *pb.FedResponse)`**
+- Calls `fedCalls.RemoveOutbound(corrID)` to get `RequesterLocalSID`.
+- Calls `nodeHooks.RouteLocalResponse(corrID, payload, requesterSID)`.
+
+**`ForwardResponse(corrID string, payload []byte, peerPubkey []byte)`**
+- Marshals `FedResponse{corrID, payload}`; enqueues via `pc.SendData` to the peer identified by `hex(peerPubkey)`.
+- Logs a warning (no panic) if the peer is not found or no longer active.
+
+**`handleInboundPolicy(pc, peerHex, *pb.FedPolicy)`**
+- New handler for `FED_POLICY` frames received from peers.
+- Extracts `pol.ExportedPubkeys`, hex-encodes each, calls `store.SetExportList(peerHex, entityHexes)` to persist.
+- Updates `remoteEntities` sync.Map: clears old entries for this peer, stores new ones.
+- Also updates `outPolicies`/`inPolicies` if the FedPolicy contains subject rules (future-proofing).
+
+**`sendFedPolicy` with `ExportedPubkeys`**
+- Now calls `store.GetExportList(peerHex)` and hex-decodes each entity pubkey before attaching to `FedPolicy.exported_pubkeys`.
+- This means peers receive the local node's export list on activation, hydrating their routing table.
+
+**`runFedCallTimeoutChecker()` goroutine**
+- Ticks every 1 second.
+- Calls `fedCalls.ExpiredOutbound(now)` and for each expired call: `nodeHooks.SendLocalError(requesterSID, "TIMEOUT", "...", corrID)`.
+- Goroutine is wg-tracked; exits when `m.done` is closed.
+
+### S5 additions to `internal/node/node.go`
+
+**`handleRequest` — stamp before routing:**
+```
+CallerIdentity and ReceivedAt are stamped BEFORE registry.Get, so TryRouteRequest
+forwards already-stamped values to the peer node.
+```
+
+**Federation fallback in `handleRequest`:**
+```go
+if targetEnt == nil {
+    if s.fedManager != nil {
+        if routed := s.fedManager.TryRouteRequest(&req, rec.ID); routed { return }
+    }
+    s.sendError(sw, "NOT_FOUND", "target entity not connected")
+    return
+}
+```
+
+**`handleResponse` — cross-federation return path:**
+```go
+if len(pending.FedSourcePeerPubkey) > 0 {
+    if s.fedManager != nil {
+        s.fedManager.ForwardResponse(resp.CorrelationId, resp.Payload, pending.FedSourcePeerPubkey)
+    }
+    return
+}
+// else: local path (unchanged)
+```
+
+**New `NodeHooks` method implementations:**
+- `RouteLocalRequest` — finds entity in local registry, calls `calls.AddFed`, enqueues REQUEST to target session writer.
+- `RouteLocalResponse` — finds requester session writer by ID, enqueues RESPONSE frame.
+- `SendLocalError` — finds session writer by ID, enqueues ERROR frame via `enqueueControl`.
+
+### `FedPolicy.exported_pubkeys` field
+
+`FedPolicy` (frame type 19) now carries `repeated bytes exported_pubkeys` — the list of local entity pubkeys reachable via this node. Peers hydrate their `remoteEntities` routing table from this field on activation and on every subsequent `FED_POLICY` frame.
 
 ---
 
@@ -956,9 +1121,11 @@ No import cycles. `proto/` and `internal/transport` are leaves. `internal/federa
 type NodeHooks interface {
     FederatedPublish(subject string, payload []byte, publisherPubkey []byte)
     SchemaRegistry() *schema.Registry
+    // S5: cross-federation call routing
     RouteLocalRequest(corrID string, targetPubkey []byte, payload []byte,
-        callerIdentity string, receivedAt int64, sourcePeerPubkey []byte)
-    RouteLocalResponse(corrID string, payload []byte, sourcePeerPubkey []byte)
+        callerIdentity string, receivedAt int64, timeoutMs uint32, sourcePeerPubkey []byte)
+    RouteLocalResponse(corrID string, payload []byte, requesterSessionID string)
+    SendLocalError(sessionID, code, message, refID string)
 }
 ```
 `node.Server` implements this interface. The manager holds it as a `NodeHooks` interface value — zero coupling to the concrete `node.Server` type.
@@ -990,8 +1157,10 @@ type ConnectionInfo struct {
 | `ResumePeer(hex)` | Paused → Active in DB + PeerConn; sends `FED_POLICY` |
 | `RevokePeer(hex)` | Sends `FED_STATUS{revoked}`; calls `pc.Revoke()`; deletes from map; updates DB |
 | `UpdatePolicy(hex, out, in)` | Replaces outbound + inbound policy rules in DB |
-| `UpdateExportList(hex, entityHexes)` | Replaces exported entity pubkeys in DB |
+| `UpdateExportList(hex, entityHexes)` | Replaces exported entity pubkeys in DB and in-memory `remoteEntities` routing table |
 | `GetConnections()` | Joins in-memory peer state with DB policy counts |
+| `TryRouteRequest(req, requesterSID)` | S5: looks up `req.TargetPubkey` in `remoteEntities`; if found, sends FED_REQUEST to the owning peer and records the outbound call in `fedCalls`; returns true on success |
+| `ForwardResponse(corrID, payload, peerPubkey)` | S5: sends FED_RESPONSE to the peer identified by `peerPubkey`; used by `node.handleResponse` when `PendingCall.FedSourcePeerPubkey` is set |
 
 **`HandleIncoming` dispatch logic:**
 

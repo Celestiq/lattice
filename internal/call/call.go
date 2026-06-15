@@ -8,9 +8,10 @@ import (
 
 // PendingCall tracks a forwarded REQUEST waiting for its RESPONSE.
 type PendingCall struct {
-	RequesterSessionID string
-	TargetSessionID    string // session that must send the RESPONSE (Decision #6)
-	Deadline           time.Time
+	RequesterSessionID  string
+	TargetSessionID     string // session that must send the RESPONSE (Decision #6)
+	Deadline            time.Time
+	FedSourcePeerPubkey []byte // nil for local calls; set for cross-federation inbound calls (S5)
 }
 
 // ExpiredCall is returned by Expired for each call that has passed its deadline.
@@ -39,6 +40,22 @@ func (r *Registry) Add(correlationID, requesterSessionID, targetSessionID string
 		RequesterSessionID: requesterSessionID,
 		TargetSessionID:    targetSessionID,
 		Deadline:           deadline,
+	}
+}
+
+// AddFed registers a cross-federation inbound call (S5). The source peer's
+// pubkey is stored so handleResponse routes the RESPONSE back across the
+// federation boundary. RequesterSessionID is intentionally empty — the
+// requester is on the source peer node, not connected locally.
+func (r *Registry) AddFed(correlationID, targetSessionID string, sourcePeerPubkey []byte, deadline time.Time) {
+	pk := make([]byte, len(sourcePeerPubkey))
+	copy(pk, sourcePeerPubkey)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.pending[correlationID] = &PendingCall{
+		TargetSessionID:     targetSessionID,
+		Deadline:            deadline,
+		FedSourcePeerPubkey: pk,
 	}
 }
 

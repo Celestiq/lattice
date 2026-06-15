@@ -284,6 +284,26 @@ func (s *Store) DeletePeer(pubkeyHex string) error {
 	return tx.Commit()
 }
 
+// GetExportList returns the entity pubkey hex strings exported to peerHex.
+// These are entities on this node that have been made available to peerHex.
+func (s *Store) GetExportList(peerHex string) ([]string, error) {
+	rows, err := s.db.Query(
+		`SELECT entity_pubkey_hex FROM remote_entities WHERE peer_pubkey_hex = ?`, peerHex)
+	if err != nil {
+		return nil, fmt.Errorf("fedstore: get export list for %s: %w", peerHex, err)
+	}
+	defer rows.Close()
+	var entities []string
+	for rows.Next() {
+		var e string
+		if err := rows.Scan(&e); err != nil {
+			return nil, fmt.Errorf("fedstore: scan entity: %w", err)
+		}
+		entities = append(entities, e)
+	}
+	return entities, rows.Err()
+}
+
 // GetRemoteEntityMap returns a map of entity_pubkey_hex → peer_pubkey_hex for
 // all stored remote entities. Used at startup to hydrate the in-memory routing
 // table.

@@ -119,14 +119,80 @@ func (s *Server) FederatedPublish(subject string, payload []byte, publisherPubke
 	s.fanout(subject, payload, publisherPubkey)
 }
 
-// RouteLocalRequest forwards a cross-federation REQUEST to the local target.
-// Stub in S3; wired in S5.
-func (s *Server) RouteLocalRequest(_ string, _ []byte, _ []byte, _ string, _ int64, _ []byte) {
+// RouteLocalRequest forwards a cross-federation REQUEST to the local target
+// entity on this node (S5). sourcePeerPubkey identifies the peer node that
+// sent the request; it is stored in the call registry so that handleResponse
+// can route the RESPONSE back across the federation boundary.
+func (s *Server) RouteLocalRequest(corrID string, targetPubkey []byte, payload []byte,
+	callerIdentity string, receivedAt int64, timeoutMs uint32, sourcePeerPubkey []byte) {
+
+	sendErrBack := func(code, message string) {
+		if s.fedManager == nil {
+			return
+		}
+		errPayload, _ := proto.Marshal(&pb.Error{
+			Code: code, Message: message, RefId: corrID,
+		})
+		s.fedManager.ForwardResponse(corrID, errPayload, sourcePeerPubkey)
+	}
+
+	targetEnt := s.registry.Get(targetPubkey)
+	if targetEnt == nil {
+		sendErrBack("NOT_FOUND", "target entity not connected")
+		return
+	}
+	v, ok := s.conns.Load(targetEnt.SessionID)
+	if !ok {
+		sendErrBack("NOT_FOUND", "target entity not connected")
+		return
+	}
+	targetSw := v.(*sessionWriter)
+
+	ms := timeoutMs
+	if ms == 0 {
+		ms = 5000
+	}
+	deadline := time.Now().Add(time.Duration(ms) * time.Millisecond)
+	s.calls.AddFed(corrID, targetEnt.SessionID, sourcePeerPubkey, deadline)
+
+	req := &pb.Request{
+		CorrelationId:  corrID,
+		Payload:        payload,
+		CallerIdentity: callerIdentity,
+		ReceivedAt:     receivedAt,
+		TargetPubkey:   targetPubkey,
+	}
+	reqPayload, _ := proto.Marshal(req)
+	if !targetSw.enqueue(pb.FrameType_FRAME_TYPE_REQUEST, reqPayload) {
+		s.calls.Remove(corrID)
+		sendErrBack("DELIVERY_FAILED", "target data channel full")
+	}
 }
 
-// RouteLocalResponse routes a cross-federation RESPONSE back to the requester.
-// Stub in S3; wired in S5.
-func (s *Server) RouteLocalResponse(_ string, _ []byte, _ []byte) {
+// RouteLocalResponse delivers a cross-federation RESPONSE to the local session
+// identified by requesterSessionID (S5). Called by the manager when FED_RESPONSE
+// arrives from a peer node.
+func (s *Server) RouteLocalResponse(corrID string, payload []byte, requesterSessionID string) {
+	respPayload, _ := proto.Marshal(&pb.Response{
+		CorrelationId: corrID,
+		Payload:       payload,
+	})
+	if v, ok := s.conns.Load(requesterSessionID); ok {
+		_ = v.(*sessionWriter).enqueue(pb.FrameType_FRAME_TYPE_RESPONSE, respPayload)
+	}
+}
+
+// SendLocalError sends an ERROR frame to a local session (S5). Used by the
+// manager to deliver timeout errors for expired cross-federation calls.
+func (s *Server) SendLocalError(sessionID, code, message, refID string) {
+	errPayload, _ := proto.Marshal(&pb.Error{
+		Code:    code,
+		Message: message,
+		RefId:   refID,
+	})
+	if v, ok := s.conns.Load(sessionID); ok {
+		_ = v.(*sessionWriter).enqueueControl(pb.FrameType_FRAME_TYPE_ERROR, errPayload)
+	}
 }
 
 // ─── Connection handling ──────────────────────────────────────────────────────
@@ -377,9 +443,20 @@ func (s *Server) handleRequest(sw *sessionWriter, rec *session.Record, payload [
 		return
 	}
 
-	// Target must be present in the entity registry.
+	// Stamp caller_identity and received_at server-side (Decision #18).
+	// Must happen before TryRouteRequest so the remote peer receives the correct values.
+	req.CallerIdentity = acl.EncodeIdentity(rec.Pubkey)
+	req.ReceivedAt = time.Now().UnixMilli()
+
+	// Target must be present in the local entity registry.
 	targetEnt := s.registry.Get(req.TargetPubkey)
 	if targetEnt == nil {
+		// Try cross-federation routing (S5): route via a peer if the target is exported there.
+		if s.fedManager != nil {
+			if routed := s.fedManager.TryRouteRequest(&req, rec.ID); routed {
+				return
+			}
+		}
 		s.sendError(sw, "NOT_FOUND", "target entity not connected")
 		return
 	}
@@ -400,12 +477,7 @@ func (s *Server) handleRequest(sw *sessionWriter, rec *session.Record, payload [
 	// before the pending entry exists.
 	s.calls.Add(req.CorrelationId, rec.ID, targetEnt.SessionID, deadline)
 
-	// Stamp caller_identity and received_at server-side before forwarding so the
-	// target can trust these fields (Decision #18). Client-supplied values are overwritten.
-	req.CallerIdentity = acl.EncodeIdentity(rec.Pubkey)
-	req.ReceivedAt = time.Now().UnixMilli()
 	stampedPayload, _ := proto.Marshal(&req)
-
 	if !targetSw.enqueue(pb.FrameType_FRAME_TYPE_REQUEST, stampedPayload) {
 		s.calls.Remove(req.CorrelationId)
 		s.sendError(sw, "DELIVERY_FAILED", "target data channel full")
@@ -436,6 +508,15 @@ func (s *Server) handleResponse(sw *sessionWriter, rec *session.Record, payload 
 	pending = s.calls.Remove(resp.CorrelationId)
 	if pending == nil {
 		return // expired between Peek and Remove; silently drop
+	}
+
+	// Cross-federation inbound call (S5): response goes back to the peer node,
+	// not a local session. FedSourcePeerPubkey is set by calls.AddFed.
+	if len(pending.FedSourcePeerPubkey) > 0 {
+		if s.fedManager != nil {
+			s.fedManager.ForwardResponse(resp.CorrelationId, resp.Payload, pending.FedSourcePeerPubkey)
+		}
+		return
 	}
 
 	v, ok := s.conns.Load(pending.RequesterSessionID)

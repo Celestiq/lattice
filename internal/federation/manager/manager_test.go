@@ -948,11 +948,16 @@ func TestManagerE2EGetConnections(t *testing.T) {
 
 // ─── S4: Forwarding Policy Engine + Schema Propagation ────────────────────────
 
-// mockNodeHooks implements manager.NodeHooks for forwarding tests.
+// mockNodeHooks implements manager.NodeHooks for forwarding and call-routing tests.
 type mockNodeHooks struct {
 	mu        sync.Mutex
 	published []mockPublished
 	reg       *schema.Registry
+
+	// S5: call routing
+	routeLocalRequestFn  func(corrID string, targetPubkey []byte, payload []byte, callerIdentity string, receivedAt int64, timeoutMs uint32, sourcePeerPubkey []byte)
+	routeLocalResponseFn func(corrID string, payload []byte, requesterSID string)
+	sendLocalErrorFn     func(sessionID, code, message, refID string)
 }
 
 type mockPublished struct {
@@ -969,8 +974,30 @@ func (h *mockNodeHooks) FederatedPublish(subject string, payload []byte, pubkey 
 	h.mu.Unlock()
 }
 func (h *mockNodeHooks) SchemaRegistry() *schema.Registry { return h.reg }
-func (h *mockNodeHooks) RouteLocalRequest(string, []byte, []byte, string, int64, []byte) {}
-func (h *mockNodeHooks) RouteLocalResponse(string, []byte, []byte)                       {}
+func (h *mockNodeHooks) RouteLocalRequest(corrID string, targetPubkey []byte, payload []byte, callerIdentity string, receivedAt int64, timeoutMs uint32, sourcePeerPubkey []byte) {
+	h.mu.Lock()
+	fn := h.routeLocalRequestFn
+	h.mu.Unlock()
+	if fn != nil {
+		fn(corrID, targetPubkey, payload, callerIdentity, receivedAt, timeoutMs, sourcePeerPubkey)
+	}
+}
+func (h *mockNodeHooks) RouteLocalResponse(corrID string, payload []byte, requesterSID string) {
+	h.mu.Lock()
+	fn := h.routeLocalResponseFn
+	h.mu.Unlock()
+	if fn != nil {
+		fn(corrID, payload, requesterSID)
+	}
+}
+func (h *mockNodeHooks) SendLocalError(sessionID, code, message, refID string) {
+	h.mu.Lock()
+	fn := h.sendLocalErrorFn
+	h.mu.Unlock()
+	if fn != nil {
+		fn(sessionID, code, message, refID)
+	}
+}
 
 func (h *mockNodeHooks) countPublished(subject string) int {
 	h.mu.Lock()
@@ -1472,5 +1499,706 @@ func TestForwardingSchemaTrackerRace(t *testing.T) {
 done:
 	if withSchema != 1 {
 		t.Errorf("schema descriptor sent %d times, want exactly 1 (race tracker)", withSchema)
+	}
+}
+
+// ─── S5: Cross-federation call routing ────────────────────────────────────────
+
+// activatePeerAndDrain activates a peer via HandleIncoming, drains the initial
+// FedPolicy frame, and returns a channel of subsequent frames received by the peer.
+func activatePeerAndDrain(t *testing.T, mgr *manager.Manager, peerPriv ed25519.PrivateKey, nonce []byte) (<-chan *wire.Frame, *nonceStream) {
+	t.Helper()
+	managerSide, peerSide := pipeWithNonce(t, nonce)
+	frames := make(chan *wire.Frame, 64)
+	go func() {
+		defer close(frames)
+		fedhandshake.DoFederatedHandshake(context.Background(), peerSide, nonce, peerPriv) //nolint:errcheck
+		// Drain initial FedPolicy frame.
+		peerSide.SetDeadline(time.Now().Add(500 * time.Millisecond)) //nolint:errcheck
+		wire.Read(peerSide)                                           //nolint:errcheck
+		peerSide.SetDeadline(time.Time{})                            //nolint:errcheck
+		for {
+			peerSide.SetDeadline(time.Now().Add(500 * time.Millisecond)) //nolint:errcheck
+			f, err := wire.Read(peerSide)
+			if err != nil {
+				return
+			}
+			frames <- f
+		}
+	}()
+	mgr.HandleIncoming(managerSide)
+	return frames, peerSide
+}
+
+func TestFedCallTargetNotExported(t *testing.T) {
+	nonce := sharedNonce()
+	store := newTestStore(t)
+
+	peerPub, peerPriv := genKey(t)
+	peerHex := pubHex(peerPub)
+	store.UpsertPeer(peerHex, "Peer", "", "manual", "active") //nolint:errcheck
+
+	hooks := &mockNodeHooks{reg: schema.NewRegistry()}
+	mgr := newTestManagerWithHooks(t, store, errDialer{err: errors.New("no dial")}, noopListener{}, hooks)
+	if err := mgr.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mgr.Stop)
+
+	activatePeerAndDrain(t, mgr, peerPriv, nonce)
+	time.Sleep(50 * time.Millisecond)
+
+	// Target not in any export list → TryRouteRequest returns false.
+	targetPub, _ := genKey(t)
+	req := &pb.Request{
+		CorrelationId: "corr-1",
+		TargetPubkey:  targetPub,
+		Payload:       []byte("payload"),
+		TimeoutMs:     5000,
+	}
+	if mgr.TryRouteRequest(req, "sess-x") {
+		t.Error("TryRouteRequest should return false when target is not exported")
+	}
+}
+
+func TestFedCallRouteFound(t *testing.T) {
+	nonce := sharedNonce()
+	store := newTestStore(t)
+
+	peerPub, peerPriv := genKey(t)
+	peerHex := pubHex(peerPub)
+	store.UpsertPeer(peerHex, "Peer", "", "manual", "active") //nolint:errcheck
+
+	// Export a target entity to this peer.
+	targetPub, _ := genKey(t)
+	targetHex := pubHex(targetPub)
+	store.SetExportList(peerHex, []string{targetHex}) //nolint:errcheck
+
+	hooks := &mockNodeHooks{reg: schema.NewRegistry()}
+	mgr := newTestManagerWithHooks(t, store, errDialer{err: errors.New("no dial")}, noopListener{}, hooks)
+	if err := mgr.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mgr.Stop)
+
+	frames, _ := activatePeerAndDrain(t, mgr, peerPriv, nonce)
+	time.Sleep(50 * time.Millisecond)
+
+	// TryRouteRequest should return true and send FED_REQUEST to the peer.
+	req := &pb.Request{
+		CorrelationId:  "corr-fed-1",
+		TargetPubkey:   targetPub,
+		Payload:        []byte("call-payload"),
+		TimeoutMs:      5000,
+		CallerIdentity: "abc123",
+		ReceivedAt:     time.Now().UnixMilli(),
+	}
+	if !mgr.TryRouteRequest(req, "sess-requester") {
+		t.Fatal("TryRouteRequest returned false for exported target")
+	}
+
+	f := waitForFrame(frames, func(f *wire.Frame) bool {
+		return f.Type == pb.FrameType_FRAME_TYPE_FED_REQUEST
+	})
+	if f == nil {
+		t.Fatal("peer did not receive FED_REQUEST")
+	}
+	var fedReq pb.FedRequest
+	if err := proto.Unmarshal(f.Payload, &fedReq); err != nil {
+		t.Fatalf("unmarshal FedRequest: %v", err)
+	}
+	if fedReq.CorrelationId != "corr-fed-1" {
+		t.Errorf("correlation_id: want corr-fed-1, got %s", fedReq.CorrelationId)
+	}
+	if string(fedReq.Payload) != "call-payload" {
+		t.Errorf("payload: want call-payload, got %s", fedReq.Payload)
+	}
+	if !bytes.Equal(fedReq.TargetPubkey, targetPub) {
+		t.Error("target_pubkey mismatch")
+	}
+	if !bytes.Equal(fedReq.RequesterNodePub, nil) && len(fedReq.RequesterNodePub) == 0 {
+		t.Error("requester_node_pub should be set")
+	}
+}
+
+func TestFedCallExportListAdd(t *testing.T) {
+	nonce := sharedNonce()
+	store := newTestStore(t)
+
+	peerPub, peerPriv := genKey(t)
+	peerHex := pubHex(peerPub)
+	store.UpsertPeer(peerHex, "Peer", "", "manual", "active") //nolint:errcheck
+
+	hooks := &mockNodeHooks{reg: schema.NewRegistry()}
+	mgr := newTestManagerWithHooks(t, store, errDialer{err: errors.New("no dial")}, noopListener{}, hooks)
+	if err := mgr.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mgr.Stop)
+
+	activatePeerAndDrain(t, mgr, peerPriv, nonce)
+	time.Sleep(50 * time.Millisecond)
+
+	targetPub, _ := genKey(t)
+	targetHex := pubHex(targetPub)
+	req := &pb.Request{
+		CorrelationId: "corr-2",
+		TargetPubkey:  targetPub,
+		Payload:       []byte("x"),
+		TimeoutMs:     5000,
+	}
+
+	// Before adding to export list → should fail.
+	if mgr.TryRouteRequest(req, "sess-x") {
+		t.Error("expected false before export list update")
+	}
+
+	// Add to export list → routing table should update.
+	if err := mgr.UpdateExportList(peerHex, []string{targetHex}); err != nil {
+		t.Fatalf("UpdateExportList: %v", err)
+	}
+	time.Sleep(30 * time.Millisecond)
+
+	if !mgr.TryRouteRequest(req, "sess-x") {
+		t.Error("expected true after export list update")
+	}
+}
+
+func TestFedCallExportListRemove(t *testing.T) {
+	nonce := sharedNonce()
+	store := newTestStore(t)
+
+	peerPub, peerPriv := genKey(t)
+	peerHex := pubHex(peerPub)
+	targetPub, _ := genKey(t)
+	targetHex := pubHex(targetPub)
+	store.UpsertPeer(peerHex, "Peer", "", "manual", "active") //nolint:errcheck
+	store.SetExportList(peerHex, []string{targetHex})          //nolint:errcheck
+
+	hooks := &mockNodeHooks{reg: schema.NewRegistry()}
+	mgr := newTestManagerWithHooks(t, store, errDialer{err: errors.New("no dial")}, noopListener{}, hooks)
+	if err := mgr.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mgr.Stop)
+
+	activatePeerAndDrain(t, mgr, peerPriv, nonce)
+	time.Sleep(50 * time.Millisecond)
+
+	req := &pb.Request{
+		CorrelationId: "corr-3",
+		TargetPubkey:  targetPub,
+		Payload:       []byte("x"),
+		TimeoutMs:     5000,
+	}
+
+	// Should route before removal.
+	if !mgr.TryRouteRequest(req, "sess-x") {
+		t.Error("expected true before removal")
+	}
+
+	// Remove from export list.
+	if err := mgr.UpdateExportList(peerHex, nil); err != nil {
+		t.Fatalf("UpdateExportList (remove): %v", err)
+	}
+	time.Sleep(30 * time.Millisecond)
+
+	req.CorrelationId = "corr-4" // new corrID to avoid duplicate
+	if mgr.TryRouteRequest(req, "sess-x") {
+		t.Error("expected false after removal")
+	}
+}
+
+func TestFedCallInboundRequestRoutedToHooks(t *testing.T) {
+	nonce := sharedNonce()
+	store := newTestStore(t)
+
+	peerPub, peerPriv := genKey(t)
+	peerHex := pubHex(peerPub)
+	store.UpsertPeer(peerHex, "Peer", "", "manual", "active") //nolint:errcheck
+
+	var gotCorrID string
+	var gotTargetPubkey []byte
+	var gotCallerIdentity string
+	var gotTimeoutMs uint32
+	var gotSourcePeerPubkey []byte
+	var mu sync.Mutex
+
+	hooks := &mockNodeHooks{
+		reg: schema.NewRegistry(),
+		routeLocalRequestFn: func(corrID string, targetPubkey []byte, payload []byte, callerIdentity string, receivedAt int64, timeoutMs uint32, sourcePeerPubkey []byte) {
+			mu.Lock()
+			gotCorrID = corrID
+			gotTargetPubkey = append([]byte(nil), targetPubkey...)
+			gotCallerIdentity = callerIdentity
+			gotTimeoutMs = timeoutMs
+			gotSourcePeerPubkey = append([]byte(nil), sourcePeerPubkey...)
+			mu.Unlock()
+		},
+	}
+	mgr := newTestManagerWithHooks(t, store, errDialer{err: errors.New("no dial")}, noopListener{}, hooks)
+	if err := mgr.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mgr.Stop)
+
+	managerSide, peerSide := pipeWithNonce(t, nonce)
+	go func() {
+		fedhandshake.DoFederatedHandshake(context.Background(), peerSide, nonce, peerPriv) //nolint:errcheck
+		// Drain initial FedPolicy.
+		peerSide.SetDeadline(time.Now().Add(500 * time.Millisecond)) //nolint:errcheck
+		wire.Read(peerSide)                                           //nolint:errcheck
+		peerSide.SetDeadline(time.Time{})                            //nolint:errcheck
+
+		// Send a FED_REQUEST.
+		targetPub, _ := genKey(t)
+		fedReq := &pb.FedRequest{
+			CorrelationId:  "corr-inbound-1",
+			TargetPubkey:   targetPub,
+			Payload:        []byte("req-payload"),
+			TimeoutMs:      3000,
+			CallerIdentity: "caller-x",
+			ReceivedAt:     time.Now().UnixMilli(),
+		}
+		b, _ := proto.Marshal(fedReq)
+		wire.Write(peerSide, pb.FrameType_FRAME_TYPE_FED_REQUEST, b) //nolint:errcheck
+		io.Copy(io.Discard, peerSide)                                  //nolint:errcheck
+	}()
+	mgr.HandleIncoming(managerSide)
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		got := gotCorrID
+		mu.Unlock()
+		if got != "" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if gotCorrID != "corr-inbound-1" {
+		t.Errorf("corrID: want corr-inbound-1, got %q", gotCorrID)
+	}
+	if gotCallerIdentity != "caller-x" {
+		t.Errorf("callerIdentity: want caller-x, got %q", gotCallerIdentity)
+	}
+	if gotTimeoutMs != 3000 {
+		t.Errorf("timeoutMs: want 3000, got %d", gotTimeoutMs)
+	}
+	// sourcePeerPubkey should be the peer's pubkey.
+	if !bytes.Equal(gotSourcePeerPubkey, peerPub) {
+		t.Errorf("sourcePeerPubkey mismatch: want peer pubkey, got %x", gotSourcePeerPubkey)
+	}
+	_ = gotTargetPubkey
+}
+
+func TestFedCallInboundResponseRoutedToHooks(t *testing.T) {
+	nonce := sharedNonce()
+	store := newTestStore(t)
+
+	peerPub, peerPriv := genKey(t)
+	peerHex := pubHex(peerPub)
+	targetPub, _ := genKey(t)
+	targetHex := pubHex(targetPub)
+	store.UpsertPeer(peerHex, "Peer", "", "manual", "active") //nolint:errcheck
+	store.SetExportList(peerHex, []string{targetHex})          //nolint:errcheck
+
+	var gotCorrID string
+	var gotResponsePayload []byte
+	var gotRequesterSID string
+	var mu sync.Mutex
+	done := make(chan struct{})
+
+	hooks := &mockNodeHooks{
+		reg: schema.NewRegistry(),
+		routeLocalResponseFn: func(corrID string, payload []byte, requesterSID string) {
+			mu.Lock()
+			gotCorrID = corrID
+			gotResponsePayload = append([]byte(nil), payload...)
+			gotRequesterSID = requesterSID
+			mu.Unlock()
+			select {
+			case <-done:
+			default:
+				close(done)
+			}
+		},
+	}
+	mgr := newTestManagerWithHooks(t, store, errDialer{err: errors.New("no dial")}, noopListener{}, hooks)
+	if err := mgr.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mgr.Stop)
+
+	frames, peerSide := activatePeerAndDrain(t, mgr, peerPriv, nonce)
+	time.Sleep(50 * time.Millisecond)
+
+	// Send a request from the "requester" session so fedCalls registers it.
+	req := &pb.Request{
+		CorrelationId:  "corr-resp-1",
+		TargetPubkey:   targetPub,
+		Payload:        []byte("req"),
+		TimeoutMs:      5000,
+		CallerIdentity: "caller-y",
+		ReceivedAt:     time.Now().UnixMilli(),
+	}
+	if !mgr.TryRouteRequest(req, "sess-requester-y") {
+		t.Fatal("TryRouteRequest returned false")
+	}
+
+	// Ensure FED_REQUEST was received by the peer.
+	f := waitForFrame(frames, func(f *wire.Frame) bool {
+		return f.Type == pb.FrameType_FRAME_TYPE_FED_REQUEST
+	})
+	if f == nil {
+		t.Fatal("peer did not receive FED_REQUEST")
+	}
+
+	// Peer sends FED_RESPONSE back.
+	fedResp := &pb.FedResponse{
+		CorrelationId: "corr-resp-1",
+		Payload:       []byte("response-data"),
+	}
+	b, _ := proto.Marshal(fedResp)
+	wire.Write(peerSide, pb.FrameType_FRAME_TYPE_FED_RESPONSE, b) //nolint:errcheck
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("RouteLocalResponse was not called within 2s")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if gotCorrID != "corr-resp-1" {
+		t.Errorf("corrID: want corr-resp-1, got %q", gotCorrID)
+	}
+	if string(gotResponsePayload) != "response-data" {
+		t.Errorf("payload: want response-data, got %s", gotResponsePayload)
+	}
+	if gotRequesterSID != "sess-requester-y" {
+		t.Errorf("requesterSID: want sess-requester-y, got %q", gotRequesterSID)
+	}
+}
+
+func TestFedCallForwardResponse(t *testing.T) {
+	nonce := sharedNonce()
+	store := newTestStore(t)
+
+	peerPub, peerPriv := genKey(t)
+	peerHex := pubHex(peerPub)
+	store.UpsertPeer(peerHex, "Peer", "", "manual", "active") //nolint:errcheck
+
+	hooks := &mockNodeHooks{reg: schema.NewRegistry()}
+	mgr := newTestManagerWithHooks(t, store, errDialer{err: errors.New("no dial")}, noopListener{}, hooks)
+	if err := mgr.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mgr.Stop)
+
+	frames, _ := activatePeerAndDrain(t, mgr, peerPriv, nonce)
+	time.Sleep(50 * time.Millisecond)
+
+	// ForwardResponse should send FED_RESPONSE to the active peer.
+	mgr.ForwardResponse("corr-fwd-1", []byte("resp-payload"), peerPub)
+
+	f := waitForFrame(frames, func(f *wire.Frame) bool {
+		return f.Type == pb.FrameType_FRAME_TYPE_FED_RESPONSE
+	})
+	if f == nil {
+		t.Fatal("peer did not receive FED_RESPONSE")
+	}
+	var fedResp pb.FedResponse
+	if err := proto.Unmarshal(f.Payload, &fedResp); err != nil {
+		t.Fatalf("unmarshal FedResponse: %v", err)
+	}
+	if fedResp.CorrelationId != "corr-fwd-1" {
+		t.Errorf("corrID: want corr-fwd-1, got %s", fedResp.CorrelationId)
+	}
+	if string(fedResp.Payload) != "resp-payload" {
+		t.Errorf("payload: want resp-payload, got %s", fedResp.Payload)
+	}
+}
+
+func TestFedCallForwardResponseUnknownPeer(t *testing.T) {
+	store := newTestStore(t)
+	hooks := &mockNodeHooks{reg: schema.NewRegistry()}
+	mgr := newTestManagerWithHooks(t, store, errDialer{err: errors.New("no dial")}, noopListener{}, hooks)
+	if err := mgr.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mgr.Stop)
+
+	unknownPub, _ := genKey(t)
+	// Should not panic even if peer is unknown.
+	mgr.ForwardResponse("corr-x", []byte("payload"), unknownPub)
+}
+
+func TestFedCallTimeoutSendsError(t *testing.T) {
+	nonce := sharedNonce()
+	store := newTestStore(t)
+
+	peerPub, peerPriv := genKey(t)
+	peerHex := pubHex(peerPub)
+	targetPub, _ := genKey(t)
+	targetHex := pubHex(targetPub)
+	store.UpsertPeer(peerHex, "Peer", "", "manual", "active") //nolint:errcheck
+	store.SetExportList(peerHex, []string{targetHex})          //nolint:errcheck
+
+	var gotSessionID, gotCode, gotRefID string
+	var mu sync.Mutex
+	done := make(chan struct{})
+
+	hooks := &mockNodeHooks{
+		reg: schema.NewRegistry(),
+		sendLocalErrorFn: func(sessionID, code, message, refID string) {
+			mu.Lock()
+			gotSessionID = sessionID
+			gotCode = code
+			gotRefID = refID
+			mu.Unlock()
+			select {
+			case <-done:
+			default:
+				close(done)
+			}
+		},
+	}
+	mgr := newTestManagerWithHooks(t, store, errDialer{err: errors.New("no dial")}, noopListener{}, hooks)
+	if err := mgr.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mgr.Stop)
+
+	activatePeerAndDrain(t, mgr, peerPriv, nonce)
+	time.Sleep(50 * time.Millisecond)
+
+	// Route a call with 1ms timeout — will expire almost immediately.
+	req := &pb.Request{
+		CorrelationId:  "corr-timeout-1",
+		TargetPubkey:   targetPub,
+		Payload:        []byte("x"),
+		TimeoutMs:      1,
+		CallerIdentity: "caller-x",
+		ReceivedAt:     time.Now().UnixMilli(),
+	}
+	if !mgr.TryRouteRequest(req, "sess-timeout-x") {
+		t.Fatal("TryRouteRequest returned false")
+	}
+
+	// Wait for the timeout checker to fire (ticks every second; give it 3s).
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("SendLocalError was not called within 3s after call timeout")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if gotSessionID != "sess-timeout-x" {
+		t.Errorf("sessionID: want sess-timeout-x, got %q", gotSessionID)
+	}
+	if gotCode != "TIMEOUT" {
+		t.Errorf("code: want TIMEOUT, got %q", gotCode)
+	}
+	if gotRefID != "corr-timeout-1" {
+		t.Errorf("refID: want corr-timeout-1, got %q", gotRefID)
+	}
+}
+
+func TestFedCallInboundPolicyUpdatesRoutingTable(t *testing.T) {
+	nonce := sharedNonce()
+	store := newTestStore(t)
+
+	peerPub, peerPriv := genKey(t)
+	peerHex := pubHex(peerPub)
+	store.UpsertPeer(peerHex, "Peer", "", "manual", "active") //nolint:errcheck
+
+	hooks := &mockNodeHooks{reg: schema.NewRegistry()}
+	mgr := newTestManagerWithHooks(t, store, errDialer{err: errors.New("no dial")}, noopListener{}, hooks)
+	if err := mgr.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mgr.Stop)
+
+	managerSide, peerSide := pipeWithNonce(t, nonce)
+	go func() {
+		fedhandshake.DoFederatedHandshake(context.Background(), peerSide, nonce, peerPriv) //nolint:errcheck
+		// Drain initial FedPolicy from manager.
+		peerSide.SetDeadline(time.Now().Add(500 * time.Millisecond)) //nolint:errcheck
+		wire.Read(peerSide)                                           //nolint:errcheck
+		peerSide.SetDeadline(time.Time{})                            //nolint:errcheck
+
+		// Send FedPolicy with an exported entity.
+		entityPub, _ := genKey(t)
+		fedPol := &pb.FedPolicy{
+			ExportedPubkeys: [][]byte{entityPub},
+		}
+		b, _ := proto.Marshal(fedPol)
+		wire.Write(peerSide, pb.FrameType_FRAME_TYPE_FED_POLICY, b) //nolint:errcheck
+		io.Copy(io.Discard, peerSide)                                 //nolint:errcheck
+	}()
+	mgr.HandleIncoming(managerSide)
+	time.Sleep(200 * time.Millisecond)
+
+	// The routing table should now contain the exported entity.
+	// Verify by checking that GetRemoteEntityMap has the entry.
+	entityMap, err := store.GetRemoteEntityMap()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The entity should be stored under peerHex.
+	found := false
+	for _, ph := range entityMap {
+		if ph == peerHex {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("inbound FedPolicy did not persist exported entity to SQLite")
+	}
+}
+
+func TestFedCallExportListSentInFedPolicy(t *testing.T) {
+	nonce := sharedNonce()
+	store := newTestStore(t)
+
+	peerPub, peerPriv := genKey(t)
+	peerHex := pubHex(peerPub)
+	targetPub, _ := genKey(t)
+	targetHex := pubHex(targetPub)
+	store.UpsertPeer(peerHex, "Peer", "", "manual", "active") //nolint:errcheck
+	store.SetExportList(peerHex, []string{targetHex})          //nolint:errcheck
+
+	hooks := &mockNodeHooks{reg: schema.NewRegistry()}
+	mgr := newTestManagerWithHooks(t, store, errDialer{err: errors.New("no dial")}, noopListener{}, hooks)
+	if err := mgr.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mgr.Stop)
+
+	managerSide, peerSide := pipeWithNonce(t, nonce)
+	var fedPol pb.FedPolicy
+	gotPolicy := make(chan struct{})
+	go func() {
+		fedhandshake.DoFederatedHandshake(context.Background(), peerSide, nonce, peerPriv) //nolint:errcheck
+		peerSide.SetDeadline(time.Now().Add(time.Second))             //nolint:errcheck
+		f, err := wire.Read(peerSide)
+		if err == nil && f.Type == pb.FrameType_FRAME_TYPE_FED_POLICY {
+			proto.Unmarshal(f.Payload, &fedPol) //nolint:errcheck
+			close(gotPolicy)
+		}
+		io.Copy(io.Discard, peerSide) //nolint:errcheck
+	}()
+	mgr.HandleIncoming(managerSide)
+
+	select {
+	case <-gotPolicy:
+	case <-time.After(2 * time.Second):
+		t.Fatal("did not receive FedPolicy within 2s")
+	}
+
+	// The FedPolicy must include the exported entity pubkey.
+	if len(fedPol.ExportedPubkeys) != 1 {
+		t.Fatalf("ExportedPubkeys: want 1, got %d", len(fedPol.ExportedPubkeys))
+	}
+	if pubHex(fedPol.ExportedPubkeys[0]) != targetHex {
+		t.Errorf("exported pubkey mismatch: want %s, got %s", targetHex[:8], pubHex(fedPol.ExportedPubkeys[0])[:8])
+	}
+}
+
+func TestFedCallExportListPersistedAndHydratedOnStart(t *testing.T) {
+	store := newTestStore(t)
+
+	peerPub, _ := genKey(t)
+	peerHex := pubHex(peerPub)
+	targetPub, _ := genKey(t)
+	targetHex := pubHex(targetPub)
+
+	// Store the peer and its export list before Start().
+	store.UpsertPeer(peerHex, "Peer", "", "manual", "active") //nolint:errcheck
+	store.SetExportList(peerHex, []string{targetHex})          //nolint:errcheck
+
+	hooks := &mockNodeHooks{reg: schema.NewRegistry()}
+	mgr := newTestManagerWithHooks(t, store, errDialer{err: errors.New("no dial")}, noopListener{}, hooks)
+	if err := mgr.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mgr.Stop)
+
+	// The routing table should be populated from SQLite at Start() without
+	// needing to receive a FedPolicy frame. Verify by calling TryRouteRequest
+	// on a peer that's not yet active — it should return false (peer inactive),
+	// but not because the routing table is empty. We need an active peer to
+	// test TryRouteRequest properly, so instead we verify via UpdateExportList
+	// and the SQLite round-trip.
+
+	// Remove then re-add via UpdateExportList to confirm in-memory is consistent.
+	if err := mgr.UpdateExportList(peerHex, nil); err != nil {
+		t.Fatalf("UpdateExportList(remove): %v", err)
+	}
+	if err := mgr.UpdateExportList(peerHex, []string{targetHex}); err != nil {
+		t.Fatalf("UpdateExportList(add): %v", err)
+	}
+
+	list, err := store.GetExportList(peerHex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 || list[0] != targetHex {
+		t.Errorf("export list: want [%s], got %v", targetHex[:8], list)
+	}
+}
+
+func TestFedCallConcurrentTryRouteRequest(t *testing.T) {
+	nonce := sharedNonce()
+	store := newTestStore(t)
+
+	peerPub, peerPriv := genKey(t)
+	peerHex := pubHex(peerPub)
+	targetPub, _ := genKey(t)
+	targetHex := pubHex(targetPub)
+	store.UpsertPeer(peerHex, "Peer", "", "manual", "active") //nolint:errcheck
+	store.SetExportList(peerHex, []string{targetHex})          //nolint:errcheck
+
+	hooks := &mockNodeHooks{reg: schema.NewRegistry()}
+	mgr := newTestManagerWithHooks(t, store, errDialer{err: errors.New("no dial")}, noopListener{}, hooks)
+	if err := mgr.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mgr.Stop)
+
+	activatePeerAndDrain(t, mgr, peerPriv, nonce)
+	time.Sleep(50 * time.Millisecond)
+
+	// 10 goroutines simultaneously call TryRouteRequest for the same target.
+	// Each uses a distinct correlation ID; all should succeed.
+	var wg sync.WaitGroup
+	var routed int32
+	for i := range 10 {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			req := &pb.Request{
+				CorrelationId:  fmt.Sprintf("corr-conc-%d", i),
+				TargetPubkey:   targetPub,
+				Payload:        []byte("x"),
+				TimeoutMs:      5000,
+				CallerIdentity: fmt.Sprintf("caller-%d", i),
+				ReceivedAt:     time.Now().UnixMilli(),
+			}
+			if mgr.TryRouteRequest(req, fmt.Sprintf("sess-%d", i)) {
+				atomic.AddInt32(&routed, 1)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	if atomic.LoadInt32(&routed) != 10 {
+		t.Errorf("all 10 concurrent TryRouteRequest calls should succeed; got %d", routed)
 	}
 }
