@@ -265,6 +265,25 @@ func (s *Store) SetExportList(peerHex string, entityHexes []string) error {
 	return tx.Commit()
 }
 
+// DeletePeer removes a peer and all associated policy/entity rows.
+// Child rows (policy, entities) are deleted first to satisfy the foreign-key constraint.
+func (s *Store) DeletePeer(pubkeyHex string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("fedstore: begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+	for _, tbl := range []string{"federation_outbound_policy", "federation_inbound_policy", "remote_entities"} {
+		if _, err := tx.Exec("DELETE FROM "+tbl+" WHERE peer_pubkey_hex = ?", pubkeyHex); err != nil {
+			return fmt.Errorf("fedstore: delete from %s: %w", tbl, err)
+		}
+	}
+	if _, err := tx.Exec("DELETE FROM federation_peers WHERE pubkey_hex = ?", pubkeyHex); err != nil {
+		return fmt.Errorf("fedstore: delete peer %s: %w", pubkeyHex, err)
+	}
+	return tx.Commit()
+}
+
 // GetRemoteEntityMap returns a map of entity_pubkey_hex → peer_pubkey_hex for
 // all stored remote entities. Used at startup to hydrate the in-memory routing
 // table.

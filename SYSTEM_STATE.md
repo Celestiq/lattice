@@ -1,6 +1,6 @@
 # Lattice — System State
 
-**Scope:** Local orchestration + federation (in progress) · **Language:** Go 1.25 · **v0.1.1:** Sessions 0–7 complete · **v0.2 Federation S1+S2:** QUIC transport + symmetric FedHello handshake + SQLite persistence · **Branch:** `dev/v0.2`
+**Scope:** Local orchestration + federation (in progress) · **Language:** Go 1.25 · **v0.1.1:** Sessions 0–7 complete · **v0.2 Federation S1–S3:** QUIC transport + FedHello handshake + SQLite persistence + Federation Manager + Bilateral Consent + Admin API · **Branch:** `dev/v0.2`
 
 This document captures the complete state of the Lattice codebase: what exists, how the pieces fit together, and the design decisions behind them. Start here before reading any source file.
 
@@ -52,9 +52,12 @@ lattice/
 │       ├── peer/          #   PeerConn state machine (S2)
 │       │   ├── peer.go    #     Pending→Active→Paused↔Active→Revoked
 │       │   └── peer_test.go  # 4 tests
-│       └── store/         #   SQLite peer persistence (S2)
-│           ├── store.go   #     modernc.org/sqlite; 4 tables; CRUD
-│           └── store_test.go # 5 tests
+│       ├── store/         #   SQLite peer persistence (S2)
+│       │   ├── store.go   #     modernc.org/sqlite; 4 tables; CRUD + DeletePeer
+│       │   └── store_test.go # 5 tests
+│       └── manager/       #   federation lifecycle + consent (S3)
+│           ├── manager.go #     Manager, NodeHooks, ConnectionInfo; Start/Stop/HandleIncoming/consent ops
+│           └── manager_test.go # 18 tests (topology / fault / consent lifecycle / race / e2e)
 ├── proto/
 │   ├── frames.proto       # 23 frame types (0-14 client, 15-23 federation)
 │   ├── federation.proto   # v0.2: FedHello, FedPolicy, FedDeliver, FedRequest, ...
@@ -449,6 +452,7 @@ type Server struct {
     wg                sync.WaitGroup
     stopOnce          sync.Once
     done              chan struct{}
+    fedManager        *manager.Manager    // nil when federation disabled (S3)
 }
 ```
 Created once; `HandleConn` is called in a goroutine per accepted connection. The `wg` tracks all HandleConn goroutines and the three background goroutines (heartbeat checker, call timeout checker, token expirer). `done` is closed by `Shutdown()` to signal them. `stopOnce` prevents double-close panics.
@@ -456,6 +460,12 @@ Created once; `HandleConn` is called in a goroutine per accepted connection. The
 `New(log, serverPriv, heartbeatInterval, tokenTTL ...time.Duration)` — the optional `tokenTTL` overrides the default 5-minute resume-token TTL.
 
 `SchemaRegistry() *schema.Registry` — returns the server's dynamic schema registry. Used by `admin.New` to wire the admin HTTP server to the same registry instance.
+
+`SetFederationManager(mgr *manager.Manager)` — wires the federation manager (S3). nil-safe — existing 192+ tests pass when no manager is set.
+
+`FederatedPublish(subject string, payload []byte, publisherPubkey []byte)` — implements `NodeHooks`; calls `s.fanout` directly (S3 stub, full routing in S4).
+
+`RouteLocalRequest` / `RouteLocalResponse` — `NodeHooks` stubs for federated call routing (implemented in S5).
 
 `durableReplayHook(*session.Record)` — called during resume after subscriptions are restored. No-op stub in v0.1.1; durable message replay is not yet implemented.
 
@@ -682,12 +692,30 @@ A lightweight stdlib `net/http` server. Accessible via `cmd/lattice-node --admin
 
 **Timeouts and body limits (L-1):** `ListenAndServe` uses an `http.Server` with `ReadTimeout(10s)`, `WriteTimeout(10s)`, `IdleTimeout(60s)`, and `MaxHeaderBytes(64 KiB)`. `handleRegisterSchema` caps the request body at 512 KiB via `http.MaxBytesReader`; oversized requests return `413 Request Entity Too Large` before any parsing occurs.
 
+**Schema endpoints:**
+
 | Method | Path | Body | Response |
 |--------|------|------|----------|
-| `POST` | `/schema` | `{"subject": "...", "message_name": "...", "descriptor": "<base64 FileDescriptorProto>"}` | `204 No Content`, `400 Bad Request`, `413 Too Large`, or `422 Unprocessable Entity` |
+| `POST` | `/schema` | `{"subject": "...", "message_name": "...", "descriptor": "<base64 FileDescriptorProto>"}` | `204`, `400`, `413`, or `422` |
 | `GET` | `/schema` | — | `200 JSON [{"subject":"...","schema_version":N}]` |
 
-`admin.Server` also exposes `Serve(net.Listener)` for tests only — it bypasses the loopback address check. **Production code must use `ListenAndServe`**; serving the admin mux on a non-loopback listener exposes unauthenticated schema registration. (`internal/admin` is module-internal, so no external caller can reach it regardless.)
+**Federation endpoints (registered via `SetFederationManager`, S3):**
+
+| Method | Path | Body | Response |
+|--------|------|------|----------|
+| `POST` | `/federation/pair` | `{"pubkey":"<64-hex>","name":"...","addr":"..."}` | `201` (created), `400` (bad hex), `409` (already known) |
+| `POST` | `/federation/accept` | `{"pubkey":"<64-hex>"}` | `204`, `400`, `409` (not pending) |
+| `POST` | `/federation/reject` | `{"pubkey":"<64-hex>"}` | `204`, `400`, `409` (not pending) |
+| `POST` | `/federation/pause` | `{"pubkey":"<64-hex>"}` | `204`, `400`, `409` (not active) |
+| `POST` | `/federation/resume` | `{"pubkey":"<64-hex>"}` | `204`, `400`, `409` (not paused) |
+| `POST` | `/federation/revoke` | `{"pubkey":"<64-hex>"}` | `204`, `400`, `500` |
+| `GET` | `/federation/connections` | — | `200 JSON [ConnectionInfo]` |
+| `POST` | `/federation/policy` | `{"pubkey":"...","outbound":[...],"inbound":[...]}` | `204`, `400` |
+| `POST` | `/federation/export` | `{"pubkey":"...","entity_pubkeys":[...]}` | `204`, `400` |
+
+All federation endpoints return `503 Service Unavailable` if federation is not enabled (`--fed-addr` not set). `validatePubkeyHex` rejects any string that isn't exactly 64 hex characters (32 bytes).
+
+`admin.Server` also exposes `Handler() http.Handler` (for httptest) and `Serve(net.Listener)` (for test binding). **Production code must use `ListenAndServe`**; serving the admin mux on a non-loopback listener exposes unauthenticated endpoints.
 
 The server binary exposes `srv.SchemaRegistry() *schema.Registry` to pass to `admin.New`.
 
@@ -839,7 +867,8 @@ go test ./...
 | `internal/federation/handshake` | 8 | Mutual auth (both pubkeys correct), known-peer flow, unknown-peer flow, bad signature → ErrInvalidSignature, wrong protocol version → ErrProtocolVersion + FED_REJECT, 200ms deadline fires without goroutine leak, stream close midway returns error, 3 concurrent handshakes same peer pubkey (race-detector clean) |
 | `internal/federation/peer` | 4 | All legal transitions (Pending→Active→Paused→Active→Revoked + stream.Close called), illegal transitions from Revoked return ErrIllegalTransition/ErrAlreadyRevoked, 20 goroutines concurrent Pause/Resume (race-detector clean), Revoke while writing (no panic, write returns error) |
 | `internal/federation/store` | 5 | Full round-trip (write peer + 3 outbound + 2 inbound rules + 5 export entities; close; reopen; verify all), bad path returns error, 10 concurrent UpsertPeer goroutines (no SQLITE_BUSY), persist+restart (2 active peers + entity maps survive close/reopen), revoked peer absent from AllActivePeers |
-| **Total** | **192** | |
+| `internal/federation/manager` | 15 | **Topology:** Start dials 2 active peers, HandleIncoming known-active sends FedPolicy, HandleIncoming known-paused skips FedPolicy, HandleIncoming unknown stores as pending, HandleIncoming revoked sends FedReject. **Admin lifecycle:** pair→accept→pause→resume→revoke full round-trip via HTTP (201/204/409 status codes). **Fault injection:** dial unreachable peer (Stop() returns cleanly), stream drop after activation resets DB to pending, Stop() during dial goroutine. **Admin validation:** invalid pubkey hex → 400, accept non-pending peer → 409. **Race/concurrency:** concurrent AcceptPeer+RejectPeer (one wins, no panic), 3 concurrent HandleIncoming from same peer (exactly one activates, rest get FedReject, race-detector clean), 10 concurrent Pause/Resume rounds (race-detector clean), Stop with 4 active peers (all cleaned, Stop returns). **E2E:** GetConnections returns all 3 peers with correct policy rule counts |
+| **Total** | **207** | |
 
 The `TestIntegrationSequence` test covers all 10 steps of the full integration scenario in a single sequential test with per-step log output.
 
@@ -883,6 +912,106 @@ internal/federation/handshake (v0.2) ──► internal/transport (Stream interf
                                     ──► proto/ (FedHello, FedHelloAck, FedReject)
 internal/federation/peer (v0.2)     ──► internal/transport (Stream interface)
 internal/federation/store (v0.2)    ──► modernc.org/sqlite v1.52.0
+internal/federation/manager (v0.2)  ──► internal/federation/handshake
+                                    ──► internal/federation/peer
+                                    ──► internal/federation/store
+                                    ──► internal/transport (Dialer/Listener/TLSExporter)
+                                    ──► internal/wire (Read/Write)
+                                    ──► internal/schema (NodeHooks.SchemaRegistry)
+                                    ──► proto/ (FED_* frame types)
+cmd/lattice-node (S3)               ──► internal/federation/manager
+                                    ──► internal/admin (SetFederationManager)
 ```
 
-No import cycles. `proto/` and `internal/transport` are leaves. `internal/federation/*` packages are new leaves in S2 — they do not import `internal/node`. The federation manager hook-up (node.go integration) happens in Session 3.
+No import cycles. `proto/` and `internal/transport` are leaves. `internal/federation/manager` does NOT import `internal/node` — the `NodeHooks` interface inverts the dependency direction. `internal/federation/manager` imports `node` only via the `NodeHooks` interface (no direct import of `internal/node`) — the dependency is inverted through the interface.
+
+---
+
+## v0.2 Federation Manager + Bilateral Consent (Session 3)
+
+### `internal/federation/manager/manager.go`
+
+`Manager` owns the full federation lifecycle: dialing active peers on startup, accepting incoming connections, routing bilateral consent state changes, and exposing policy/export configuration.
+
+**`NodeHooks` interface** — callbacks from the manager into the node layer:
+```go
+type NodeHooks interface {
+    FederatedPublish(subject string, payload []byte, publisherPubkey []byte)
+    SchemaRegistry() *schema.Registry
+    RouteLocalRequest(corrID string, targetPubkey []byte, payload []byte,
+        callerIdentity string, receivedAt int64, sourcePeerPubkey []byte)
+    RouteLocalResponse(corrID string, payload []byte, sourcePeerPubkey []byte)
+}
+```
+`node.Server` implements this interface. The manager holds it as a `NodeHooks` interface value — zero coupling to the concrete `node.Server` type.
+
+**`ConnectionInfo`** — returned by `GetConnections()`:
+```go
+type ConnectionInfo struct {
+    PubkeyHex     string `json:"pubkey_hex"`
+    Name          string `json:"name"`
+    Addr          string `json:"addr"`
+    State         string `json:"state"`
+    OutboundRules int    `json:"outbound_rules"`
+    InboundRules  int    `json:"inbound_rules"`
+}
+```
+
+**Key Manager methods:**
+
+| Method | Description |
+|--------|-------------|
+| `New(localPriv, store, dialer, listener, nodeHooks, log)` | Constructor |
+| `Start()` | Dials all active/paused peers from store; starts accept loop goroutine |
+| `Stop()` | Cancels context; calls `Revoke` on all in-memory peers; closes listener; `wg.Wait()` |
+| `HandleIncoming(stream)` | FedHello handshake + dispatch by DB state |
+| `PairPeer(hex, name, addr)` | Stores peer as "pending"; error if already known |
+| `AcceptPeer(hex)` | pending → active in DB; starts `connectPeerWithRetry` goroutine |
+| `RejectPeer(hex)` | Deletes pending peer from store (and child rows) |
+| `PausePeer(hex)` | Active → Paused in DB + PeerConn; sends `FED_STATUS{paused}` |
+| `ResumePeer(hex)` | Paused → Active in DB + PeerConn; sends `FED_POLICY` |
+| `RevokePeer(hex)` | Sends `FED_STATUS{revoked}`; calls `pc.Revoke()`; deletes from map; updates DB |
+| `UpdatePolicy(hex, out, in)` | Replaces outbound + inbound policy rules in DB |
+| `UpdateExportList(hex, entityHexes)` | Replaces exported entity pubkeys in DB |
+| `GetConnections()` | Joins in-memory peer state with DB policy counts |
+
+**`HandleIncoming` dispatch logic:**
+
+| DB state of peer | Action |
+|-----------------|--------|
+| `"active"` | `getOrCreatePeer` → `pc.Activate(stream)` (reject concurrent with `FED_REJECT`); `sendFedPolicy`; `runPeerReadLoop(resetOnDrop=true)` |
+| `"paused"` | Same as active but NO `sendFedPolicy` — peer is paused, keep stream open silently |
+| `"revoked"` | Write `FED_REJECT{reason:"revoked"}` + close stream |
+| `nil` / `"pending"` | `UpsertPeer` as pending; write `FED_PENDING{introductionId=hex[:8]}`; close stream |
+
+**Bilateral consent flow (A accepts B, B dials back A):**
+1. A operator calls `PairPeer(B)` → B stored as `"pending"` in A's DB.
+2. A operator calls `AcceptPeer(B)` → B promoted to `"active"` in A's DB; A starts `connectPeerWithRetry(B, resetOnDrop=false)`.
+3. A dials B. B's `HandleIncoming` sees A as unknown → sends `FED_PENDING` → closes stream.
+4. `connectPeerWithRetry` exits (stream closed) but does NOT reset B to "pending" in A's DB (because `resetOnDrop=false`).
+5. B operator calls `PairPeer(A)` + `AcceptPeer(A)`. B dials A.
+6. A's `HandleIncoming` sees B as `"active"` → calls `pc.Activate(stream)` → `sendFedPolicy` → both nodes are now in `StateActive`.
+
+**`consentMu sync.Mutex`** — serializes all consent state transitions (AcceptPeer, RejectPeer, PausePeer, ResumePeer, RevokePeer, UpdatePolicy, UpdateExportList) to prevent TOCTOU races like concurrent AcceptPeer+RejectPeer.
+
+**`TLSExporter` interface** — added to `internal/transport/transport.go`:
+```go
+type TLSExporter interface {
+    ExportKeyingMaterial(label string, context []byte, length int) ([]byte, error)
+}
+```
+QUIC streams (`quicStream`, `lazyServerStream`) implement it via `conn.ConnectionState().TLS.ExportKeyingMaterial(...)` (local variable assignment required — `tls.ConnectionState` has pointer receiver in Go 1.21+). `deriveNonce` type-asserts the stream to `TLSExporter`; falls back to zero slice for non-QUIC streams (test doubles).
+
+**`connectPeerWithRetry`** — exponential backoff (1s base, 60s cap) with `select` on `m.done` so `Stop()` cancels all retry loops immediately.
+
+**`getOrCreatePeer`** — uses `sync.Map.LoadOrStore` atomically; handles stale Revoked entries via `CompareAndDelete`.
+
+**`store.DeletePeer(hex)`** — added to `fedstore.Store` (S3); deletes child rows (`federation_outbound_policy`, `federation_inbound_policy`, `remote_entities`) then the peer row in a single transaction.
+
+### `cmd/lattice-node/main.go` — federation flags (S3)
+
+Two new flags:
+- `--fed-addr ""` — QUIC federation listen address; empty = federation disabled.
+- `--fed-db "./fed.db"` — SQLite database path for federation peer state.
+
+When `--fed-addr` is non-empty, `main` creates a QUIC listener, opens the SQLite store, creates the Manager, calls `Start()`, and wires it to both `node.Server` (`SetFederationManager`) and `admin.Server` (`SetFederationManager`). `Stop()` is called in the SIGINT/SIGTERM handler before `srv.Shutdown()`.

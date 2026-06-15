@@ -16,6 +16,7 @@ import (
 	"lattice/internal/acl"
 	"lattice/internal/bus"
 	"lattice/internal/call"
+	"lattice/internal/federation/manager"
 	"lattice/internal/handshake"
 	"lattice/internal/registry"
 	"lattice/internal/schema"
@@ -42,6 +43,7 @@ type Server struct {
 	wg                sync.WaitGroup
 	stopOnce          sync.Once
 	done              chan struct{}
+	fedManager        *manager.Manager // nil when federation is disabled
 }
 
 // New creates a Server and starts the background heartbeat checker.
@@ -101,6 +103,30 @@ func (s *Server) AddRule(r acl.Rule) {
 // Used by the admin server to register schemas at runtime.
 func (s *Server) SchemaRegistry() *schema.Registry {
 	return s.schema
+}
+
+// SetFederationManager attaches a federation Manager. The node becomes a
+// NodeHooks implementation: FederatedPublish fans out to local subscribers;
+// RouteLocalRequest and RouteLocalResponse are wired in S4/S5.
+func (s *Server) SetFederationManager(mgr *manager.Manager) {
+	s.fedManager = mgr
+}
+
+// FederatedPublish delivers a message received from a peer to local
+// subscribers. It bypasses publish-side ACL (the sending peer's outbound
+// policy already validated the message). Implements manager.NodeHooks.
+func (s *Server) FederatedPublish(subject string, payload []byte, publisherPubkey []byte) {
+	s.fanout(subject, payload, publisherPubkey)
+}
+
+// RouteLocalRequest forwards a cross-federation REQUEST to the local target.
+// Stub in S3; wired in S5.
+func (s *Server) RouteLocalRequest(_ string, _ []byte, _ []byte, _ string, _ int64, _ []byte) {
+}
+
+// RouteLocalResponse routes a cross-federation RESPONSE back to the requester.
+// Stub in S3; wired in S5.
+func (s *Server) RouteLocalResponse(_ string, _ []byte, _ []byte) {
 }
 
 // ─── Connection handling ──────────────────────────────────────────────────────

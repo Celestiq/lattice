@@ -55,6 +55,11 @@ func (s *quicStream) Close() error {
 	return err
 }
 
+func (s *quicStream) ExportKeyingMaterial(label string, context []byte, length int) ([]byte, error) {
+	cs := s.conn.ConnectionState().TLS
+	return cs.ExportKeyingMaterial(label, context, length)
+}
+
 // ─── Listener-side stream (AcceptStream deferred until first use) ─────────────
 
 type streamResult struct {
@@ -128,6 +133,11 @@ func (s *lazyServerStream) Close() error {
 		err = s.conn.CloseWithError(0, "")
 	})
 	return err
+}
+
+func (s *lazyServerStream) ExportKeyingMaterial(label string, context []byte, length int) ([]byte, error) {
+	cs := s.conn.ConnectionState().TLS
+	return cs.ExportKeyingMaterial(label, context, length)
 }
 
 // ─── Listener ────────────────────────────────────────────────────────────────

@@ -27,3 +27,11 @@ type Listener interface {
 	Addr() net.Addr
 	Close() error
 }
+
+// TLSExporter is an optional interface that Stream implementations backed by a
+// real TLS connection may satisfy. The federation manager uses it to derive the
+// nonce passed to DoFederatedHandshake. Test streams provide a fixed nonce by
+// implementing this interface.
+type TLSExporter interface {
+	ExportKeyingMaterial(label string, context []byte, length int) ([]byte, error)
+}
