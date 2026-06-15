@@ -19,6 +19,9 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protodesc"
+
 	"lattice/internal/admin"
 	fedhandshake "lattice/internal/federation/handshake"
 	"lattice/internal/federation/manager"
@@ -940,5 +943,534 @@ func TestManagerE2EGetConnections(t *testing.T) {
 	}
 	if byHex[p3Hex].InboundRules != 2 {
 		t.Errorf("p3 inbound rules: want 2, got %d", byHex[p3Hex].InboundRules)
+	}
+}
+
+// ─── S4: Forwarding Policy Engine + Schema Propagation ────────────────────────
+
+// mockNodeHooks implements manager.NodeHooks for forwarding tests.
+type mockNodeHooks struct {
+	mu        sync.Mutex
+	published []mockPublished
+	reg       *schema.Registry
+}
+
+type mockPublished struct {
+	subject string
+	payload []byte
+	pubkey  []byte
+}
+
+func (h *mockNodeHooks) FederatedPublish(subject string, payload []byte, pubkey []byte) {
+	h.mu.Lock()
+	h.published = append(h.published, mockPublished{
+		subject, append([]byte(nil), payload...), append([]byte(nil), pubkey...),
+	})
+	h.mu.Unlock()
+}
+func (h *mockNodeHooks) SchemaRegistry() *schema.Registry { return h.reg }
+func (h *mockNodeHooks) RouteLocalRequest(string, []byte, []byte, string, int64, []byte) {}
+func (h *mockNodeHooks) RouteLocalResponse(string, []byte, []byte)                       {}
+
+func (h *mockNodeHooks) countPublished(subject string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	n := 0
+	for _, p := range h.published {
+		if p.subject == subject {
+			n++
+		}
+	}
+	return n
+}
+
+func newTestManagerWithHooks(t *testing.T, store *fedstore.Store, dialer transport.Dialer, listener transport.Listener, hooks *mockNodeHooks) *manager.Manager {
+	t.Helper()
+	_, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	return manager.New(priv, store, dialer, listener, hooks, log)
+}
+
+// testFdBytes returns marshalled FileDescriptorProto bytes for the lattice schemas file.
+func testFdBytes(t *testing.T) []byte {
+	t.Helper()
+	fdp := protodesc.ToFileDescriptorProto((&pb.TemperatureReading{}).ProtoReflect().Descriptor().ParentFile())
+	b, err := proto.Marshal(fdp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// activatePeer performs a HandleIncoming handshake in a background goroutine,
+// then drains all frames until a non-FedPolicy type is seen or the read deadline
+// expires. Returns a channel that receives all frames delivered to peerSide.
+func activatePeer(t *testing.T, mgr *manager.Manager, peerPriv ed25519.PrivateKey, nonce []byte) (<-chan *wire.Frame, *nonceStream) {
+	t.Helper()
+	managerSide, peerSide := pipeWithNonce(t, nonce)
+	frames := make(chan *wire.Frame, 32)
+	go func() {
+		defer close(frames)
+		fedhandshake.DoFederatedHandshake(context.Background(), peerSide, nonce, peerPriv) //nolint:errcheck
+		for {
+			peerSide.SetDeadline(time.Now().Add(400 * time.Millisecond)) //nolint:errcheck
+			f, err := wire.Read(peerSide)
+			if err != nil {
+				return
+			}
+			frames <- f
+		}
+	}()
+	mgr.HandleIncoming(managerSide)
+	return frames, peerSide
+}
+
+// waitForFrame reads from ch and returns the first frame matching pred, or
+// nil if the channel closes before a match is found.
+func waitForFrame(ch <-chan *wire.Frame, pred func(*wire.Frame) bool) *wire.Frame {
+	for f := range ch {
+		if pred(f) {
+			return f
+		}
+	}
+	return nil
+}
+
+func TestForwardingDenyByDefault(t *testing.T) {
+	nonce := sharedNonce()
+	store := newTestStore(t)
+
+	peerPub, peerPriv := genKey(t)
+	peerHex := pubHex(peerPub)
+	// Active peer, no outbound policy → default deny.
+	store.UpsertPeer(peerHex, "Peer", "", "manual", "active") //nolint:errcheck
+
+	hooks := &mockNodeHooks{reg: schema.NewRegistry()}
+	mgr := newTestManagerWithHooks(t, store, errDialer{err: errors.New("no dial")}, noopListener{}, hooks)
+	if err := mgr.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mgr.Stop)
+
+	frames, _ := activatePeer(t, mgr, peerPriv, nonce)
+	time.Sleep(50 * time.Millisecond)
+
+	mgr.ForwardIfNeeded("sensors.temperature", []byte("data"), make([]byte, 32))
+
+	// Collect frames for 300 ms; must not see FedDeliver.
+	timer := time.NewTimer(300 * time.Millisecond)
+	defer timer.Stop()
+	for {
+		select {
+		case f, ok := <-frames:
+			if !ok {
+				return
+			}
+			if f.Type == pb.FrameType_FRAME_TYPE_FED_DELIVER {
+				t.Error("received FedDeliver despite no outbound policy")
+				return
+			}
+		case <-timer.C:
+			return
+		}
+	}
+}
+
+func TestForwardingSinglePeerForwardRule(t *testing.T) {
+	nonce := sharedNonce()
+	store := newTestStore(t)
+
+	peerPub, peerPriv := genKey(t)
+	peerHex := pubHex(peerPub)
+	store.UpsertPeer(peerHex, "Peer", "", "manual", "active") //nolint:errcheck
+	store.SetOutboundPolicy(peerHex, []fedstore.PolicyRule{   //nolint:errcheck
+		{SubjectPattern: "sensors.>", Effect: "forward"},
+	})
+
+	hooks := &mockNodeHooks{reg: schema.NewRegistry()}
+	mgr := newTestManagerWithHooks(t, store, errDialer{err: errors.New("no dial")}, noopListener{}, hooks)
+	if err := mgr.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mgr.Stop)
+
+	frames, _ := activatePeer(t, mgr, peerPriv, nonce)
+	time.Sleep(50 * time.Millisecond)
+
+	mgr.ForwardIfNeeded("sensors.temperature", []byte("hello"), make([]byte, 32))
+
+	f := waitForFrame(frames, func(f *wire.Frame) bool {
+		return f.Type == pb.FrameType_FRAME_TYPE_FED_DELIVER
+	})
+	if f == nil {
+		t.Fatal("peer did not receive FedDeliver for matching subject")
+	}
+	var deliver pb.FedDeliver
+	if err := proto.Unmarshal(f.Payload, &deliver); err != nil {
+		t.Fatalf("unmarshal FedDeliver: %v", err)
+	}
+	if deliver.Subject != "sensors.temperature" {
+		t.Errorf("subject: want sensors.temperature, got %s", deliver.Subject)
+	}
+	if string(deliver.Payload) != "hello" {
+		t.Errorf("payload: want hello, got %s", deliver.Payload)
+	}
+}
+
+func TestForwardingNonMatchingSubjectNotForwarded(t *testing.T) {
+	nonce := sharedNonce()
+	store := newTestStore(t)
+
+	peerPub, peerPriv := genKey(t)
+	peerHex := pubHex(peerPub)
+	store.UpsertPeer(peerHex, "Peer", "", "manual", "active") //nolint:errcheck
+	store.SetOutboundPolicy(peerHex, []fedstore.PolicyRule{   //nolint:errcheck
+		{SubjectPattern: "sensors.>", Effect: "forward"},
+	})
+
+	hooks := &mockNodeHooks{reg: schema.NewRegistry()}
+	mgr := newTestManagerWithHooks(t, store, errDialer{err: errors.New("no dial")}, noopListener{}, hooks)
+	if err := mgr.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mgr.Stop)
+
+	frames, _ := activatePeer(t, mgr, peerPriv, nonce)
+	time.Sleep(50 * time.Millisecond)
+
+	// "metrics.cpu" does not match "sensors.>" → should be dropped.
+	mgr.ForwardIfNeeded("metrics.cpu", []byte("data"), make([]byte, 32))
+
+	timer := time.NewTimer(300 * time.Millisecond)
+	defer timer.Stop()
+	for {
+		select {
+		case f, ok := <-frames:
+			if !ok {
+				return
+			}
+			if f.Type == pb.FrameType_FRAME_TYPE_FED_DELIVER {
+				t.Error("FedDeliver sent for non-matching subject")
+			}
+		case <-timer.C:
+			return
+		}
+	}
+}
+
+func TestForwardingInboundAccept(t *testing.T) {
+	nonce := sharedNonce()
+	store := newTestStore(t)
+
+	peerPub, peerPriv := genKey(t)
+	peerHex := pubHex(peerPub)
+	store.UpsertPeer(peerHex, "Peer", "", "manual", "active") //nolint:errcheck
+	store.SetInboundPolicy(peerHex, []fedstore.PolicyRule{    //nolint:errcheck
+		{SubjectPattern: "sensors.>", Effect: "accept"},
+	})
+
+	hooks := &mockNodeHooks{reg: schema.NewRegistry()}
+	mgr := newTestManagerWithHooks(t, store, errDialer{err: errors.New("no dial")}, noopListener{}, hooks)
+	if err := mgr.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mgr.Stop)
+
+	managerSide, peerSide := pipeWithNonce(t, nonce)
+	go func() {
+		fedhandshake.DoFederatedHandshake(context.Background(), peerSide, nonce, peerPriv) //nolint:errcheck
+		// Drain the FedPolicy the manager always sends on activation.
+		peerSide.SetDeadline(time.Now().Add(500 * time.Millisecond)) //nolint:errcheck
+		wire.Read(peerSide)                                           //nolint:errcheck
+		peerSide.SetDeadline(time.Time{})                            //nolint:errcheck
+		// Send a FedDeliver that should be accepted.
+		deliverB, _ := proto.Marshal(&pb.FedDeliver{
+			Subject: "sensors.temperature",
+			Payload: []byte("inbound"),
+		})
+		wire.Write(peerSide, pb.FrameType_FRAME_TYPE_FED_DELIVER, deliverB) //nolint:errcheck
+		io.Copy(io.Discard, peerSide)                                        //nolint:errcheck
+	}()
+	mgr.HandleIncoming(managerSide)
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if hooks.countPublished("sensors.temperature") > 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Error("FederatedPublish was not called for accepted inbound FedDeliver")
+}
+
+func TestForwardingInboundDeny(t *testing.T) {
+	nonce := sharedNonce()
+	store := newTestStore(t)
+
+	peerPub, peerPriv := genKey(t)
+	peerHex := pubHex(peerPub)
+	// Active peer with no inbound policy → default deny.
+	store.UpsertPeer(peerHex, "Peer", "", "manual", "active") //nolint:errcheck
+
+	hooks := &mockNodeHooks{reg: schema.NewRegistry()}
+	mgr := newTestManagerWithHooks(t, store, errDialer{err: errors.New("no dial")}, noopListener{}, hooks)
+	if err := mgr.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mgr.Stop)
+
+	managerSide, peerSide := pipeWithNonce(t, nonce)
+	go func() {
+		fedhandshake.DoFederatedHandshake(context.Background(), peerSide, nonce, peerPriv) //nolint:errcheck
+		peerSide.SetDeadline(time.Now().Add(500 * time.Millisecond))                       //nolint:errcheck
+		wire.Read(peerSide)                                                                 //nolint:errcheck
+		peerSide.SetDeadline(time.Time{})                                                  //nolint:errcheck
+		deliverB, _ := proto.Marshal(&pb.FedDeliver{
+			Subject: "sensors.temperature",
+			Payload: []byte("should be denied"),
+		})
+		wire.Write(peerSide, pb.FrameType_FRAME_TYPE_FED_DELIVER, deliverB) //nolint:errcheck
+		io.Copy(io.Discard, peerSide)                                        //nolint:errcheck
+	}()
+	mgr.HandleIncoming(managerSide)
+
+	time.Sleep(300 * time.Millisecond)
+	if hooks.countPublished("sensors.temperature") != 0 {
+		t.Error("FederatedPublish was called despite no inbound policy (expected deny)")
+	}
+}
+
+func TestForwardingSchemaDescriptorFirstOnly(t *testing.T) {
+	nonce := sharedNonce()
+	store := newTestStore(t)
+
+	peerPub, peerPriv := genKey(t)
+	peerHex := pubHex(peerPub)
+	store.UpsertPeer(peerHex, "Peer", "", "manual", "active") //nolint:errcheck
+	store.SetOutboundPolicy(peerHex, []fedstore.PolicyRule{   //nolint:errcheck
+		{SubjectPattern: "test.>", Effect: "forward"},
+	})
+
+	fdBytes := testFdBytes(t)
+	reg := schema.NewRegistry()
+	if err := reg.Register("test.sensor.reading", "TemperatureReading", fdBytes); err != nil {
+		t.Fatalf("register schema: %v", err)
+	}
+
+	hooks := &mockNodeHooks{reg: reg}
+	mgr := newTestManagerWithHooks(t, store, errDialer{err: errors.New("no dial")}, noopListener{}, hooks)
+	if err := mgr.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mgr.Stop)
+
+	frames, _ := activatePeer(t, mgr, peerPriv, nonce)
+	time.Sleep(50 * time.Millisecond)
+
+	// First forward — SchemaDescriptor must be present.
+	mgr.ForwardIfNeeded("test.sensor.reading", []byte("p1"), make([]byte, 32))
+	f1 := waitForFrame(frames, func(f *wire.Frame) bool {
+		return f.Type == pb.FrameType_FRAME_TYPE_FED_DELIVER
+	})
+	if f1 == nil {
+		t.Fatal("peer did not receive first FedDeliver")
+	}
+	var d1 pb.FedDeliver
+	proto.Unmarshal(f1.Payload, &d1) //nolint:errcheck
+	if len(d1.SchemaDescriptor) == 0 {
+		t.Error("first FedDeliver: want SchemaDescriptor present, got nil")
+	}
+
+	// Second forward — SchemaDescriptor must be absent.
+	mgr.ForwardIfNeeded("test.sensor.reading", []byte("p2"), make([]byte, 32))
+	f2 := waitForFrame(frames, func(f *wire.Frame) bool {
+		return f.Type == pb.FrameType_FRAME_TYPE_FED_DELIVER
+	})
+	if f2 == nil {
+		t.Fatal("peer did not receive second FedDeliver")
+	}
+	var d2 pb.FedDeliver
+	proto.Unmarshal(f2.Payload, &d2) //nolint:errcheck
+	if len(d2.SchemaDescriptor) != 0 {
+		t.Error("second FedDeliver: want SchemaDescriptor absent (already sent), got present")
+	}
+}
+
+func TestForwardingSchemaAutoRegisteredOnInbound(t *testing.T) {
+	nonce := sharedNonce()
+	store := newTestStore(t)
+
+	peerPub, peerPriv := genKey(t)
+	peerHex := pubHex(peerPub)
+	store.UpsertPeer(peerHex, "Peer", "", "manual", "active") //nolint:errcheck
+	store.SetInboundPolicy(peerHex, []fedstore.PolicyRule{    //nolint:errcheck
+		{SubjectPattern: "test.>", Effect: "accept"},
+	})
+
+	reg := schema.NewRegistry()
+	hooks := &mockNodeHooks{reg: reg}
+	mgr := newTestManagerWithHooks(t, store, errDialer{err: errors.New("no dial")}, noopListener{}, hooks)
+	if err := mgr.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mgr.Stop)
+
+	fdBytes := testFdBytes(t)
+
+	managerSide, peerSide := pipeWithNonce(t, nonce)
+	go func() {
+		fedhandshake.DoFederatedHandshake(context.Background(), peerSide, nonce, peerPriv) //nolint:errcheck
+		// Drain FedPolicy sent by manager.
+		peerSide.SetDeadline(time.Now().Add(500 * time.Millisecond)) //nolint:errcheck
+		wire.Read(peerSide)                                           //nolint:errcheck
+		peerSide.SetDeadline(time.Time{})                            //nolint:errcheck
+		// Send FedDeliver with SchemaDescriptor — manager should auto-register.
+		deliverB, _ := proto.Marshal(&pb.FedDeliver{
+			Subject:          "test.sensor.reading",
+			Payload:          []byte("body"),
+			SchemaDescriptor: fdBytes,
+		})
+		wire.Write(peerSide, pb.FrameType_FRAME_TYPE_FED_DELIVER, deliverB) //nolint:errcheck
+		io.Copy(io.Discard, peerSide)                                        //nolint:errcheck
+	}()
+	mgr.HandleIncoming(managerSide)
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if reg.Version("test.sensor.reading") > 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Errorf("schema not auto-registered after inbound FedDeliver with SchemaDescriptor; version=%d", reg.Version("test.sensor.reading"))
+}
+
+func TestForwardingPolicyUpdateRefreshesEngine(t *testing.T) {
+	nonce := sharedNonce()
+	store := newTestStore(t)
+
+	peerPub, peerPriv := genKey(t)
+	peerHex := pubHex(peerPub)
+	// Activate with NO outbound policy (deny all).
+	store.UpsertPeer(peerHex, "Peer", "", "manual", "active") //nolint:errcheck
+
+	hooks := &mockNodeHooks{reg: schema.NewRegistry()}
+	mgr := newTestManagerWithHooks(t, store, errDialer{err: errors.New("no dial")}, noopListener{}, hooks)
+	if err := mgr.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mgr.Stop)
+
+	frames, _ := activatePeer(t, mgr, peerPriv, nonce)
+	time.Sleep(50 * time.Millisecond)
+
+	// Before policy update: ForwardIfNeeded must not deliver.
+	mgr.ForwardIfNeeded("sensors.temperature", []byte("before"), make([]byte, 32))
+	timer := time.NewTimer(150 * time.Millisecond)
+	func() {
+		for {
+			select {
+			case f, ok := <-frames:
+				if !ok {
+					return
+				}
+				if f.Type == pb.FrameType_FRAME_TYPE_FED_DELIVER {
+					t.Error("FedDeliver delivered before policy update")
+					return
+				}
+			case <-timer.C:
+				return
+			}
+		}
+	}()
+	timer.Stop()
+
+	// Apply outbound policy: forward sensors.>
+	err := mgr.UpdatePolicy(peerHex,
+		[]fedstore.PolicyRule{{SubjectPattern: "sensors.>", Effect: "forward"}},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("UpdatePolicy: %v", err)
+	}
+	time.Sleep(30 * time.Millisecond)
+
+	// After policy update: ForwardIfNeeded must deliver.
+	mgr.ForwardIfNeeded("sensors.temperature", []byte("after"), make([]byte, 32))
+	f := waitForFrame(frames, func(f *wire.Frame) bool {
+		return f.Type == pb.FrameType_FRAME_TYPE_FED_DELIVER
+	})
+	if f == nil {
+		t.Fatal("peer did not receive FedDeliver after policy update")
+	}
+}
+
+func TestForwardingSchemaTrackerRace(t *testing.T) {
+	nonce := sharedNonce()
+	store := newTestStore(t)
+
+	peerPub, peerPriv := genKey(t)
+	peerHex := pubHex(peerPub)
+	store.UpsertPeer(peerHex, "Peer", "", "manual", "active") //nolint:errcheck
+	store.SetOutboundPolicy(peerHex, []fedstore.PolicyRule{   //nolint:errcheck
+		{SubjectPattern: ">", Effect: "forward"},
+	})
+
+	fdBytes := testFdBytes(t)
+	reg := schema.NewRegistry()
+	if err := reg.Register("race.subject", "TemperatureReading", fdBytes); err != nil {
+		t.Fatalf("register schema: %v", err)
+	}
+
+	hooks := &mockNodeHooks{reg: reg}
+	mgr := newTestManagerWithHooks(t, store, errDialer{err: errors.New("no dial")}, noopListener{}, hooks)
+	if err := mgr.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mgr.Stop)
+
+	frames, _ := activatePeer(t, mgr, peerPriv, nonce)
+	time.Sleep(50 * time.Millisecond)
+
+	const goroutines = 10
+	var wg sync.WaitGroup
+	for range goroutines {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			mgr.ForwardIfNeeded("race.subject", []byte("x"), make([]byte, 32))
+		}()
+	}
+	wg.Wait()
+
+	// Collect all FedDeliver frames and count how many have SchemaDescriptor.
+	withSchema := 0
+	timer := time.NewTimer(500 * time.Millisecond)
+	defer timer.Stop()
+	collected := 0
+	for collected < goroutines {
+		select {
+		case f, ok := <-frames:
+			if !ok {
+				goto done
+			}
+			if f.Type == pb.FrameType_FRAME_TYPE_FED_DELIVER {
+				var d pb.FedDeliver
+				proto.Unmarshal(f.Payload, &d) //nolint:errcheck
+				if len(d.SchemaDescriptor) > 0 {
+					withSchema++
+				}
+				collected++
+			}
+		case <-timer.C:
+			goto done
+		}
+	}
+done:
+	if withSchema != 1 {
+		t.Errorf("schema descriptor sent %d times, want exactly 1 (race tracker)", withSchema)
 	}
 }

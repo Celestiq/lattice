@@ -28,6 +28,7 @@ type registryEntry struct {
 	msgDesc     protoreflect.MessageDescriptor
 	version     uint32
 	constraints map[protoreflect.FieldNumber]fieldConstraint
+	fdBytes     []byte // raw FileDescriptorProto bytes; nil for built-in schemas
 }
 
 // SubjectInfo is returned by List.
@@ -112,6 +113,7 @@ func (r *Registry) Register(subject, messageName string, fdBytes []byte) error {
 		msgDesc:     msgDesc,
 		version:     version,
 		constraints: constraints,
+		fdBytes:     fdBytes,
 	}
 	return nil
 }
@@ -135,6 +137,18 @@ func (r *Registry) Version(subject string) uint32 {
 		return e.version
 	}
 	return 0
+}
+
+// Descriptor returns the raw FileDescriptorProto bytes for subject, or nil if
+// the subject is not registered or was registered as a built-in schema.
+// Used by the federation manager to propagate schema descriptors to peers.
+func (r *Registry) Descriptor(subject string) []byte {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if e, ok := r.entries[subject]; ok {
+		return e.fdBytes
+	}
+	return nil
 }
 
 // List returns all registered subjects and their current versions.

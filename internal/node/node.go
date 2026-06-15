@@ -353,6 +353,9 @@ func (s *Server) handlePublish(sw *sessionWriter, rec *session.Record, payload [
 
 	// Fan-out — pass publisher pubkey for server-stamped provenance (Decision #4).
 	s.fanout(msg.Subject, msg.Payload, rec.Pubkey)
+	if s.fedManager != nil {
+		s.fedManager.ForwardIfNeeded(msg.Subject, msg.Payload, rec.Pubkey)
+	}
 }
 
 func (s *Server) handleRequest(sw *sessionWriter, rec *session.Record, payload []byte) {

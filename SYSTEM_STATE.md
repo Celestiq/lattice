@@ -1,6 +1,6 @@
 # Lattice — System State
 
-**Scope:** Local orchestration + federation (in progress) · **Language:** Go 1.25 · **v0.1.1:** Sessions 0–7 complete · **v0.2 Federation S1–S3:** QUIC transport + FedHello handshake + SQLite persistence + Federation Manager + Bilateral Consent + Admin API · **Branch:** `dev/v0.2`
+**Scope:** Local orchestration + federation (in progress) · **Language:** Go 1.25 · **v0.1.1:** Sessions 0–7 complete · **v0.2 Federation S1–S4:** QUIC transport + FedHello handshake + SQLite persistence + Federation Manager + Bilateral Consent + Admin API + Forwarding Policy Engine + Schema Propagation · **Branch:** `dev/v0.2`
 
 This document captures the complete state of the Lattice codebase: what exists, how the pieces fit together, and the design decisions behind them. Start here before reading any source file.
 
@@ -49,15 +49,18 @@ lattice/
 │       ├── handshake/     #   symmetric FedHello exchange (S2)
 │       │   ├── handshake.go  # DoFederatedHandshake; rejectAndClose
 │       │   └── handshake_test.go # 8 tests
-│       ├── peer/          #   PeerConn state machine (S2)
-│       │   ├── peer.go    #     Pending→Active→Paused↔Active→Revoked
+│       ├── peer/          #   PeerConn state machine + write channels (S2/S4)
+│       │   ├── peer.go    #     Pending→Active→Paused↔Active→Revoked; ctrl/data channels; RunWriteLoop
 │       │   └── peer_test.go  # 4 tests
+│       ├── policy/        #   first-match forwarding policy engine (S4)
+│       │   ├── engine.go  #     Engine{rules}; Evaluate(subject)→Effect; NewEngine/Empty/SetRules/Rules
+│       │   └── engine_test.go # 7 tests
 │       ├── store/         #   SQLite peer persistence (S2)
 │       │   ├── store.go   #     modernc.org/sqlite; 4 tables; CRUD + DeletePeer
 │       │   └── store_test.go # 5 tests
-│       └── manager/       #   federation lifecycle + consent (S3)
-│           ├── manager.go #     Manager, NodeHooks, ConnectionInfo; Start/Stop/HandleIncoming/consent ops
-│           └── manager_test.go # 18 tests (topology / fault / consent lifecycle / race / e2e)
+│       └── manager/       #   federation lifecycle + consent + forwarding (S3/S4)
+│           ├── manager.go #     Manager, NodeHooks, ConnectionInfo; Start/Stop/HandleIncoming/consent ops; ForwardIfNeeded; handleInboundDeliver
+│           └── manager_test.go # 27 tests (topology / fault / consent lifecycle / race / e2e / S4 forwarding)
 ├── proto/
 │   ├── frames.proto       # 23 frame types (0-14 client, 15-23 federation)
 │   ├── federation.proto   # v0.2: FedHello, FedPolicy, FedDeliver, FedRequest, ...
@@ -674,6 +677,7 @@ type Registry struct {
 - **`Register(subject, messageName string, fdBytes []byte) error`** — parses the `FileDescriptorProto`, builds a `FileDescriptor` via `protodesc.NewFile(fd, protoregistry.GlobalFiles)`, finds the named message, extracts constraints, enforces additive-only versioning, and stores the entry. Version increments by 1 on each accepted upgrade.
 - **`Validate(subject string, payload []byte) error`** — unmarshals using `dynamicpb.NewMessage`, walks fields, enforces `required`, `range`, and `max_length` constraints.
 - **`Version(subject string) uint32`** — returns current version (0 if not registered).
+- **`Descriptor(subject string) []byte`** — returns raw `FileDescriptorProto` bytes stored at `Register` time, or nil for built-in schemas and unknown subjects. Used by `manager.ForwardIfNeeded` to piggyback schema descriptors on the first FedDeliver for a subject to a peer.
 - **`List() []SubjectInfo`** — returns all subjects with versions; used by the admin GET endpoint.
 
 **Additive-only versioning (Decision #16):** `checkAdditive` enforces four constraints (M-4 fix):
@@ -806,12 +810,22 @@ Pending ──Activate(stream)──► Active ──Pause()──► Paused
                              Revoked           (back to Active)
 ```
 
-- `New(pubkey, name, addr)` — creates a PeerConn in Pending. Copies pubkey.
+- `New(pubkey, name, addr)` — creates a PeerConn in Pending. Copies pubkey. Initializes `ctrl` (cap 32) and `data` (cap 256) channels.
 - `Activate(stream)` — Pending → Active. Returns `ErrIllegalTransition` if not Pending.
 - `Pause()` — Active → Paused.
 - `Resume(stream)` — Paused → Active (may attach a new stream on re-dial).
 - `Revoke()` — Active/Paused → Revoked; calls `stream.Close()` after releasing the lock. Returns `ErrAlreadyRevoked` on double-revoke.
 - `State()`, `PeerPubkey()`, `PeerName()`, `Addr()`, `Stream()` — accessors.
+
+**S4 additions:**
+- `SendCtrl(ft, payload) bool` — non-blocking enqueue to ctrl channel (FedPolicy, FedStatus). Returns false if full.
+- `SendData(ft, payload) bool` — non-blocking enqueue to data channel (FedDeliver, FedRequest, FedResponse). Returns false if full (caller logs drop).
+- `RunWriteLoop(done <-chan struct{}, log, onWriteError func())` — priority-drain goroutine: non-blocking ctrl check before every fair select on ctrl/data/done. Writes each frame with a 5-second deadline via `wire.Write`. Calls `onWriteError` once on write failure, then exits. Started by the Manager as a tracked goroutine after `Activate()`.
+
+**Write channel design (mirrors v0.1.1 `sessionWriter` Decision #10):**
+- `ctrl chan fedMsg` (cap 32) — high-priority lane for FedPolicy. FedStatus frames (pause/revoke) bypass the channel and are written directly to the stream before `pc.Revoke()` closes it — preserving send-before-close ordering.
+- `data chan fedMsg` (cap 256) — data-plane lane for FedDeliver. Dropped (not back-pressured) when full.
+- The Manager starts `runPeerWriteLoop(pc, peerHex, resetOnDrop)` as a wg-tracked goroutine after every `Activate()`.
 
 ---
 
@@ -867,8 +881,9 @@ go test ./...
 | `internal/federation/handshake` | 8 | Mutual auth (both pubkeys correct), known-peer flow, unknown-peer flow, bad signature → ErrInvalidSignature, wrong protocol version → ErrProtocolVersion + FED_REJECT, 200ms deadline fires without goroutine leak, stream close midway returns error, 3 concurrent handshakes same peer pubkey (race-detector clean) |
 | `internal/federation/peer` | 4 | All legal transitions (Pending→Active→Paused→Active→Revoked + stream.Close called), illegal transitions from Revoked return ErrIllegalTransition/ErrAlreadyRevoked, 20 goroutines concurrent Pause/Resume (race-detector clean), Revoke while writing (no panic, write returns error) |
 | `internal/federation/store` | 5 | Full round-trip (write peer + 3 outbound + 2 inbound rules + 5 export entities; close; reopen; verify all), bad path returns error, 10 concurrent UpsertPeer goroutines (no SQLITE_BUSY), persist+restart (2 active peers + entity maps survive close/reopen), revoked peer absent from AllActivePeers |
-| `internal/federation/manager` | 15 | **Topology:** Start dials 2 active peers, HandleIncoming known-active sends FedPolicy, HandleIncoming known-paused skips FedPolicy, HandleIncoming unknown stores as pending, HandleIncoming revoked sends FedReject. **Admin lifecycle:** pair→accept→pause→resume→revoke full round-trip via HTTP (201/204/409 status codes). **Fault injection:** dial unreachable peer (Stop() returns cleanly), stream drop after activation resets DB to pending, Stop() during dial goroutine. **Admin validation:** invalid pubkey hex → 400, accept non-pending peer → 409. **Race/concurrency:** concurrent AcceptPeer+RejectPeer (one wins, no panic), 3 concurrent HandleIncoming from same peer (exactly one activates, rest get FedReject, race-detector clean), 10 concurrent Pause/Resume rounds (race-detector clean), Stop with 4 active peers (all cleaned, Stop returns). **E2E:** GetConnections returns all 3 peers with correct policy rule counts |
-| **Total** | **207** | |
+| `internal/federation/policy` | 7 | DenyByDefault, FirstMatchForward, FirstMatchAccept, ExactMatch, GtWildcard, SetRules atomic replace, Rules snapshot immutability |
+| `internal/federation/manager` | 27 | **Topology (S3):** Start dials 2 active peers, HandleIncoming known-active sends FedPolicy, HandleIncoming known-paused skips FedPolicy, HandleIncoming unknown stores as pending, HandleIncoming revoked sends FedReject. **Admin lifecycle (S3):** pair→accept→pause→resume→revoke via HTTP (201/204/409). **Fault injection (S3):** dial unreachable, stream drop resets to pending, Stop() during dial. **Admin validation (S3):** invalid hex → 400, accept non-pending → 409. **Race/concurrency (S3):** concurrent AcceptPeer+RejectPeer, 3 concurrent HandleIncoming from same peer, 10 Pause/Resume rounds, Stop with 4 active peers. **E2E (S3):** GetConnections policy counts. **S4 forwarding (9 tests):** deny-by-default (no outbound rule), single forward rule delivers FedDeliver, non-matching subject not forwarded, inbound accept calls FederatedPublish, inbound deny drops frame, SchemaDescriptor on first forward only (tracker key), schema auto-registered on inbound FedDeliver, UpdatePolicy refreshes in-memory engine, concurrent ForwardIfNeeded schema tracker race |
+| **Total** | **223** | |
 
 The `TestIntegrationSequence` test covers all 10 steps of the full integration scenario in a single sequential test with per-step log output.
 
@@ -912,13 +927,16 @@ internal/federation/handshake (v0.2) ──► internal/transport (Stream interf
                                     ──► proto/ (FedHello, FedHelloAck, FedReject)
 internal/federation/peer (v0.2)     ──► internal/transport (Stream interface)
 internal/federation/store (v0.2)    ──► modernc.org/sqlite v1.52.0
+internal/federation/policy (v0.2 S4) ──► internal/bus (Match for wildcard evaluation)
 internal/federation/manager (v0.2)  ──► internal/federation/handshake
                                     ──► internal/federation/peer
+                                    ──► internal/federation/policy  (S4)
                                     ──► internal/federation/store
                                     ──► internal/transport (Dialer/Listener/TLSExporter)
                                     ──► internal/wire (Read/Write)
-                                    ──► internal/schema (NodeHooks.SchemaRegistry)
+                                    ──► internal/schema (NodeHooks.SchemaRegistry, Descriptor)
                                     ──► proto/ (FED_* frame types)
+                                    ──► google.golang.org/protobuf/types/descriptorpb  (S4 extractMsgName)
 cmd/lattice-node (S3)               ──► internal/federation/manager
                                     ──► internal/admin (SetFederationManager)
 ```
@@ -1015,3 +1033,102 @@ Two new flags:
 - `--fed-db "./fed.db"` — SQLite database path for federation peer state.
 
 When `--fed-addr` is non-empty, `main` creates a QUIC listener, opens the SQLite store, creates the Manager, calls `Start()`, and wires it to both `node.Server` (`SetFederationManager`) and `admin.Server` (`SetFederationManager`). `Stop()` is called in the SIGINT/SIGTERM handler before `srv.Shutdown()`.
+
+---
+
+## v0.2 Forwarding Policy Engine + Schema Propagation (Session 4)
+
+### `internal/federation/policy/engine.go`
+
+First-match forwarding policy engine used by the Manager to decide cross-peer message routing.
+
+```go
+type Effect int
+const (
+    EffectDeny    Effect = iota // no rule matches → deny (default)
+    EffectForward               // outbound: message should cross to this peer
+    EffectAccept                // inbound: message should be delivered locally
+)
+
+type Rule struct {
+    SubjectPattern string
+    Effect         Effect
+}
+
+type Engine struct {
+    mu    sync.RWMutex
+    rules []Rule
+}
+```
+
+- `NewEngine(rules)` — creates Engine with initial rule set (copied).
+- `Empty()` — Engine with no rules (deny all).
+- `Evaluate(subject)` — returns Effect of first rule whose `SubjectPattern` matches `subject` using `bus.Match` semantics (`*`/`>` wildcards). Returns `EffectDeny` on no match.
+- `SetRules(rules)` — atomically replaces all rules (thread-safe).
+- `Rules()` — returns a snapshot copy (mutations don't affect the engine).
+
+### S4 additions to `internal/federation/manager/manager.go`
+
+**New Manager fields:**
+- `outPolicies sync.Map` — `peerHex → *fedpolicy.Engine` (outbound forwarding rules). Loaded from SQLite on peer activation and on every `UpdatePolicy` or `UpdateExportList` call.
+- `inPolicies sync.Map` — `peerHex → *fedpolicy.Engine` (inbound acceptance rules). Same lifecycle as `outPolicies`.
+- `schemaTracker sync.Map` — key: `peerHex+":"+subject` → `struct{}`. Ensures `SchemaDescriptor` is sent at most once per peer per subject. Uses `sync.Map.LoadOrStore` atomically.
+
+**`loadPolicies(peerHex)`** — reads outbound and inbound rules from SQLite, builds `*fedpolicy.Engine` objects, stores them in `outPolicies`/`inPolicies`. Called on activation and after `UpdatePolicy`/`UpdateExportList` to keep in-memory engines fresh without hitting SQLite on the hot forwarding path.
+
+**`ForwardIfNeeded(subject, payload, publisherPubkey []byte)`** — called by `node.Server.handlePublish` after every successful local fanout (nil-guarded: no-op when federation is disabled). Algorithm:
+1. Base32-encode `publisherPubkey` for `FedDeliver.publisher_identity`.
+2. `peers.Range` over all active peers.
+3. For each active peer: load `outPolicies`; if `Evaluate(subject) != EffectForward`, skip.
+4. Check `schemaTracker.LoadOrStore(peerHex+":"+subject, struct{}{})` — if not loaded, attach `SchemaDescriptor = nodeHooks.SchemaRegistry().Descriptor(subject)` to the frame (nil for built-ins → no descriptor).
+5. `proto.Marshal` the `FedDeliver` frame; `pc.SendData` (non-blocking); log drop if full.
+
+**`handleInboundDeliver(pc, peerHex, *pb.FedDeliver)`** — dispatched by `handleInboundFrame` on `FED_DELIVER` frames:
+1. Load `inPolicies` for `peerHex`; if `Evaluate(subject) != EffectAccept`, drop.
+2. If `SchemaDescriptor` is present and `reg.Version(subject) == 0`: call `extractMsgName(fdBytes)` and `reg.Register(subject, msgName, fdBytes)` to auto-register the schema.
+3. Call `nodeHooks.FederatedPublish(subject, payload, pc.PeerPubkey())` → fans out locally.
+
+**`extractMsgName(fdBytes []byte) string`** — unmarshals `FileDescriptorProto` via `proto.Unmarshal`, returns `fdProto.MessageType[0].Name` (the first top-level message). Returns `""` on any error.
+
+**`sendFedPolicy(pc *peer.PeerConn, peerHex string) error`** — changed from taking `transport.Stream` to taking `*peer.PeerConn`. Now uses `pc.SendCtrl` (enqueues to ctrl channel) instead of `wire.Write` (direct stream write). FedStatus frames (pause/revoke signals) remain direct writes to preserve send-before-close ordering.
+
+**`runPeerWriteLoop(pc, peerHex, resetOnDrop)`** — Manager-tracked wrapper for `pc.RunWriteLoop`. `onWriteError` calls `dropPeer(peerHex, resetOnDrop)`.
+
+**`dropPeer(peerHex, resetOnDrop)`** — idempotent cleanup: `peers.Delete(peerHex)`, optionally resets DB state to `"pending"`. Called from both read loop (stream error) and write loop (write error) — `sync.Map.Delete` and `store.UpdatePeerState` are both safe to call multiple times.
+
+### S4 node.go change
+
+Single nil-guarded call added in `handlePublish` after `s.fanout(...)`:
+```go
+if s.fedManager != nil {
+    s.fedManager.ForwardIfNeeded(msg.Subject, msg.Payload, rec.Pubkey)
+}
+```
+
+### Message flow with federation (S4)
+
+```
+Local entity PUBLISH "sensors.temperature"
+    │
+    ▼  node.handlePublish
+    │
+    ├─ ValidateSubject / ACL / schema.Validate / s.fanout  (unchanged)
+    │
+    └─ s.fedManager.ForwardIfNeeded("sensors.temperature", payload, pubkey)
+           │
+           ▼  peers.Range
+           for each active peer:
+               outPolicies[peer].Evaluate(subject)   == EffectForward?
+               yes → build FedDeliver { subject, payload, publisher_identity, published_at }
+                         if first time subject→peer: attach SchemaDescriptor
+                         pc.SendData(FED_DELIVER, marshaled)  (non-blocking; drops if full)
+
+Peer sends FED_DELIVER to us:
+    │
+    ▼  runPeerReadLoop → handleInboundFrame → handleInboundDeliver
+    │
+    ├─ inPolicies[peer].Evaluate(subject)   == EffectAccept?
+    ├─ if SchemaDescriptor present and subject unregistered: auto-register schema
+    └─ nodeHooks.FederatedPublish(subject, payload, peerPubkey)
+           └─ node.FederatedPublish → s.fanout(subject, payload, peerPubkey)
+```

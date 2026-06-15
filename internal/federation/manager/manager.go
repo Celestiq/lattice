@@ -10,6 +10,7 @@ package manager
 import (
 	"context"
 	"crypto/ed25519"
+	"encoding/base32"
 	"encoding/hex"
 	"fmt"
 	"log/slog"
@@ -17,9 +18,11 @@ import (
 	"time"
 
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/descriptorpb"
 
 	fedhandshake "lattice/internal/federation/handshake"
 	"lattice/internal/federation/peer"
+	fedpolicy "lattice/internal/federation/policy"
 	fedstore "lattice/internal/federation/store"
 	"lattice/internal/schema"
 	"lattice/internal/transport"
@@ -64,6 +67,13 @@ type Manager struct {
 	ctx       context.Context
 	cancel    context.CancelFunc
 	consentMu sync.Mutex // serializes all consent state transitions
+
+	// S4: per-peer policy engines loaded from SQLite on activation.
+	outPolicies sync.Map // peerHex → *fedpolicy.Engine (outbound forwarding rules)
+	inPolicies  sync.Map // peerHex → *fedpolicy.Engine (inbound acceptance rules)
+	// S4: schema propagation tracker. Key: peerHex+":"+subject; value: struct{}.
+	// LoadOrStore ensures SchemaDescriptor is sent at most once per peer per subject.
+	schemaTracker sync.Map
 }
 
 // New creates a Manager. Call Start() to begin accepting and dialing.
@@ -164,9 +174,12 @@ func (m *Manager) HandleIncoming(stream transport.Stream) {
 			stream.Close()                                                    //nolint:errcheck
 			return
 		}
-		if err := m.sendFedPolicy(stream, peerHex); err != nil {
+		m.loadPolicies(peerHex)
+		if err := m.sendFedPolicy(pc, peerHex); err != nil {
 			m.log.Warn("fed: sendFedPolicy failed", "peer", peerHex, "err", err)
 		}
+		m.wg.Add(1)
+		go m.runPeerWriteLoop(pc, peerHex, true)
 		m.wg.Add(1)
 		go m.runPeerReadLoop(pc, peerHex, true)
 
@@ -178,7 +191,10 @@ func (m *Manager) HandleIncoming(stream transport.Stream) {
 			stream.Close()                                                    //nolint:errcheck
 			return
 		}
+		m.loadPolicies(peerHex)
 		// No FedPolicy on paused — connection maintained but no message flow.
+		m.wg.Add(1)
+		go m.runPeerWriteLoop(pc, peerHex, true)
 		m.wg.Add(1)
 		go m.runPeerReadLoop(pc, peerHex, true)
 
@@ -300,9 +316,7 @@ func (m *Manager) ResumePeer(peerHex string) error {
 		return err
 	}
 	m.store.UpdatePeerState(peerHex, "active") //nolint:errcheck
-	if stream != nil {
-		m.sendFedPolicy(stream, peerHex) //nolint:errcheck
-	}
+	m.sendFedPolicy(pc, peerHex) //nolint:errcheck
 	return nil
 }
 
@@ -336,12 +350,11 @@ func (m *Manager) UpdatePolicy(peerHex string, outbound, inbound []fedstore.Poli
 	if err := m.store.SetInboundPolicy(peerHex, inbound); err != nil {
 		return err
 	}
+	m.loadPolicies(peerHex)
 	if v, ok := m.peers.Load(peerHex); ok {
 		pc := v.(*peer.PeerConn)
 		if pc.State() == peer.StateActive {
-			if stream := pc.Stream(); stream != nil {
-				m.sendFedPolicy(stream, peerHex) //nolint:errcheck
-			}
+			m.sendFedPolicy(pc, peerHex) //nolint:errcheck
 		}
 	}
 	return nil
@@ -356,12 +369,11 @@ func (m *Manager) UpdateExportList(peerHex string, entityHexes []string) error {
 	if err := m.store.SetExportList(peerHex, entityHexes); err != nil {
 		return err
 	}
+	m.loadPolicies(peerHex)
 	if v, ok := m.peers.Load(peerHex); ok {
 		pc := v.(*peer.PeerConn)
 		if pc.State() == peer.StateActive {
-			if stream := pc.Stream(); stream != nil {
-				m.sendFedPolicy(stream, peerHex) //nolint:errcheck
-			}
+			m.sendFedPolicy(pc, peerHex) //nolint:errcheck
 		}
 	}
 	return nil
@@ -482,9 +494,12 @@ func (m *Manager) connectPeerWithRetry(rec *fedstore.PeerRecord, sendPolicy bool
 			return
 		}
 
+		m.loadPolicies(peerHex)
 		if sendPolicy {
-			m.sendFedPolicy(stream, peerHex) //nolint:errcheck
+			m.sendFedPolicy(pc, peerHex) //nolint:errcheck
 		}
+		m.wg.Add(1)
+		go m.runPeerWriteLoop(pc, peerHex, false)
 		m.wg.Add(1)
 		go m.runPeerReadLoop(pc, peerHex, false)
 		return
@@ -511,10 +526,7 @@ func (m *Manager) runPeerReadLoop(pc *peer.PeerConn, peerHex string, resetOnDrop
 		f, err := wire.Read(stream)
 		if err != nil {
 			m.log.Info("fed: peer disconnected", "peer", peerHex, "err", err)
-			m.peers.Delete(peerHex)
-			if resetOnDrop {
-				m.store.UpdatePeerState(peerHex, "pending") //nolint:errcheck
-			}
+			m.dropPeer(peerHex, resetOnDrop)
 			return
 		}
 		m.handleInboundFrame(pc, peerHex, f)
@@ -537,7 +549,13 @@ func (m *Manager) handleInboundFrame(pc *peer.PeerConn, peerHex string, f *wire.
 			m.store.UpdatePeerState(peerHex, "revoked") //nolint:errcheck
 			m.peers.Delete(peerHex)
 		}
-	// FED_DELIVER, FED_REQUEST, FED_RESPONSE are handled in S4/S5.
+	case pb.FrameType_FRAME_TYPE_FED_DELIVER:
+		var deliver pb.FedDeliver
+		if err := proto.Unmarshal(f.Payload, &deliver); err != nil {
+			return
+		}
+		m.handleInboundDeliver(pc, peerHex, &deliver)
+	// FED_REQUEST, FED_RESPONSE are handled in S5.
 	}
 }
 
@@ -558,8 +576,10 @@ func (m *Manager) getOrCreatePeer(pubkey []byte, name, addr string) *peer.PeerCo
 	return existing
 }
 
-// sendFedPolicy loads rules from the store and writes a FED_POLICY frame.
-func (m *Manager) sendFedPolicy(stream transport.Stream, peerHex string) error {
+// sendFedPolicy loads rules from the store and enqueues a FED_POLICY frame on
+// the peer's ctrl channel. Non-blocking: returns an error only on store failure
+// or full ctrl channel (extremely rare).
+func (m *Manager) sendFedPolicy(pc *peer.PeerConn, peerHex string) error {
 	out, err := m.store.GetOutboundPolicy(peerHex)
 	if err != nil {
 		return err
@@ -568,24 +588,168 @@ func (m *Manager) sendFedPolicy(stream transport.Stream, peerHex string) error {
 	if err != nil {
 		return err
 	}
-	policy := &pb.FedPolicy{}
+	pol := &pb.FedPolicy{}
 	for _, r := range out {
-		policy.Outbound = append(policy.Outbound, &pb.FedPolicyRule{
+		pol.Outbound = append(pol.Outbound, &pb.FedPolicyRule{
 			SubjectPattern: r.SubjectPattern,
 			Effect:         r.Effect,
 		})
 	}
 	for _, r := range in {
-		policy.Inbound = append(policy.Inbound, &pb.FedPolicyRule{
+		pol.Inbound = append(pol.Inbound, &pb.FedPolicyRule{
 			SubjectPattern: r.SubjectPattern,
 			Effect:         r.Effect,
 		})
 	}
-	b, err := proto.Marshal(policy)
+	b, err := proto.Marshal(pol)
 	if err != nil {
 		return err
 	}
-	return wire.Write(stream, pb.FrameType_FRAME_TYPE_FED_POLICY, b)
+	if !pc.SendCtrl(pb.FrameType_FRAME_TYPE_FED_POLICY, b) {
+		return fmt.Errorf("sendFedPolicy: ctrl channel full for peer %s", peerHex)
+	}
+	return nil
+}
+
+// runPeerWriteLoop wraps pc.RunWriteLoop in a manager-tracked goroutine.
+// onWriteError calls dropPeer so the peer is cleaned up if the stream dies.
+func (m *Manager) runPeerWriteLoop(pc *peer.PeerConn, peerHex string, resetOnDrop bool) {
+	defer m.wg.Done()
+	pc.RunWriteLoop(m.done, m.log, func() {
+		m.dropPeer(peerHex, resetOnDrop)
+	})
+}
+
+// dropPeer removes the peer from the active peers map and optionally resets its
+// store state to "pending". Safe to call concurrently from read and write loops.
+func (m *Manager) dropPeer(peerHex string, resetOnDrop bool) {
+	m.peers.Delete(peerHex)
+	if resetOnDrop {
+		m.store.UpdatePeerState(peerHex, "pending") //nolint:errcheck
+	}
+}
+
+// loadPolicies reads outbound and inbound policy rules from SQLite and refreshes
+// the in-memory policy engines for peerHex. Called on activation and after any
+// policy update so ForwardIfNeeded doesn't need to hit SQLite on the hot path.
+func (m *Manager) loadPolicies(peerHex string) {
+	outRules, err := m.store.GetOutboundPolicy(peerHex)
+	if err != nil {
+		m.log.Warn("fed: loadPolicies: GetOutboundPolicy failed", "peer", peerHex, "err", err)
+		return
+	}
+	inRules, err := m.store.GetInboundPolicy(peerHex)
+	if err != nil {
+		m.log.Warn("fed: loadPolicies: GetInboundPolicy failed", "peer", peerHex, "err", err)
+		return
+	}
+	outEngRules := make([]fedpolicy.Rule, 0, len(outRules))
+	for _, r := range outRules {
+		eff := fedpolicy.EffectDeny
+		if r.Effect == "forward" {
+			eff = fedpolicy.EffectForward
+		}
+		outEngRules = append(outEngRules, fedpolicy.Rule{SubjectPattern: r.SubjectPattern, Effect: eff})
+	}
+	inEngRules := make([]fedpolicy.Rule, 0, len(inRules))
+	for _, r := range inRules {
+		eff := fedpolicy.EffectDeny
+		if r.Effect == "accept" {
+			eff = fedpolicy.EffectAccept
+		}
+		inEngRules = append(inEngRules, fedpolicy.Rule{SubjectPattern: r.SubjectPattern, Effect: eff})
+	}
+	m.outPolicies.Store(peerHex, fedpolicy.NewEngine(outEngRules))
+	m.inPolicies.Store(peerHex, fedpolicy.NewEngine(inEngRules))
+}
+
+// ForwardIfNeeded is called by the node after every successful local fanout.
+// It iterates all active peers, evaluates the outbound forwarding policy for
+// each, and enqueues a FedDeliver frame on the peer's data channel.
+// SchemaDescriptor is piggybacked on the first forward of any subject to a
+// given peer (LoadOrStore atomically guards against duplicate sends).
+func (m *Manager) ForwardIfNeeded(subject string, payload []byte, publisherPubkey []byte) {
+	pubIdentity := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(publisherPubkey)
+	m.peers.Range(func(key, val any) bool {
+		peerHex := key.(string)
+		pc := val.(*peer.PeerConn)
+		if pc.State() != peer.StateActive {
+			return true
+		}
+		v, ok := m.outPolicies.Load(peerHex)
+		if !ok {
+			return true // no engine = deny
+		}
+		eng := v.(*fedpolicy.Engine)
+		if eng.Evaluate(subject) != fedpolicy.EffectForward {
+			return true
+		}
+
+		deliver := &pb.FedDeliver{
+			Subject:          subject,
+			Payload:          payload,
+			PublisherIdentity: pubIdentity,
+			PublishedAt:      time.Now().UnixMilli(),
+		}
+
+		// Piggyback SchemaDescriptor on first forward of this subject to this peer.
+		if m.nodeHooks != nil {
+			fdBytes := m.nodeHooks.SchemaRegistry().Descriptor(subject)
+			if fdBytes != nil {
+				trackerKey := peerHex + ":" + subject
+				if _, loaded := m.schemaTracker.LoadOrStore(trackerKey, struct{}{}); !loaded {
+					deliver.SchemaDescriptor = fdBytes
+				}
+			}
+		}
+
+		b, err := proto.Marshal(deliver)
+		if err != nil {
+			return true
+		}
+		if !pc.SendData(pb.FrameType_FRAME_TYPE_FED_DELIVER, b) {
+			m.log.Warn("fed: FedDeliver dropped (data channel full)", "peer", peerHex, "subject", subject)
+		}
+		return true
+	})
+}
+
+// handleInboundDeliver processes a FedDeliver frame received from a peer.
+// Checks inbound policy; if accepted, optionally registers the schema and
+// delivers the payload to local subscribers via nodeHooks.FederatedPublish.
+func (m *Manager) handleInboundDeliver(pc *peer.PeerConn, peerHex string, msg *pb.FedDeliver) {
+	v, ok := m.inPolicies.Load(peerHex)
+	if !ok {
+		return // no inbound engine = deny
+	}
+	if v.(*fedpolicy.Engine).Evaluate(msg.Subject) != fedpolicy.EffectAccept {
+		return
+	}
+	if len(msg.SchemaDescriptor) > 0 && m.nodeHooks != nil {
+		reg := m.nodeHooks.SchemaRegistry()
+		if reg.Version(msg.Subject) == 0 {
+			msgName := extractMsgName(msg.SchemaDescriptor)
+			if msgName != "" {
+				reg.Register(msg.Subject, msgName, msg.SchemaDescriptor) //nolint:errcheck
+			}
+		}
+	}
+	if m.nodeHooks != nil {
+		m.nodeHooks.FederatedPublish(msg.Subject, msg.Payload, pc.PeerPubkey())
+	}
+}
+
+// extractMsgName parses a raw FileDescriptorProto and returns the name of the
+// first top-level message, or "" on any parse error.
+func extractMsgName(fdBytes []byte) string {
+	var fdProto descriptorpb.FileDescriptorProto
+	if err := proto.Unmarshal(fdBytes, &fdProto); err != nil {
+		return ""
+	}
+	if len(fdProto.MessageType) == 0 || fdProto.MessageType[0].Name == nil {
+		return ""
+	}
+	return *fdProto.MessageType[0].Name
 }
 
 // deriveNonce returns TLS keying material when the stream implements
