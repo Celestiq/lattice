@@ -634,6 +634,348 @@ func (x *FedResponse) GetPayload() []byte {
 	return nil
 }
 
+// RelayRegister is sent by a node to a relay to initiate a rendezvous.
+// The relay XORs local_pubkey and target_pubkey to derive a rendezvous token.
+// When a second node registers with the same token (reciprocal pubkeys), the
+// relay pairs the two streams and splices bytes transparently between them.
+type RelayRegister struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	LocalPubkey   []byte                 `protobuf:"bytes,1,opt,name=local_pubkey,json=localPubkey,proto3" json:"local_pubkey,omitempty"`    // Ed25519 public key of the connecting node (32 bytes)
+	TargetPubkey  []byte                 `protobuf:"bytes,2,opt,name=target_pubkey,json=targetPubkey,proto3" json:"target_pubkey,omitempty"` // Ed25519 public key of the peer to rendezvous with (32 bytes)
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RelayRegister) Reset() {
+	*x = RelayRegister{}
+	mi := &file_proto_federation_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RelayRegister) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RelayRegister) ProtoMessage() {}
+
+func (x *RelayRegister) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_federation_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RelayRegister.ProtoReflect.Descriptor instead.
+func (*RelayRegister) Descriptor() ([]byte, []int) {
+	return file_proto_federation_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *RelayRegister) GetLocalPubkey() []byte {
+	if x != nil {
+		return x.LocalPubkey
+	}
+	return nil
+}
+
+func (x *RelayRegister) GetTargetPubkey() []byte {
+	if x != nil {
+		return x.TargetPubkey
+	}
+	return nil
+}
+
+// RelayPaired is sent by the relay to both nodes once they are matched.
+// After this frame, all bytes from each stream are forwarded to the other.
+type RelayPaired struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RelayPaired) Reset() {
+	*x = RelayPaired{}
+	mi := &file_proto_federation_proto_msgTypes[11]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RelayPaired) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RelayPaired) ProtoMessage() {}
+
+func (x *RelayPaired) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_federation_proto_msgTypes[11]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RelayPaired.ProtoReflect.Descriptor instead.
+func (*RelayPaired) Descriptor() ([]byte, []int) {
+	return file_proto_federation_proto_rawDescGZIP(), []int{11}
+}
+
+// RegistryRegister is sent by a node to register its current federation address.
+// known_peers lists the peer pubkeys the registry should notify when this node's
+// address changes. The registry matches known_peers entries to registered nodes
+// and delivers push notifications to them.
+type RegistryRegister struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Pubkey        []byte                 `protobuf:"bytes,1,opt,name=pubkey,proto3" json:"pubkey,omitempty"`                           // Ed25519 public key of the registering node (32 bytes)
+	Addr          string                 `protobuf:"bytes,2,opt,name=addr,proto3" json:"addr,omitempty"`                               // IPv6 addr:port of the node's federation listener
+	KnownPeers    [][]byte               `protobuf:"bytes,3,rep,name=known_peers,json=knownPeers,proto3" json:"known_peers,omitempty"` // pubkeys of peers to notify on address change
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RegistryRegister) Reset() {
+	*x = RegistryRegister{}
+	mi := &file_proto_federation_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RegistryRegister) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RegistryRegister) ProtoMessage() {}
+
+func (x *RegistryRegister) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_federation_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RegistryRegister.ProtoReflect.Descriptor instead.
+func (*RegistryRegister) Descriptor() ([]byte, []int) {
+	return file_proto_federation_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *RegistryRegister) GetPubkey() []byte {
+	if x != nil {
+		return x.Pubkey
+	}
+	return nil
+}
+
+func (x *RegistryRegister) GetAddr() string {
+	if x != nil {
+		return x.Addr
+	}
+	return ""
+}
+
+func (x *RegistryRegister) GetKnownPeers() [][]byte {
+	if x != nil {
+		return x.KnownPeers
+	}
+	return nil
+}
+
+// RegistryRegisterAck is sent by the registry to confirm a successful registration.
+type RegistryRegisterAck struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RegistryRegisterAck) Reset() {
+	*x = RegistryRegisterAck{}
+	mi := &file_proto_federation_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RegistryRegisterAck) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RegistryRegisterAck) ProtoMessage() {}
+
+func (x *RegistryRegisterAck) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_federation_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RegistryRegisterAck.ProtoReflect.Descriptor instead.
+func (*RegistryRegisterAck) Descriptor() ([]byte, []int) {
+	return file_proto_federation_proto_rawDescGZIP(), []int{13}
+}
+
+// RegistryLookup is sent by a node to look up the current federation address
+// of a peer by public key.
+type RegistryLookup struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Pubkey        []byte                 `protobuf:"bytes,1,opt,name=pubkey,proto3" json:"pubkey,omitempty"` // Ed25519 public key of the peer to look up (32 bytes)
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RegistryLookup) Reset() {
+	*x = RegistryLookup{}
+	mi := &file_proto_federation_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RegistryLookup) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RegistryLookup) ProtoMessage() {}
+
+func (x *RegistryLookup) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_federation_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RegistryLookup.ProtoReflect.Descriptor instead.
+func (*RegistryLookup) Descriptor() ([]byte, []int) {
+	return file_proto_federation_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *RegistryLookup) GetPubkey() []byte {
+	if x != nil {
+		return x.Pubkey
+	}
+	return nil
+}
+
+// RegistryLookupResult is the registry's response to a RegistryLookup.
+// addr is empty if the pubkey has not registered.
+type RegistryLookupResult struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Addr          string                 `protobuf:"bytes,1,opt,name=addr,proto3" json:"addr,omitempty"` // current federation addr:port; empty if not found
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RegistryLookupResult) Reset() {
+	*x = RegistryLookupResult{}
+	mi := &file_proto_federation_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RegistryLookupResult) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RegistryLookupResult) ProtoMessage() {}
+
+func (x *RegistryLookupResult) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_federation_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RegistryLookupResult.ProtoReflect.Descriptor instead.
+func (*RegistryLookupResult) Descriptor() ([]byte, []int) {
+	return file_proto_federation_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *RegistryLookupResult) GetAddr() string {
+	if x != nil {
+		return x.Addr
+	}
+	return ""
+}
+
+// RegistryNotify is pushed by the registry to a node's federation listener
+// when one of its known_peers re-registers with a new address. This allows the
+// node to update its stored address without polling.
+type RegistryNotify struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Pubkey        []byte                 `protobuf:"bytes,1,opt,name=pubkey,proto3" json:"pubkey,omitempty"` // Ed25519 public key of the peer whose address changed
+	Addr          string                 `protobuf:"bytes,2,opt,name=addr,proto3" json:"addr,omitempty"`     // new federation addr:port
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RegistryNotify) Reset() {
+	*x = RegistryNotify{}
+	mi := &file_proto_federation_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RegistryNotify) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RegistryNotify) ProtoMessage() {}
+
+func (x *RegistryNotify) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_federation_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RegistryNotify.ProtoReflect.Descriptor instead.
+func (*RegistryNotify) Descriptor() ([]byte, []int) {
+	return file_proto_federation_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *RegistryNotify) GetPubkey() []byte {
+	if x != nil {
+		return x.Pubkey
+	}
+	return nil
+}
+
+func (x *RegistryNotify) GetAddr() string {
+	if x != nil {
+		return x.Addr
+	}
+	return ""
+}
+
 var File_proto_federation_proto protoreflect.FileDescriptor
 
 const file_proto_federation_proto_rawDesc = "" +
@@ -681,7 +1023,24 @@ const file_proto_federation_proto_rawDesc = "" +
 	"\x12requester_node_pub\x18\a \x01(\fR\x10requesterNodePub\"N\n" +
 	"\vFedResponse\x12%\n" +
 	"\x0ecorrelation_id\x18\x01 \x01(\tR\rcorrelationId\x12\x18\n" +
-	"\apayload\x18\x02 \x01(\fR\apayloadB\x0fZ\rlattice/protob\x06proto3"
+	"\apayload\x18\x02 \x01(\fR\apayload\"W\n" +
+	"\rRelayRegister\x12!\n" +
+	"\flocal_pubkey\x18\x01 \x01(\fR\vlocalPubkey\x12#\n" +
+	"\rtarget_pubkey\x18\x02 \x01(\fR\ftargetPubkey\"\r\n" +
+	"\vRelayPaired\"_\n" +
+	"\x10RegistryRegister\x12\x16\n" +
+	"\x06pubkey\x18\x01 \x01(\fR\x06pubkey\x12\x12\n" +
+	"\x04addr\x18\x02 \x01(\tR\x04addr\x12\x1f\n" +
+	"\vknown_peers\x18\x03 \x03(\fR\n" +
+	"knownPeers\"\x15\n" +
+	"\x13RegistryRegisterAck\"(\n" +
+	"\x0eRegistryLookup\x12\x16\n" +
+	"\x06pubkey\x18\x01 \x01(\fR\x06pubkey\"*\n" +
+	"\x14RegistryLookupResult\x12\x12\n" +
+	"\x04addr\x18\x01 \x01(\tR\x04addr\"<\n" +
+	"\x0eRegistryNotify\x12\x16\n" +
+	"\x06pubkey\x18\x01 \x01(\fR\x06pubkey\x12\x12\n" +
+	"\x04addr\x18\x02 \x01(\tR\x04addrB\x0fZ\rlattice/protob\x06proto3"
 
 var (
 	file_proto_federation_proto_rawDescOnce sync.Once
@@ -695,18 +1054,25 @@ func file_proto_federation_proto_rawDescGZIP() []byte {
 	return file_proto_federation_proto_rawDescData
 }
 
-var file_proto_federation_proto_msgTypes = make([]protoimpl.MessageInfo, 10)
+var file_proto_federation_proto_msgTypes = make([]protoimpl.MessageInfo, 17)
 var file_proto_federation_proto_goTypes = []any{
-	(*FedHello)(nil),      // 0: lattice.FedHello
-	(*FedHelloAck)(nil),   // 1: lattice.FedHelloAck
-	(*FedReject)(nil),     // 2: lattice.FedReject
-	(*FedPending)(nil),    // 3: lattice.FedPending
-	(*FedPolicy)(nil),     // 4: lattice.FedPolicy
-	(*FedPolicyRule)(nil), // 5: lattice.FedPolicyRule
-	(*FedStatus)(nil),     // 6: lattice.FedStatus
-	(*FedDeliver)(nil),    // 7: lattice.FedDeliver
-	(*FedRequest)(nil),    // 8: lattice.FedRequest
-	(*FedResponse)(nil),   // 9: lattice.FedResponse
+	(*FedHello)(nil),             // 0: lattice.FedHello
+	(*FedHelloAck)(nil),          // 1: lattice.FedHelloAck
+	(*FedReject)(nil),            // 2: lattice.FedReject
+	(*FedPending)(nil),           // 3: lattice.FedPending
+	(*FedPolicy)(nil),            // 4: lattice.FedPolicy
+	(*FedPolicyRule)(nil),        // 5: lattice.FedPolicyRule
+	(*FedStatus)(nil),            // 6: lattice.FedStatus
+	(*FedDeliver)(nil),           // 7: lattice.FedDeliver
+	(*FedRequest)(nil),           // 8: lattice.FedRequest
+	(*FedResponse)(nil),          // 9: lattice.FedResponse
+	(*RelayRegister)(nil),        // 10: lattice.RelayRegister
+	(*RelayPaired)(nil),          // 11: lattice.RelayPaired
+	(*RegistryRegister)(nil),     // 12: lattice.RegistryRegister
+	(*RegistryRegisterAck)(nil),  // 13: lattice.RegistryRegisterAck
+	(*RegistryLookup)(nil),       // 14: lattice.RegistryLookup
+	(*RegistryLookupResult)(nil), // 15: lattice.RegistryLookupResult
+	(*RegistryNotify)(nil),       // 16: lattice.RegistryNotify
 }
 var file_proto_federation_proto_depIdxs = []int32{
 	5, // 0: lattice.FedPolicy.outbound:type_name -> lattice.FedPolicyRule
@@ -729,7 +1095,7 @@ func file_proto_federation_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_federation_proto_rawDesc), len(file_proto_federation_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   10,
+			NumMessages:   17,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

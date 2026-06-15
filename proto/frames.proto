@@ -34,6 +34,17 @@ enum FrameType {
   FRAME_TYPE_FED_DELIVER   = 21;
   FRAME_TYPE_FED_REQUEST   = 22;
   FRAME_TYPE_FED_RESPONSE  = 23;
+
+  // Relay frames — QUIC connections to a relay node (v0.2 S6)
+  FRAME_TYPE_RELAY_REGISTER = 24; // node → relay: register for rendezvous
+  FRAME_TYPE_RELAY_PAIRED   = 25; // relay → node: rendezvous confirmed; bytes now spliced
+
+  // Address registry frames — QUIC connections to an address registry (v0.2 S6)
+  FRAME_TYPE_REGISTRY_REGISTER      = 26; // node → registry: register address + known peers
+  FRAME_TYPE_REGISTRY_REGISTER_ACK  = 27; // registry → node: ACK
+  FRAME_TYPE_REGISTRY_LOOKUP        = 28; // node → registry: look up peer address
+  FRAME_TYPE_REGISTRY_LOOKUP_RESULT = 29; // registry → node: lookup result
+  FRAME_TYPE_REGISTRY_NOTIFY        = 30; // registry → node: peer address changed (push)
 }
 
 // ─── Session 1, Decision #7: typed capability descriptor ────────────────────

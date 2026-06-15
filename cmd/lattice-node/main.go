@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"crypto/ed25519"
 	"crypto/tls"
 	"errors"
 	"flag"
@@ -10,12 +12,14 @@ import (
 	"os/signal"
 	"syscall"
 
+	"lattice/internal/address"
 	"lattice/internal/admin"
 	"lattice/internal/federation/manager"
 	fedstore "lattice/internal/federation/store"
-	quictransport "lattice/internal/transport/quic"
 	"lattice/internal/identity"
 	"lattice/internal/node"
+	"lattice/internal/transport"
+	quictransport "lattice/internal/transport/quic"
 	"lattice/internal/wire"
 )
 
@@ -26,6 +30,8 @@ func main() {
 	heartbeatInterval := flag.Uint("heartbeat", 30, "heartbeat interval sent to clients (seconds)")
 	fedAddr := flag.String("fed-addr", "", "QUIC federation listen address (empty = federation disabled)")
 	fedDB := flag.String("fed-db", "./fed.db", "SQLite database path for federation state")
+	registryAddr := flag.String("registry-addr", "", "Address registry addr:port for address lookup (empty = disabled)")
+	relayAddr := flag.String("relay-addr", "", "Relay node addr:port for relay fallback (empty = disabled)")
 	flag.Parse()
 
 	log := slog.New(slog.NewTextHandler(os.Stdout, nil))
@@ -70,7 +76,29 @@ func main() {
 			log.Error("federation: open store failed", "path", *fedDB, "err", err)
 			os.Exit(1)
 		}
-		fedMgr = manager.New(serverPriv, store, quictransport.NewDialer(), fedListener, srv, log)
+		baseDialer := quictransport.NewDialer()
+		fedMgr = manager.New(serverPriv, store, baseDialer, fedListener, srv, log)
+
+		// Wire three-layer connect when registry or relay is configured.
+		if *registryAddr != "" || *relayAddr != "" {
+			localPub := ed25519.PublicKey(serverPriv.Public().(ed25519.PublicKey))
+			regAddr := *registryAddr
+			rlAddr := *relayAddr
+			var regClient *address.Client
+			if regAddr != "" {
+				regClient = address.NewClient(regAddr, baseDialer)
+				// Register our federation address with the registry.
+				go func() {
+					if err := regClient.Register(context.Background(), []byte(localPub), *fedAddr, nil); err != nil {
+						log.Warn("registry: registration failed", "err", err)
+					}
+				}()
+			}
+			fedMgr.SetConnectFunc(func(ctx context.Context, peerPubkey []byte, peerAddr string) (transport.Stream, error) {
+				return quictransport.ThreeLayerConnect(ctx, localPub, peerPubkey, peerAddr, regAddr, rlAddr, baseDialer)
+			})
+		}
+
 		if err := fedMgr.Start(); err != nil {
 			log.Error("federation: start failed", "err", err)
 			os.Exit(1)

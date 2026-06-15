@@ -90,8 +90,17 @@ type Manager struct {
 	// S5: outbound cross-federation call registry.
 	fedCalls *fedcalls.Registry
 
+	// S6: optional three-layer connect function. When non-nil, used instead of
+	// dialer.DialPeer so that relay and registry are available.
+	connectFn transport.ConnectFunc
+
 	stopOnce sync.Once
 }
+
+// SetConnectFunc replaces the default dialer.DialPeer with a three-layer
+// connect function. Must be called before Start(). When fn is nil, DialPeer
+// is used (backward-compatible default).
+func (m *Manager) SetConnectFunc(fn transport.ConnectFunc) { m.connectFn = fn }
 
 // New creates a Manager. Call Start() to begin accepting and dialing.
 // nodeHooks may be nil (stubs are used); wiring happens in S4/S5.
@@ -172,11 +181,29 @@ func (m *Manager) Stop() {
 	})
 }
 
-// HandleIncoming handles a new inbound federation connection. It runs the
-// FedHello handshake and dispatches based on the stored peer state.
+// HandleIncoming handles a new inbound federation connection. It peeks at the
+// first frame to dispatch between registry notifications (S6) and federation
+// handshakes. REGISTRY_NOTIFY frames are handled immediately without a handshake.
 func (m *Manager) HandleIncoming(stream transport.Stream) {
+	// Peek at the first frame with a short deadline to determine connection type.
+	stream.SetDeadline(time.Now().Add(10 * time.Second)) //nolint:errcheck
+	firstFrame, err := wire.Read(stream)
+	stream.SetDeadline(time.Time{}) //nolint:errcheck
+	if err != nil {
+		stream.Close() //nolint:errcheck
+		return
+	}
+
+	// S6: registry address-change notification.
+	if firstFrame.Type == pb.FrameType_FRAME_TYPE_REGISTRY_NOTIFY {
+		m.handleRegistryNotify(stream, firstFrame)
+		return
+	}
+
+	// Standard federation handshake — first frame must be FED_HELLO.
+	// Use DoFederatedHandshakeWithHello since we already consumed it.
 	nonce := deriveNonce(stream)
-	peerPubkey, err := fedhandshake.DoFederatedHandshake(m.ctx, stream, nonce, m.localPriv)
+	peerPubkey, err := fedhandshake.DoFederatedHandshakeWithHello(m.ctx, stream, nonce, m.localPriv, firstFrame)
 	if err != nil {
 		m.log.Warn("fed: incoming handshake failed", "err", err)
 		stream.Close() //nolint:errcheck
@@ -490,7 +517,14 @@ func (m *Manager) connectPeerWithRetry(rec *fedstore.PeerRecord, sendPolicy bool
 		default:
 		}
 
-		stream, err := m.dialer.DialPeer(m.ctx, rec.Addr)
+		var stream transport.Stream
+		var err error
+		if m.connectFn != nil {
+			peerPubkeyBytes, _ := hex.DecodeString(rec.PubkeyHex)
+			stream, err = m.connectFn(m.ctx, peerPubkeyBytes, rec.Addr)
+		} else {
+			stream, err = m.dialer.DialPeer(m.ctx, rec.Addr)
+		}
 		if err != nil {
 			m.log.Warn("fed: dial failed", "peer", rec.PubkeyHex, "addr", rec.Addr,
 				"err", err, "retry_in", backoff)
@@ -940,6 +974,33 @@ func (m *Manager) handleInboundPolicy(pc *peer.PeerConn, peerHex string, pol *pb
 		entityHexes = append(entityHexes, entityHex)
 	}
 	m.store.SetExportList(peerHex, entityHexes) //nolint:errcheck
+}
+
+// handleRegistryNotify processes a REGISTRY_NOTIFY frame from an address
+// registry. It updates the stored address for the identified peer in SQLite
+// so that the next reconnect attempt uses the fresh address.
+func (m *Manager) handleRegistryNotify(stream transport.Stream, f *wire.Frame) {
+	stream.Close() //nolint:errcheck
+	var notify pb.RegistryNotify
+	if err := proto.Unmarshal(f.Payload, &notify); err != nil {
+		return
+	}
+	if len(notify.Pubkey) != 32 || notify.Addr == "" {
+		return
+	}
+	peerHex := hex.EncodeToString(notify.Pubkey)
+	stored, err := m.store.GetPeer(peerHex)
+	if err != nil || stored == nil {
+		return
+	}
+	if stored.Addr == notify.Addr {
+		return // no change
+	}
+	if err := m.store.UpsertPeer(peerHex, stored.Name, notify.Addr, stored.IntroMethod, stored.State); err != nil {
+		m.log.Warn("fed: handleRegistryNotify: upsert failed", "peer", peerHex[:8], "err", err)
+		return
+	}
+	m.log.Info("fed: updated peer address from registry notification", "peer", peerHex[:8], "addr", notify.Addr)
 }
 
 // runFedCallTimeoutChecker ticks every second and sends errors to local

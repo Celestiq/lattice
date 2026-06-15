@@ -35,3 +35,8 @@ type Listener interface {
 type TLSExporter interface {
 	ExportKeyingMaterial(label string, context []byte, length int) ([]byte, error)
 }
+
+// ConnectFunc is the function signature used by the Manager for peer connections
+// when three-layer connect (registry + relay) is configured. Unlike Dialer.DialPeer,
+// it also receives peerPubkey so the relay rendezvous token can be derived.
+type ConnectFunc func(ctx context.Context, peerPubkey []byte, peerAddr string) (Stream, error)

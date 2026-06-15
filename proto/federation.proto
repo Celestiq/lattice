@@ -100,3 +100,51 @@ message FedResponse {
   string correlation_id = 1;
   bytes  payload        = 2;
 }
+
+// ─── Session 6: relay and address registry ───────────────────────────────────
+
+// RelayRegister is sent by a node to a relay to initiate a rendezvous.
+// The relay XORs local_pubkey and target_pubkey to derive a rendezvous token.
+// When a second node registers with the same token (reciprocal pubkeys), the
+// relay pairs the two streams and splices bytes transparently between them.
+message RelayRegister {
+  bytes local_pubkey  = 1; // Ed25519 public key of the connecting node (32 bytes)
+  bytes target_pubkey = 2; // Ed25519 public key of the peer to rendezvous with (32 bytes)
+}
+
+// RelayPaired is sent by the relay to both nodes once they are matched.
+// After this frame, all bytes from each stream are forwarded to the other.
+message RelayPaired {}
+
+// RegistryRegister is sent by a node to register its current federation address.
+// known_peers lists the peer pubkeys the registry should notify when this node's
+// address changes. The registry matches known_peers entries to registered nodes
+// and delivers push notifications to them.
+message RegistryRegister {
+  bytes  pubkey              = 1; // Ed25519 public key of the registering node (32 bytes)
+  string addr                = 2; // IPv6 addr:port of the node's federation listener
+  repeated bytes known_peers = 3; // pubkeys of peers to notify on address change
+}
+
+// RegistryRegisterAck is sent by the registry to confirm a successful registration.
+message RegistryRegisterAck {}
+
+// RegistryLookup is sent by a node to look up the current federation address
+// of a peer by public key.
+message RegistryLookup {
+  bytes pubkey = 1; // Ed25519 public key of the peer to look up (32 bytes)
+}
+
+// RegistryLookupResult is the registry's response to a RegistryLookup.
+// addr is empty if the pubkey has not registered.
+message RegistryLookupResult {
+  string addr = 1; // current federation addr:port; empty if not found
+}
+
+// RegistryNotify is pushed by the registry to a node's federation listener
+// when one of its known_peers re-registers with a new address. This allows the
+// node to update its stored address without polling.
+message RegistryNotify {
+  bytes  pubkey = 1; // Ed25519 public key of the peer whose address changed
+  string addr   = 2; // new federation addr:port
+}

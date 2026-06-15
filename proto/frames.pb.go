@@ -52,6 +52,15 @@ const (
 	FrameType_FRAME_TYPE_FED_DELIVER   FrameType = 21
 	FrameType_FRAME_TYPE_FED_REQUEST   FrameType = 22
 	FrameType_FRAME_TYPE_FED_RESPONSE  FrameType = 23
+	// Relay frames — QUIC connections to a relay node (v0.2 S6)
+	FrameType_FRAME_TYPE_RELAY_REGISTER FrameType = 24 // node → relay: register for rendezvous
+	FrameType_FRAME_TYPE_RELAY_PAIRED   FrameType = 25 // relay → node: rendezvous confirmed; bytes now spliced
+	// Address registry frames — QUIC connections to an address registry (v0.2 S6)
+	FrameType_FRAME_TYPE_REGISTRY_REGISTER      FrameType = 26 // node → registry: register address + known peers
+	FrameType_FRAME_TYPE_REGISTRY_REGISTER_ACK  FrameType = 27 // registry → node: ACK
+	FrameType_FRAME_TYPE_REGISTRY_LOOKUP        FrameType = 28 // node → registry: look up peer address
+	FrameType_FRAME_TYPE_REGISTRY_LOOKUP_RESULT FrameType = 29 // registry → node: lookup result
+	FrameType_FRAME_TYPE_REGISTRY_NOTIFY        FrameType = 30 // registry → node: peer address changed (push)
 )
 
 // Enum value maps for FrameType.
@@ -81,32 +90,46 @@ var (
 		21: "FRAME_TYPE_FED_DELIVER",
 		22: "FRAME_TYPE_FED_REQUEST",
 		23: "FRAME_TYPE_FED_RESPONSE",
+		24: "FRAME_TYPE_RELAY_REGISTER",
+		25: "FRAME_TYPE_RELAY_PAIRED",
+		26: "FRAME_TYPE_REGISTRY_REGISTER",
+		27: "FRAME_TYPE_REGISTRY_REGISTER_ACK",
+		28: "FRAME_TYPE_REGISTRY_LOOKUP",
+		29: "FRAME_TYPE_REGISTRY_LOOKUP_RESULT",
+		30: "FRAME_TYPE_REGISTRY_NOTIFY",
 	}
 	FrameType_value = map[string]int32{
-		"FRAME_TYPE_UNKNOWN":       0,
-		"FRAME_TYPE_HELLO":         1,
-		"FRAME_TYPE_HELLO_ACK":     2,
-		"FRAME_TYPE_HEARTBEAT":     3,
-		"FRAME_TYPE_HEARTBEAT_ACK": 4,
-		"FRAME_TYPE_SUBSCRIBE":     5,
-		"FRAME_TYPE_UNSUBSCRIBE":   6,
-		"FRAME_TYPE_PUBLISH":       7,
-		"FRAME_TYPE_DELIVER":       8,
-		"FRAME_TYPE_ERROR":         9,
-		"FRAME_TYPE_REQUEST":       10,
-		"FRAME_TYPE_RESPONSE":      11,
-		"FRAME_TYPE_DISCONNECT":    12,
-		"FRAME_TYPE_PING":          13,
-		"FRAME_TYPE_PONG":          14,
-		"FRAME_TYPE_FED_HELLO":     15,
-		"FRAME_TYPE_FED_HELLO_ACK": 16,
-		"FRAME_TYPE_FED_REJECT":    17,
-		"FRAME_TYPE_FED_PENDING":   18,
-		"FRAME_TYPE_FED_POLICY":    19,
-		"FRAME_TYPE_FED_STATUS":    20,
-		"FRAME_TYPE_FED_DELIVER":   21,
-		"FRAME_TYPE_FED_REQUEST":   22,
-		"FRAME_TYPE_FED_RESPONSE":  23,
+		"FRAME_TYPE_UNKNOWN":                0,
+		"FRAME_TYPE_HELLO":                  1,
+		"FRAME_TYPE_HELLO_ACK":              2,
+		"FRAME_TYPE_HEARTBEAT":              3,
+		"FRAME_TYPE_HEARTBEAT_ACK":          4,
+		"FRAME_TYPE_SUBSCRIBE":              5,
+		"FRAME_TYPE_UNSUBSCRIBE":            6,
+		"FRAME_TYPE_PUBLISH":                7,
+		"FRAME_TYPE_DELIVER":                8,
+		"FRAME_TYPE_ERROR":                  9,
+		"FRAME_TYPE_REQUEST":                10,
+		"FRAME_TYPE_RESPONSE":               11,
+		"FRAME_TYPE_DISCONNECT":             12,
+		"FRAME_TYPE_PING":                   13,
+		"FRAME_TYPE_PONG":                   14,
+		"FRAME_TYPE_FED_HELLO":              15,
+		"FRAME_TYPE_FED_HELLO_ACK":          16,
+		"FRAME_TYPE_FED_REJECT":             17,
+		"FRAME_TYPE_FED_PENDING":            18,
+		"FRAME_TYPE_FED_POLICY":             19,
+		"FRAME_TYPE_FED_STATUS":             20,
+		"FRAME_TYPE_FED_DELIVER":            21,
+		"FRAME_TYPE_FED_REQUEST":            22,
+		"FRAME_TYPE_FED_RESPONSE":           23,
+		"FRAME_TYPE_RELAY_REGISTER":         24,
+		"FRAME_TYPE_RELAY_PAIRED":           25,
+		"FRAME_TYPE_REGISTRY_REGISTER":      26,
+		"FRAME_TYPE_REGISTRY_REGISTER_ACK":  27,
+		"FRAME_TYPE_REGISTRY_LOOKUP":        28,
+		"FRAME_TYPE_REGISTRY_LOOKUP_RESULT": 29,
+		"FRAME_TYPE_REGISTRY_NOTIFY":        30,
 	}
 )
 
@@ -1026,7 +1049,7 @@ const file_proto_frames_proto_rawDesc = "" +
 	"\x04Ping\x12\x14\n" +
 	"\x05nonce\x18\x01 \x01(\fR\x05nonce\"\x1c\n" +
 	"\x04Pong\x12\x14\n" +
-	"\x05nonce\x18\x01 \x01(\fR\x05nonce*\xf7\x04\n" +
+	"\x05nonce\x18\x01 \x01(\fR\x05nonce*\xe2\x06\n" +
 	"\tFrameType\x12\x16\n" +
 	"\x12FRAME_TYPE_UNKNOWN\x10\x00\x12\x14\n" +
 	"\x10FRAME_TYPE_HELLO\x10\x01\x12\x18\n" +
@@ -1052,7 +1075,14 @@ const file_proto_frames_proto_rawDesc = "" +
 	"\x15FRAME_TYPE_FED_STATUS\x10\x14\x12\x1a\n" +
 	"\x16FRAME_TYPE_FED_DELIVER\x10\x15\x12\x1a\n" +
 	"\x16FRAME_TYPE_FED_REQUEST\x10\x16\x12\x1b\n" +
-	"\x17FRAME_TYPE_FED_RESPONSE\x10\x17B\x0fZ\rlattice/protob\x06proto3"
+	"\x17FRAME_TYPE_FED_RESPONSE\x10\x17\x12\x1d\n" +
+	"\x19FRAME_TYPE_RELAY_REGISTER\x10\x18\x12\x1b\n" +
+	"\x17FRAME_TYPE_RELAY_PAIRED\x10\x19\x12 \n" +
+	"\x1cFRAME_TYPE_REGISTRY_REGISTER\x10\x1a\x12$\n" +
+	" FRAME_TYPE_REGISTRY_REGISTER_ACK\x10\x1b\x12\x1e\n" +
+	"\x1aFRAME_TYPE_REGISTRY_LOOKUP\x10\x1c\x12%\n" +
+	"!FRAME_TYPE_REGISTRY_LOOKUP_RESULT\x10\x1d\x12\x1e\n" +
+	"\x1aFRAME_TYPE_REGISTRY_NOTIFY\x10\x1eB\x0fZ\rlattice/protob\x06proto3"
 
 var (
 	file_proto_frames_proto_rawDescOnce sync.Once

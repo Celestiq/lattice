@@ -165,6 +165,104 @@ func DoFederatedHandshake(ctx context.Context, stream transport.Stream, nonce []
 	return received.Pubkey, nil
 }
 
+// DoFederatedHandshakeWithHello completes the handshake when the peer's FedHello
+// was already read by the caller (e.g., because the caller peeked at the first
+// frame to dispatch between connection types). This variant:
+//   - sends our FedHello to the peer (phase 1 send side only)
+//   - validates the already-received peerHello
+//   - exchanges FedHelloAck frames (phase 2)
+//
+// Use DoFederatedHandshake for the standard symmetric case where both sides read
+// and write simultaneously.
+func DoFederatedHandshakeWithHello(ctx context.Context, stream transport.Stream, nonce []byte, localPriv ed25519.PrivateKey, peerHelloFrame *wire.Frame) (peerPubkey []byte, err error) {
+	dl := time.Now().Add(defaultTimeout)
+	if d, ok := ctx.Deadline(); ok && d.Before(dl) {
+		dl = d
+	}
+	if err := stream.SetDeadline(dl); err != nil {
+		return nil, err
+	}
+	defer stream.SetDeadline(time.Time{}) //nolint:errcheck
+
+	// Parse the pre-read frame.
+	if peerHelloFrame.Type == pb.FrameType_FRAME_TYPE_FED_REJECT {
+		var reject pb.FedReject
+		proto.Unmarshal(peerHelloFrame.Payload, &reject) //nolint:errcheck
+		return nil, fmt.Errorf("%w: %s", ErrHandshakeRejected, reject.Reason)
+	}
+	if peerHelloFrame.Type != pb.FrameType_FRAME_TYPE_FED_HELLO {
+		return nil, fmt.Errorf("federation: expected FED_HELLO, got %v", peerHelloFrame.Type)
+	}
+	var received pb.FedHello
+	if err := proto.Unmarshal(peerHelloFrame.Payload, &received); err != nil {
+		return nil, fmt.Errorf("federation: unmarshal FedHello: %w", err)
+	}
+
+	// Phase 1: send our FedHello (peer's FedHello is already received).
+	localPub := localPriv.Public().(ed25519.PublicKey)
+	sig := ed25519.Sign(localPriv, nonce)
+	helloBytes, err := proto.Marshal(&pb.FedHello{
+		Pubkey:          []byte(localPub),
+		Signature:       sig,
+		ProtocolVersion: FedProtocolVersion,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("federation: marshal FedHello: %w", err)
+	}
+	if err := wire.Write(stream, pb.FrameType_FRAME_TYPE_FED_HELLO, helloBytes); err != nil {
+		return nil, err
+	}
+
+	// Validate the peer's identity.
+	if received.ProtocolVersion != FedProtocolVersion {
+		rejectAndClose(stream, fmt.Sprintf("unsupported protocol version %d", received.ProtocolVersion))
+		return nil, fmt.Errorf("%w: %d", ErrProtocolVersion, received.ProtocolVersion)
+	}
+	if len(received.Pubkey) != ed25519.PublicKeySize {
+		rejectAndClose(stream, "invalid pubkey length")
+		return nil, errors.New("federation: invalid peer pubkey length")
+	}
+	if !ed25519.Verify(received.Pubkey, nonce, received.Signature) {
+		rejectAndClose(stream, "invalid signature")
+		return nil, ErrInvalidSignature
+	}
+
+	// Phase 2: concurrent FedHelloAck exchange.
+	var ackSendErr, ackRecvErr error
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		ackSendErr = wire.Write(stream, pb.FrameType_FRAME_TYPE_FED_HELLO_ACK, nil)
+	}()
+	go func() {
+		defer wg.Done()
+		f, err := wire.Read(stream)
+		if err != nil {
+			ackRecvErr = fmt.Errorf("federation: read FedHelloAck: %w", err)
+			return
+		}
+		if f.Type == pb.FrameType_FRAME_TYPE_FED_REJECT {
+			var reject pb.FedReject
+			proto.Unmarshal(f.Payload, &reject) //nolint:errcheck
+			ackRecvErr = fmt.Errorf("%w: %s", ErrHandshakeRejected, reject.Reason)
+			return
+		}
+		if f.Type != pb.FrameType_FRAME_TYPE_FED_HELLO_ACK {
+			ackRecvErr = fmt.Errorf("federation: expected FED_HELLO_ACK, got %v", f.Type)
+		}
+	}()
+	wg.Wait()
+
+	if ackSendErr != nil {
+		return nil, ackSendErr
+	}
+	if ackRecvErr != nil {
+		return nil, ackRecvErr
+	}
+	return received.Pubkey, nil
+}
+
 // rejectAndClose writes FedReject to stream and closes it. Errors are swallowed
 // because the caller is about to return a local error regardless.
 func rejectAndClose(stream transport.Stream, reason string) {

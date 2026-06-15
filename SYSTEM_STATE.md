@@ -1,6 +1,6 @@
 # Lattice — System State
 
-**Scope:** Local orchestration + federation (in progress) · **Language:** Go 1.25 · **v0.1.1:** Sessions 0–7 complete · **v0.2 Federation S1–S5:** QUIC transport + FedHello handshake + SQLite persistence + Federation Manager + Bilateral Consent + Admin API + Forwarding Policy Engine + Schema Propagation + Cross-Federation Call Routing · **Branch:** `dev/v0.2`
+**Scope:** Local orchestration + federation (complete) · **Language:** Go 1.25 · **v0.1.1:** Sessions 0–7 complete · **v0.2 Federation S1–S6:** QUIC transport + FedHello handshake + SQLite persistence + Federation Manager + Bilateral Consent + Admin API + Forwarding Policy Engine + Schema Propagation + Cross-Federation Call Routing + Address Registry + Relay Node + ThreeLayerConnect · **Branch:** `dev/v0.2` · **Tests:** 266 passing (race-detector clean)
 
 This document captures the complete state of the Lattice codebase: what exists, how the pieces fit together, and the design decisions behind them. Start here before reading any source file.
 
@@ -26,6 +26,11 @@ lattice/
 ├── cmd/
 │   ├── lattice-node/      # server binary
 │   └── lattice-client/    # CLI client binary
+├── cmd/
+│   ├── lattice-node/      # server binary
+│   ├── lattice-client/    # CLI client binary
+│   ├── lattice-relay/     # relay node binary (S6)
+│   └── lattice-registry/  # address registry binary (S6)
 ├── internal/
 │   ├── wire/              # frame encoding / TLS cert generation
 │   ├── identity/          # Ed25519 keypair persistence
@@ -38,16 +43,24 @@ lattice/
 │   ├── call/              # pending REQUEST/RESPONSE registry
 │   ├── admin/             # localhost-only HTTP admin API (Decision #15)
 │   ├── node/              # server connection handler (owns all of the above)
+│   ├── relay/             # v0.2 S6: QUIC relay rendezvous node
+│   │   ├── relay.go       #   Relay; XOR rendezvous token; splicePair; halfPair sweeper
+│   │   └── relay_test.go  #   6 tests (pair+splice, token symmetry, multi-pair, timeout, invalid frame, race)
+│   ├── address/           # v0.2 S6: address registry + client
+│   │   ├── registry.go    #   Server (register/lookup/push-notify); Client (Register/Lookup)
+│   │   └── registry_test.go # 6 tests (register+lookup, unknown, update, notification, unavailable, concurrent)
 │   ├── transport/         # v0.2: federation transport abstraction (S1)
-│   │   ├── transport.go   #   Stream / Dialer / Listener interfaces
+│   │   ├── transport.go   #   Stream / Dialer / Listener interfaces; ConnectFunc (S6)
 │   │   └── quic/          #   QUIC implementation (quic-go v0.60)
 │   │       ├── tls.go     #     TLS configs; ALPN "lattice-fed-v1"
 │   │       ├── keepalive.go #   application-level PING/PONG keepalive
 │   │       ├── quic.go    #     Listener, Dialer, quicStream, lazyServerStream
-│   │       └── quic_test.go #  15 tests (topology / fault / race / e2e)
+│   │       ├── connect.go #     ThreeLayerConnect (direct → registry → relay); dialViaRelay (S6)
+│   │       ├── quic_test.go #  15 tests (topology / fault / race / e2e)
+│   │       └── connect_test.go # 5 tests (direct, relay, direct-fail+relay, no-layers, registry lookup)
 │   └── federation/        # v0.2: federation logic (S2+)
-│       ├── handshake/     #   symmetric FedHello exchange (S2)
-│       │   ├── handshake.go  # DoFederatedHandshake; rejectAndClose
+│       ├── handshake/     #   symmetric FedHello exchange (S2); DoFederatedHandshakeWithHello (S6)
+│       │   ├── handshake.go  # DoFederatedHandshake; DoFederatedHandshakeWithHello; rejectAndClose
 │       │   └── handshake_test.go # 8 tests
 │       ├── peer/          #   PeerConn state machine + write channels (S2/S4)
 │       │   ├── peer.go    #     Pending→Active→Paused↔Active→Revoked; ctrl/data channels; RunWriteLoop
@@ -61,12 +74,12 @@ lattice/
 │       ├── calls/         #   outbound cross-federation call registry (S5)
 │       │   ├── calls.go   #     Registry; OutboundCall; AddOutbound/RemoveOutbound/ExpiredOutbound
 │       │   └── calls_test.go # 6 tests
-│       └── manager/       #   federation lifecycle + consent + forwarding + call routing (S3/S4/S5)
-│           ├── manager.go #     Manager, NodeHooks, ConnectionInfo; Start/Stop/HandleIncoming/consent ops; ForwardIfNeeded; handleInboundDeliver; TryRouteRequest; ForwardResponse; handleInboundRequest/Response/Policy
-│           └── manager_test.go # 39 tests (topology / fault / consent lifecycle / race / e2e / S4 forwarding / S5 call routing)
+│       └── manager/       #   federation lifecycle + consent + forwarding + call routing (S3/S4/S5/S6)
+│           ├── manager.go #     Manager, NodeHooks, ConnectionInfo; Start/Stop/HandleIncoming/consent ops; ForwardIfNeeded; handleInboundDeliver; TryRouteRequest; ForwardResponse; handleInboundRequest/Response/Policy; SetConnectFunc; handleRegistryNotify (S6)
+│           └── manager_test.go # 43 tests (topology / fault / consent lifecycle / race / e2e / S4 forwarding / S5 call routing / S6 registry notify + ConnectFunc)
 ├── proto/
-│   ├── frames.proto       # 23 frame types (0-14 client, 15-23 federation)
-│   ├── federation.proto   # v0.2: FedHello, FedPolicy, FedDeliver, FedRequest, ...
+│   ├── frames.proto       # 30 frame types (0-14 client, 15-23 federation, 24-30 relay/registry S6)
+│   ├── federation.proto   # v0.2: FedHello, FedPolicy, FedDeliver, FedRequest, RelayRegister, RegistryRegister, ...
 │   ├── schemas.proto      # TemperatureReading, LightCommand (with lattice.* options)
 │   ├── lattice_options.proto  # custom field options: range, max_length, required
 │   └── events.proto       # EntityJoined, EntityLeft, EntityOffline
@@ -134,6 +147,18 @@ Values 0–14 are client↔server frames (TLS-over-TCP). Values 15–23 are fede
 | 21 | `FED_DELIVER` | peer → peer | Forwarded channel message with schema descriptor | S4 |
 | 22 | `FED_REQUEST` | peer → peer | Forwarded call request across federation boundary | S5 |
 | 23 | `FED_RESPONSE` | peer → peer | Forwarded call response | S5 |
+
+### Relay & Registry frames (24–30) — QUIC only (v0.2 Session 6)
+
+| # | Name | Direction | Purpose |
+|---|------|-----------|---------|
+| 24 | `RELAY_REGISTER` | node → relay | Register rendezvous intent: `{local_pubkey, target_pubkey}` |
+| 25 | `RELAY_PAIRED` | relay → node | Rendezvous matched; bidirectional splice begins |
+| 26 | `REGISTRY_REGISTER` | node → registry | Publish this node's current federation address + known peers |
+| 27 | `REGISTRY_REGISTER_ACK` | registry → node | Registration accepted |
+| 28 | `REGISTRY_LOOKUP` | node → registry | Look up the federation address for a given pubkey |
+| 29 | `REGISTRY_LOOKUP_RESULT` | registry → node | Address (empty string if unknown) |
+| 30 | `REGISTRY_NOTIFY` | registry → node | Push notification: a known peer's address changed |
 
 ---
 
@@ -891,8 +916,11 @@ go test ./...
 | `internal/federation/peer` | 4 | All legal transitions (Pending→Active→Paused→Active→Revoked + stream.Close called), illegal transitions from Revoked return ErrIllegalTransition/ErrAlreadyRevoked, 20 goroutines concurrent Pause/Resume (race-detector clean), Revoke while writing (no panic, write returns error) |
 | `internal/federation/store` | 5 | Full round-trip (write peer + 3 outbound + 2 inbound rules + 5 export entities; close; reopen; verify all), bad path returns error, 10 concurrent UpsertPeer goroutines (no SQLITE_BUSY), persist+restart (2 active peers + entity maps survive close/reopen), revoked peer absent from AllActivePeers |
 | `internal/federation/policy` | 7 | DenyByDefault, FirstMatchForward, FirstMatchAccept, ExactMatch, GtWildcard, SetRules atomic replace, Rules snapshot immutability |
-| `internal/federation/manager` | 39 | **Topology (S3):** Start dials 2 active peers, HandleIncoming known-active sends FedPolicy, HandleIncoming known-paused skips FedPolicy, HandleIncoming unknown stores as pending, HandleIncoming revoked sends FedReject. **Admin lifecycle (S3):** pair→accept→pause→resume→revoke via HTTP (201/204/409). **Fault injection (S3):** dial unreachable, stream drop resets to pending, Stop() during dial. **Admin validation (S3):** invalid hex → 400, accept non-pending → 409. **Race/concurrency (S3):** concurrent AcceptPeer+RejectPeer, 3 concurrent HandleIncoming from same peer, 10 Pause/Resume rounds, Stop with 4 active peers. **E2E (S3):** GetConnections policy counts. **S4 forwarding (9 tests):** deny-by-default (no outbound rule), single forward rule delivers FedDeliver, non-matching subject not forwarded, inbound accept calls FederatedPublish, inbound deny drops frame, SchemaDescriptor on first forward only (tracker key), schema auto-registered on inbound FedDeliver, UpdatePolicy refreshes in-memory engine, concurrent ForwardIfNeeded schema tracker race. **S5 call routing (12 tests):** TryRouteRequest false for unknown target, TryRouteRequest sends FED_REQUEST to correct peer, UpdateExportList add wires routing, UpdateExportList remove stops routing, inbound FED_REQUEST dispatches to RouteLocalRequest hook, inbound FED_RESPONSE dispatches to RouteLocalResponse with correct requesterSID, ForwardResponse sends FED_RESPONSE to peer, ForwardResponse for unknown peer no-panic, expired outbound calls trigger SendLocalError(TIMEOUT), inbound FedPolicy updates routing table and SQLite, sendFedPolicy includes exported pubkeys, export list persisted and in-memory consistent, 10 concurrent TryRouteRequest goroutines (race-detector clean) |
-| **Total** | **245** | |
+| `internal/relay` | 6 | Pair+splice bidirectional bytes, rendezvous token symmetric (XOR commutative), 3 concurrent independent pairs, half-pair timeout on Stop, invalid frame type closes connection, 5 concurrent pair races (race-detector clean) |
+| `internal/address` | 6 | Register+Lookup round-trip, lookup unknown returns empty, address update persisted, push notification on address change, unavailable registry returns error, 10 concurrent register+lookup (race-detector clean) |
+| `internal/transport/quic` (connect) | 5 | Direct dial succeeds, relay forwarding (both sides connect), direct-fail relay-succeeds, no-layers configured returns error, registry-assisted lookup+dial |
+| `internal/federation/manager` | 43 | **Topology (S3):** Start dials 2 active peers, HandleIncoming known-active sends FedPolicy, HandleIncoming known-paused skips FedPolicy, HandleIncoming unknown stores as pending, HandleIncoming revoked sends FedReject. **Admin lifecycle (S3):** pair→accept→pause→resume→revoke via HTTP (201/204/409). **Fault injection (S3):** dial unreachable, stream drop resets to pending, Stop() during dial. **Admin validation (S3):** invalid hex → 400, accept non-pending → 409. **Race/concurrency (S3):** concurrent AcceptPeer+RejectPeer, 3 concurrent HandleIncoming from same peer, 10 Pause/Resume rounds, Stop with 4 active peers. **E2E (S3):** GetConnections policy counts. **S4 forwarding (9 tests):** deny-by-default (no outbound rule), single forward rule delivers FedDeliver, non-matching subject not forwarded, inbound accept calls FederatedPublish, inbound deny drops frame, SchemaDescriptor on first forward only (tracker key), schema auto-registered on inbound FedDeliver, UpdatePolicy refreshes in-memory engine, concurrent ForwardIfNeeded schema tracker race. **S5 call routing (12 tests):** TryRouteRequest false for unknown target, TryRouteRequest sends FED_REQUEST to correct peer, UpdateExportList add wires routing, UpdateExportList remove stops routing, inbound FED_REQUEST dispatches to RouteLocalRequest hook, inbound FED_RESPONSE dispatches to RouteLocalResponse with correct requesterSID, ForwardResponse sends FED_RESPONSE to peer, ForwardResponse for unknown peer no-panic, expired outbound calls trigger SendLocalError(TIMEOUT), inbound FedPolicy updates routing table and SQLite, sendFedPolicy includes exported pubkeys, export list persisted and in-memory consistent, 10 concurrent TryRouteRequest goroutines (race-detector clean). **S6 (4 tests):** REGISTRY_NOTIFY updates stored addr, REGISTRY_NOTIFY for unknown peer silently ignored, REGISTRY_NOTIFY same-addr is no-op, SetConnectFunc wires custom dial function |
+| **Total** | **266** | |
 
 The `TestIntegrationSequence` test covers all 10 steps of the full integration scenario in a single sequential test with per-step log output.
 
@@ -1054,6 +1082,120 @@ if len(pending.FedSourcePeerPubkey) > 0 {
 
 ---
 
+## v0.2 Address Registry + Relay Node + ThreeLayerConnect (Session 6)
+
+Session 6 adds dynamic peer discovery and rendezvous-based connectivity as a fallback when direct QUIC connections are not possible (NAT, firewall, no static address).
+
+### `internal/relay/relay.go` — Relay node
+
+`Relay` accepts QUIC connections from pairs of federation nodes and splices their streams bidirectionally. No application data is inspected or stored.
+
+**Rendezvous protocol:**
+1. Both nodes connect to the relay and send `RELAY_REGISTER{local_pubkey, target_pubkey}`.
+2. Relay XORs the two pubkeys: `token = hex(XOR(a, b))`. Because XOR is commutative, both sides compute the same token regardless of who registers first.
+3. When both halves of a rendezvous arrive, relay sends `RELAY_PAIRED` to both streams and starts bidirectional `io.Copy` goroutines.
+4. Half-pairs with no match within 30 seconds are cleaned up by a sweeper goroutine.
+
+**`Relay` struct:**
+```go
+type Relay struct {
+    listener transport.Listener
+    pending  sync.Map   // hex(XOR(a,b)) → *halfPair
+    log      *slog.Logger
+    wg       sync.WaitGroup
+    done     chan struct{}
+    stopOnce sync.Once  // makes Stop() idempotent
+}
+```
+`Stop()` closes all pending half-pairs and waits for goroutines. Race-detector clean (6 tests).
+
+**Binaries:** `cmd/lattice-relay` (default `:4225`).
+
+---
+
+### `internal/address/registry.go` — Address Registry
+
+`Server` lets nodes publish their current federation address so peers can discover them without pre-configured static addresses. Supports push notifications on address change.
+
+**Protocol:**
+- `REGISTRY_REGISTER{pubkey, addr, known_peers}` → `REGISTRY_REGISTER_ACK` — upsert address; trigger notifications to known peers if address changed.
+- `REGISTRY_LOOKUP{pubkey}` → `REGISTRY_LOOKUP_RESULT{addr}` — return stored address (empty if unknown).
+- `REGISTRY_NOTIFY{pubkey, addr}` — pushed proactively to a known peer's federation addr when that peer's address changes.
+
+**QUIC close ordering:** The server's `handleConn` does NOT call `stream.Close()` immediately after writing the response. Because `Close()` on a QUIC stream calls `conn.CloseWithError(0, "")` (a hard close that drops buffered data), the server instead drains the stream with a 2-second deadline (`io.Copy(io.Discard, stream)`) and lets the client drive the connection close. Same pattern in `pushNotify`.
+
+**`Client`** provides `Register(ctx, localPub, myAddr, knownPeers)` and `Lookup(ctx, peerPub) (string, error)`. Each call opens a fresh QUIC connection.
+
+**Binaries:** `cmd/lattice-registry` (default `:4226`).
+
+---
+
+### `internal/transport/transport.go` — `ConnectFunc` type (S6)
+
+```go
+type ConnectFunc func(ctx context.Context, peerPubkey []byte, peerAddr string) (Stream, error)
+```
+
+A function type that replaces `Dialer.DialPeer` in the Manager when relay/registry are configured. Decouples connection strategy from the Manager without modifying the `Dialer` interface (avoids breaking existing tests).
+
+---
+
+### `internal/transport/quic/connect.go` — `ThreeLayerConnect`
+
+```go
+func ThreeLayerConnect(
+    ctx context.Context,
+    localPub ed25519.PublicKey,
+    peerPubkey []byte,
+    storedAddr string,
+    registryAddr string,
+    relayAddr string,
+    dialer transport.Dialer,
+) (transport.Stream, error)
+```
+
+Runs up to three connection layers concurrently; returns the first stream that succeeds; cancels the rest.
+
+| Layer | Trigger | Mechanism |
+|-------|---------|-----------|
+| 1 (direct) | `storedAddr != ""` | `dialer.DialPeer(ctx, storedAddr)` |
+| 2 (registry) | `registryAddr != ""` | Connect to registry → `REGISTRY_LOOKUP` → `DialPeer(freshAddr)` |
+| 3 (relay) | `relayAddr != ""` | `dialViaRelay` → `RELAY_REGISTER` → wait for `RELAY_PAIRED` |
+
+Layer 2 skips the fresh dial if the registry returns the same addr as `storedAddr` (avoiding a duplicate attempt). All layers run under a shared `context.WithCancel`; the first success calls `cancel()` to abort remaining goroutines.
+
+`dialViaRelay(ctx, localPub, peerPubkey, relayAddr, dialer)` — internal: connects to relay, sends `RELAY_REGISTER`, waits for `RELAY_PAIRED` (up to 60s or ctx deadline), returns the stream. Stream is kept open — it is the live spliced byte pipe to the remote peer.
+
+**5 tests:** direct success, relay pairing, direct-fail relay-succeeds, no-layers error, registry-lookup-then-dial.
+
+---
+
+### S6 additions to `internal/federation/manager/manager.go`
+
+**`SetConnectFunc(fn ConnectFunc)`** — stores `fn` in `m.connectFn`. When non-nil, `connectPeerWithRetry` uses it instead of `m.dialer.DialPeer`. Called from `cmd/lattice-node` when `--relay-addr` or `--registry-addr` is set.
+
+**`HandleIncoming` dispatch** — now peeks at the first frame before running the FedHello handshake:
+- `REGISTRY_NOTIFY` → `handleRegistryNotify` (addr update, no handshake needed)
+- Any other frame → treat as `FED_HELLO`; pass the pre-read frame to `DoFederatedHandshakeWithHello`
+
+**`handleRegistryNotify(stream, frame)`** — parses `REGISTRY_NOTIFY{pubkey, addr}`, looks up the peer in SQLite, and calls `store.UpsertPeer` with the new address if it changed. Ignores unknown peers.
+
+**`DoFederatedHandshakeWithHello(ctx, stream, nonce, localPriv, peerHelloFrame)`** — new handshake variant in `internal/federation/handshake` for when the first `FED_HELLO` frame has already been read by `HandleIncoming`. Sends our own `FED_HELLO` concurrently (not blocked on receiving since we have the peer's frame), then exchanges `FED_HELLO_ACK` normally.
+
+**4 new tests:** `TestHandleIncomingRegistryNotifyUpdatesAddr`, `TestHandleIncomingRegistryNotifyUnknownPeer`, `TestHandleIncomingRegistryNotifySameAddr`, `TestSetConnectFuncIsCalledOnDial`.
+
+---
+
+### `cmd/lattice-node/main.go` — S6 flags
+
+Two new optional flags:
+- `--registry-addr ""` — address of an external registry server; when set, registers this node on startup and configures Layer 2 in ThreeLayerConnect.
+- `--relay-addr ""` — address of an external relay server; when set, configures Layer 3 in ThreeLayerConnect.
+
+When either flag is set, a `ThreeLayerConnect` closure is built and wired to the Manager via `SetConnectFunc`.
+
+---
+
 ## Dependency Graph
 
 ```
@@ -1085,8 +1227,15 @@ internal/call                          (stdlib only)
 internal/acl                        ──► internal/bus
 internal/transport/quic (v0.2)      ──► internal/transport (interfaces)
                                     ──► internal/wire (wire.Write/Read for keepalive)
-                                    ──► proto/ (FrameType_FRAME_TYPE_PING)
+                                    ──► proto/ (FrameType_FRAME_TYPE_PING + relay/registry types)
+                                    ──► internal/address (S6: registry lookup in ThreeLayerConnect)
                                     ──► github.com/quic-go/quic-go v0.60.0
+internal/relay (v0.2 S6)            ──► internal/transport (Stream/Listener)
+                                    ──► internal/wire (Read/Write)
+                                    ──► proto/ (RELAY_REGISTER, RELAY_PAIRED)
+internal/address (v0.2 S6)          ──► internal/transport (Stream/Dialer/Listener)
+                                    ──► internal/wire (Read/Write)
+                                    ──► proto/ (REGISTRY_* frame types)
 internal/federation/handshake (v0.2) ──► internal/transport (Stream interface)
                                     ──► internal/wire (Read/Write)
                                     ──► proto/ (FedHello, FedHelloAck, FedReject)
@@ -1102,8 +1251,14 @@ internal/federation/manager (v0.2)  ──► internal/federation/handshake
                                     ──► internal/schema (NodeHooks.SchemaRegistry, Descriptor)
                                     ──► proto/ (FED_* frame types)
                                     ──► google.golang.org/protobuf/types/descriptorpb  (S4 extractMsgName)
-cmd/lattice-node (S3)               ──► internal/federation/manager
+cmd/lattice-node (S3/S6)            ──► internal/federation/manager
                                     ──► internal/admin (SetFederationManager)
+                                    ──► internal/address (S6: registry client)
+                                    ──► internal/transport/quic (S6: ThreeLayerConnect)
+cmd/lattice-relay (S6)              ──► internal/relay
+                                    ──► internal/transport/quic
+cmd/lattice-registry (S6)           ──► internal/address
+                                    ──► internal/transport/quic
 ```
 
 No import cycles. `proto/` and `internal/transport` are leaves. `internal/federation/manager` does NOT import `internal/node` — the `NodeHooks` interface inverts the dependency direction. `internal/federation/manager` imports `node` only via the `NodeHooks` interface (no direct import of `internal/node`) — the dependency is inverted through the interface.

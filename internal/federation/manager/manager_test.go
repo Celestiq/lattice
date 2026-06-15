@@ -2202,3 +2202,163 @@ func TestFedCallConcurrentTryRouteRequest(t *testing.T) {
 		t.Errorf("all 10 concurrent TryRouteRequest calls should succeed; got %d", routed)
 	}
 }
+
+// ─── Session 6: Registry Notify & ConnectFunc ─────────────────────────────────
+
+// TestHandleIncomingRegistryNotifyUpdatesAddr verifies that a REGISTRY_NOTIFY
+// frame received via HandleIncoming updates the peer's stored address in SQLite.
+func TestHandleIncomingRegistryNotifyUpdatesAddr(t *testing.T) {
+	store := newTestStore(t)
+	nonce := sharedNonce()
+
+	peerPub, _ := genKey(t)
+	peerHex := pubHex(peerPub)
+	oldAddr := "10.0.0.1:4224"
+	newAddr := "10.0.0.2:4224"
+	store.UpsertPeer(peerHex, "Peer", oldAddr, "manual", "active") //nolint:errcheck
+
+	mgr, _, _ := newTestManager(t, store, errDialer{err: errors.New("no dial")}, noopListener{})
+	if err := mgr.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mgr.Stop)
+
+	notifyB, _ := proto.Marshal(&pb.RegistryNotify{Pubkey: peerPub, Addr: newAddr})
+
+	// Write the REGISTRY_NOTIFY frame from the peer side; HandleIncoming reads from
+	// the manager side.
+	managerConn, peerConn := net.Pipe()
+	t.Cleanup(func() { managerConn.Close(); peerConn.Close() })
+	managerSide := &nonceStream{Conn: managerConn, nonce: nonce}
+
+	go func() {
+		wire.Write(peerConn, pb.FrameType_FRAME_TYPE_REGISTRY_NOTIFY, notifyB) //nolint:errcheck
+	}()
+
+	// HandleIncoming dispatches synchronously; addr is updated before return.
+	mgr.HandleIncoming(managerSide)
+
+	rec, err := store.GetPeer(peerHex)
+	if err != nil {
+		t.Fatal("GetPeer:", err)
+	}
+	if rec == nil {
+		t.Fatal("peer not found after notify")
+	}
+	if rec.Addr != newAddr {
+		t.Errorf("addr = %q, want %q", rec.Addr, newAddr)
+	}
+}
+
+// TestHandleIncomingRegistryNotifyUnknownPeer verifies that a REGISTRY_NOTIFY
+// for a peer not in the store is silently ignored (no panic or error).
+func TestHandleIncomingRegistryNotifyUnknownPeer(t *testing.T) {
+	store := newTestStore(t)
+	nonce := sharedNonce()
+
+	unknownPub, _ := genKey(t)
+
+	mgr, _, _ := newTestManager(t, store, errDialer{err: errors.New("no dial")}, noopListener{})
+	if err := mgr.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mgr.Stop)
+
+	notifyB, _ := proto.Marshal(&pb.RegistryNotify{Pubkey: unknownPub, Addr: "10.0.0.2:4224"})
+
+	managerConn, peerConn := net.Pipe()
+	t.Cleanup(func() { managerConn.Close(); peerConn.Close() })
+	managerSide := &nonceStream{Conn: managerConn, nonce: nonce}
+
+	go func() {
+		wire.Write(peerConn, pb.FrameType_FRAME_TYPE_REGISTRY_NOTIFY, notifyB) //nolint:errcheck
+	}()
+
+	// Must not panic; unknown peer notification is silently dropped.
+	mgr.HandleIncoming(managerSide)
+}
+
+// TestHandleIncomingRegistryNotifySameAddrNoOp verifies that when
+// REGISTRY_NOTIFY carries the same address as already stored, the record is
+// not re-written (idempotent, no unnecessary DB churn).
+func TestHandleIncomingRegistryNotifySameAddr(t *testing.T) {
+	store := newTestStore(t)
+	nonce := sharedNonce()
+
+	peerPub, _ := genKey(t)
+	peerHex := pubHex(peerPub)
+	addr := "10.0.0.1:4224"
+	store.UpsertPeer(peerHex, "Peer", addr, "manual", "active") //nolint:errcheck
+
+	mgr, _, _ := newTestManager(t, store, errDialer{err: errors.New("no dial")}, noopListener{})
+	if err := mgr.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mgr.Stop)
+
+	notifyB, _ := proto.Marshal(&pb.RegistryNotify{Pubkey: peerPub, Addr: addr})
+
+	managerConn, peerConn := net.Pipe()
+	t.Cleanup(func() { managerConn.Close(); peerConn.Close() })
+	managerSide := &nonceStream{Conn: managerConn, nonce: nonce}
+
+	go func() {
+		wire.Write(peerConn, pb.FrameType_FRAME_TYPE_REGISTRY_NOTIFY, notifyB) //nolint:errcheck
+	}()
+
+	mgr.HandleIncoming(managerSide)
+
+	// Address must be unchanged.
+	rec, _ := store.GetPeer(peerHex)
+	if rec == nil || rec.Addr != addr {
+		t.Errorf("addr = %q, want %q (same-addr notify must be a no-op)", rec.Addr, addr)
+	}
+}
+
+// TestSetConnectFuncIsCalledOnDial verifies that when SetConnectFunc is
+// configured the manager invokes the custom connect function — not DialPeer —
+// when establishing an outbound federation connection to an active peer.
+func TestSetConnectFuncIsCalledOnDial(t *testing.T) {
+	nonce := sharedNonce()
+	store := newTestStore(t)
+
+	peerPub, peerPriv := genKey(t)
+	peerHex := pubHex(peerPub)
+	store.UpsertPeer(peerHex, "Peer", "10.0.0.1:4224", "manual", "active") //nolint:errcheck
+
+	called := make(chan []byte, 1)
+
+	connectFn := func(ctx context.Context, peerPubkeyBytes []byte, _ string) (transport.Stream, error) {
+		client, server := net.Pipe()
+		managerSide := &nonceStream{Conn: client, nonce: nonce}
+		peerSide := &nonceStream{Conn: server, nonce: nonce}
+		go func() {
+			fedhandshake.DoFederatedHandshake(ctx, peerSide, nonce, peerPriv) //nolint:errcheck
+			io.Copy(io.Discard, peerSide)                                      //nolint:errcheck
+		}()
+		select {
+		case called <- peerPubkeyBytes:
+		default:
+		}
+		return managerSide, nil
+	}
+
+	// The errDialer must never be called — connectFn replaces it.
+	mgr, _, _ := newTestManager(t, store, errDialer{err: errors.New("DialPeer must not be called")}, noopListener{})
+	mgr.SetConnectFunc(connectFn)
+	if err := mgr.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mgr.Stop)
+
+	select {
+	case pubkeyBytes := <-called:
+		if hex.EncodeToString(pubkeyBytes) != peerHex {
+			t.Errorf("connectFn called with wrong pubkey: %x", pubkeyBytes)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout: connectFn was not called")
+	}
+
+	waitPeerState(t, mgr, peerHex, "active", 2*time.Second)
+}
