@@ -1,22 +1,12 @@
 # Celestiq Lattice
 
-> Open infrastructure for a network where every entity, person, home, organisation, device, agent, is a sovereign node, and any two can coordinate directly.
-
-**Status:** Early. Architecture v1 specified. Local proof of concept working. Federation layer is the next milestone.
-
----
-
-## What this is
-
-Celestiq Lattice is a protocol and runtime for sovereign federated coordination. Each Lattice node runs on hardware owned by its operator (a home, an organisation, a research lab, eventually an individual) and hosts a typed message bus that devices, applications, and AI agents connect to. Nodes federate with each other directly, by mutual consent, with no platform in the data path.
-
-The thesis is straightforward. Today's digital infrastructure routes through a small number of platforms that decide what devices can talk to each other, where data flows, and what an individual is allowed to orchestrate. The infrastructure for the opposite arrangement, where every entity owns its own node and federates by consent, does not yet exist as a coherent protocol. Lattice is an attempt at that protocol.
+> Open infrastructure for a network where every entity — person, home, organisation, device, agent — is a sovereign node, and any two can coordinate directly.
 
 ---
 
 ## Three commitments
 
-These shape every design decision in the spec.
+These shape every design decision in the protocol.
 
 **Sovereignty is an architecture, not a policy.** Platforms that promise privacy do so by policy. Promises are revocable, monetisable, and silently changeable. Lattice removes the possibility of inspection rather than promising restraint: data flows directly between consenting parties, never touching a platform's systems.
 
@@ -26,76 +16,124 @@ These shape every design decision in the spec.
 
 ---
 
-## Architecture at a glance
+## Current status
 
-A Lattice deployment has three components.
+`go build ./...` clean · 266 tests passing · race-detector clean
 
-- **The Lattice node.** A long-running server per location. Hosts the message bus, schema registry, device registry, permission rules, object store, and federation manager. Runs on commodity hardware.
-- **Client SDKs.** Two tiers. Tier 1 is a minimal C library for constrained microcontrollers. Tier 2 is a full-featured client with bindings for desktop, mobile, browser, and command-line environments.
-- **Coordination service.** A lightweight introduction service that helps two nodes locate each other when first federating. It sees connection metadata only, never data, and is self-hostable. The decentralised path based on libp2p is on the roadmap.
-
-The full architecture, including the wire protocol, schema language, identity model, encryption profiles, and federation protocol, is documented in the v1 architecture specification under `/docs`.
+| Layer | Version | State |
+|-------|---------|-------|
+| Single-node bus | v0.1.1 | Complete and independently audited. Shippable. |
+| Federation (QUIC peering) | v0.2 | Built and working end-to-end. Pre-production at the trust boundary (4 known blockers). |
 
 ---
 
 ## What works today
 
-- Typed pub/sub messaging over the bus, end to end between processes on a single node
-- A local AI runtime integrated as a participant on the bus, subscribing to typed messages and publishing structured responses
-- A hardware client running on a constrained-device microcontroller, driving a physical actuator in response to commands sent from a phone, all routed through the local node with no cloud in the loop
+**Single-node (v0.1.1 — production-quality):**
+- Typed pub/sub messaging over a named subject space (`home.sensor.temperature`, `home.>`)
+- Deny-by-default ACL engine with wildcard rules, priority ordering, and delivery-time re-check
+- Schema validation: dynamic registry backed by Protobuf `FileDescriptorProto`; custom field options for required, numeric range, and string length
+- Request/response calls addressed by Ed25519 public key, with correlation, timeout, and server-stamped caller identity
+- Entity presence layer (`lattice.system.entity.joined/left/offline`)
+- Session resume with token-based subscription restoration
+- Localhost admin HTTP API for schema management
+- Mutual-auth TLS+Ed25519 handshake; TOFU pinning
 
-What this proves: the single-node value proposition holds. A sovereign node with local AI and hardware on the bus works end to end on commodity hardware.
+**Federation (v0.2 — working, pre-production):**
+- Two independent nodes form a persistent, mutually-authenticated QUIC peering
+- Bilateral consent state machine: pair → accept → active ↔ paused → revoked
+- Operator-configured forwarding policy per direction (outbound: what I send; inbound: what I accept)
+- Schema propagation: schema descriptor piggybacked on first forward of any subject to a peer
+- Cross-node call routing: entity on Node A calls entity on Node B transparently
+- Three-layer connectivity: direct QUIC dial → address registry lookup → relay fallback
+- Address registry server (`lattice-registry`) for dynamic peer address discovery
+- Relay node (`lattice-relay`) for NAT/firewall traversal
 
-## What is coming next
+**Not yet built (designed in spec):**
+- Stream primitive — continuous bidirectional session (camera, audio, robot control)
+- Object primitive — content-addressed blob store
+- Schema DSL — compiles to Protobuf descriptors
+- Durable messages — per-subject persistence with subscriber gap-fill
 
-- Federation between two nodes (the central thesis of the protocol)
-- The schema definition language and compiler
-- Mutual-auth TLS handshake with the identity model
-- Permission rules and the local administrative API
-- A demonstrable two-node federated teleoperation flow
+---
+
+## Quick start
+
+```sh
+# Terminal 1 — start the node (generates node.key on first run)
+go run ./cmd/lattice-node
+
+# Terminal 2 — connect a client (generates client.key on first run)
+go run ./cmd/lattice-client
+```
+
+See [DEMO.md](DEMO.md) for a full feature walkthrough including the federation scenario.
 
 ---
 
 ## Repository layout
 
-The repository is in early scaffolding. The intended structure:
-
 ```
-/spec       protocol specification and design documents
-/server     reference node runtime
-/sdk-tier1  constrained-device client SDK
-/sdk-tier2  full-featured client SDK and language bindings
-/examples   minimal working examples
-/docs       developer and operator documentation
+lattice/
+├── cmd/
+│   ├── lattice-node/      server binary
+│   ├── lattice-client/    reference CLI client
+│   ├── lattice-relay/     relay node (QUIC rendezvous, v0.2)
+│   └── lattice-registry/  address registry (v0.2)
+├── internal/
+│   ├── wire/              frame encoding + TLS cert generation
+│   ├── identity/          Ed25519 keypair load/generate
+│   ├── handshake/         HELLO exchange (client ↔ server)
+│   ├── session/           authenticated session table + resume tokens
+│   ├── bus/               subject validation + subscription registry
+│   ├── schema/            dynamic schema registry + payload validation
+│   ├── acl/               access-control engine (deny-by-default)
+│   ├── registry/          entity liveness tracking
+│   ├── call/              pending REQUEST/RESPONSE registry
+│   ├── admin/             localhost-only HTTP admin API
+│   ├── node/              server connection handler (owns all shared state)
+│   ├── transport/         federation transport abstraction (Stream/Dialer/Listener)
+│   ├── federation/        QUIC peering, consent, policy, call routing (v0.2)
+│   ├── relay/             rendezvous relay (v0.2)
+│   └── address/           address registry (v0.2)
+├── proto/
+│   ├── frames.proto       30 frame types (client 0–14, federation 15–23, relay/registry 24–30)
+│   ├── federation.proto   federation-specific message types
+│   ├── schemas.proto      built-in schema definitions
+│   ├── lattice_options.proto  custom field options (range, max_length, required)
+│   └── events.proto       system event payload types
+├── 01-Claude/             architecture documents, audit reports, implementation blueprints
+└── go.mod                 three dependencies: protobuf, quic-go, sqlite
 ```
 
 ---
 
 ## Documents
 
-- `/docs/architecture-v1.pdf` — the v1 architecture specification
-- `/docs/decisions-v1.pdf` — companion document covering the reasoning, tradeoffs, and forward considerations behind every decision in the spec
+| File | Contents |
+|------|----------|
+| [DEMO.md](DEMO.md) | Step-by-step feature walkthrough: single-node and federation |
+| [SYSTEM_STATE.md](SYSTEM_STATE.md) | Complete technical reference: all structs, flows, frame types, and test coverage |
+| [DEV.md](DEV.md) | Developer guide: flags, test commands, proto regeneration |
+| [01-Claude/PROJECT-AUDIT.md](01-Claude/PROJECT-AUDIT.md) | Full project audit: what remains, federation blockers, demo readiness |
+| [01-Claude/SYSTEM_STATE.md → v0.2-Review.md](01-Claude/v0.2-Review.md) | Production-readiness review of v0.2 federation |
 
 ---
 
 ## Getting involved
 
-This is an early project. The architecture is more developed than the code, and the right way to engage right now is at the design level.
+This is an early project. The right way to engage right now is at the design and protocol level.
 
-- If you have read the spec and have feedback, open an issue.
-- If you work on a project Lattice should learn from (NATS, libp2p, ActivityPub, AT Protocol, Matter, Home Assistant, the local-first software community), reach out.
-- If you want to follow the longer-form thinking behind the project, the [Substack](https://aayushessence.substack.com/) is the best place.
-
-A contribution guide will follow when the code base is past its initial scaffolding phase.
+- If you have read the code and have feedback, open an issue.
+- If you work on a project Lattice should learn from — NATS, libp2p, ActivityPub, AT Protocol, Matter, Home Assistant, the local-first software community — reach out.
+- For longer-form thinking behind the project: [Substack](https://aayushessence.substack.com/)
 
 ---
 
 ## License
 
-The protocol specification and reference implementations will be released under permissive open-source licences. The intended choice is Apache 2.0 for code and CC BY 4.0 for the specification, confirmed before the first tagged release.
+Protocol specification and reference implementations will be released under permissive open-source licences. Intended: Apache 2.0 for code, CC BY 4.0 for the specification, confirmed before the first tagged release.
 
 ---
 
-## Contact
-
-Aayush Sharma · aayush7official@gmail.com
+Aayush Sharma · aayush20701@gmail.com

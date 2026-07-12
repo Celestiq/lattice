@@ -6,6 +6,24 @@ This document captures the complete state of the Lattice codebase: what exists, 
 
 ---
 
+## How to read this document
+
+This file is a reference, not a tutorial. You do not need to read it top-to-bottom.
+
+**Mental model in three lines:**
+- A Lattice node is a typed pub/sub bus + call router with deny-by-default ACL. Entities (devices, agents, apps) connect via TLS+Ed25519 and publish/subscribe to named subjects, or call each other point-to-point by public key.
+- v0.1.1 (sessions 0–7) is the single-node bus: audited, race-clean, shippable. v0.2 (sessions S1–S6) adds QUIC-based federation: two nodes peer, exchange policy-governed messages and transparent cross-node calls.
+- Every outbound write goes through a priority-channel `sessionWriter` (ctrl/data lanes). Every ACL check is deny-by-default. Every identity is an Ed25519 keypair.
+
+**Where to start:**
+- See it work first → [DEMO.md](DEMO.md)
+- Understand the message flow → "How a PUBLISH Reaches a Subscriber" section below
+- Understand the frame format → "Wire Layer" section below
+- Understand federation → "v0.2 Federation Transport" section below
+- Find a struct or function → Ctrl+F; this document covers all public types and non-trivial flows
+
+---
+
 ## What Lattice Is
 
 Lattice is a message bus for locally-connected entities (services, devices, AI agents). It runs as a single TCP+TLS server (`lattice-node`) that entities dial into. Once connected and authenticated, entities can:

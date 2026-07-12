@@ -1,6 +1,6 @@
-# Lattice v0.1 — Developer Guide
+# Lattice — Developer Guide
 
-This document covers the local-node implementation (v0.1): how to run it, how it works, and how to use every feature.
+This document covers the full codebase (v0.1.1 single-node bus + v0.2 federation): how to run it, how to test it, and flag references for all binaries.
 
 ---
 
@@ -18,21 +18,39 @@ On first run each binary generates an Ed25519 keypair and writes it to a PKCS8 P
 
 ---
 
-## Server flags
+## Server flags (`lattice-node`)
 
 ```
---addr        :4222       TCP listen address
---key         node.key    Ed25519 private key file (created if absent)
---heartbeat   30          Heartbeat interval communicated to clients (seconds)
+--addr          :4222                  TCP listen address (client connections)
+--key           node.key               Ed25519 private key file (created if absent)
+--heartbeat     30                     Heartbeat interval communicated to clients (seconds)
+--admin-addr    127.0.0.1:4223         Localhost-only HTTP admin API
+--fed-addr      ""                     QUIC federation listen address (empty = federation disabled)
+--fed-db        fed.db                 SQLite file for federation state (peers, consent, policy)
+--registry-addr ""                     Address registry to register with (empty = disabled)
+--relay-addr    ""                     Relay node address for fallback connectivity (empty = disabled)
 ```
 
 Ctrl+C triggers graceful shutdown: every connected entity receives `lattice.system.entity.left`, connections drain, and the process exits cleanly.
 
-## Client flags
+## Client flags (`lattice-client`)
 
 ```
---addr    localhost:4222   Server address
---key     client.key       Ed25519 private key file (created if absent)
+--addr        localhost:4222   Server address
+--key         client.key       Ed25519 private key file (created if absent)
+--server-key  ""               Expected server pubkey hex for TOFU pinning (optional)
+```
+
+## Relay flags (`lattice-relay`)
+
+```
+--addr   :4225   QUIC listen address for relay rendezvous
+```
+
+## Registry flags (`lattice-registry`)
+
+```
+--addr   :4226   HTTP/QUIC listen address for address registry
 ```
 
 ---
@@ -43,7 +61,14 @@ Ctrl+C triggers graceful shutdown: every connected entity receives `lattice.syst
 go test ./...
 ```
 
-85 tests across 6 packages. The `TestIntegrationSequence` test in `internal/node` runs the full 10-step scenario end-to-end (pub/sub, schema validation, ACL, call primitive, entity events, graceful shutdown).
+266 tests across all packages. The `TestIntegrationSequence` test in `internal/node` runs the full 10-step scenario end-to-end (pub/sub, schema validation, ACL, call primitive, entity events, graceful shutdown). The federation packages (`internal/federation`, `internal/relay`, `internal/address`, `internal/transport`) carry the v0.2 test suite.
+
+Race detector is required before merging node or federation changes:
+
+```sh
+go test -race ./internal/node/...
+go test -race ./internal/federation/...
+```
 
 ---
 
